@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 
-from .model import ContextUsage
+from .model import ContextUsage, context_usage_ratio
 
 
 def codex_home() -> Path:
@@ -44,12 +44,10 @@ def find_rollout(thread_id: str, home: Path | None = None) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def _used_tokens(total: dict) -> int | None:
+def _context_tokens(last: dict) -> int | None:
     try:
-        return int(total.get("input_tokens", 0)) + int(
-            total.get("cached_input_tokens", 0)
-        )
-    except (TypeError, ValueError):
+        return int(last["total_tokens"])
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -59,8 +57,8 @@ def lookup_context_usage(
     """Extract the latest token usage from the thread's rollout, if any.
 
     Scans for ``token_count`` event records and keeps the last one carrying
-    both a total usage and a model context window. Unknown record types and
-    malformed lines are ignored.
+    both a latest context usage and a model context window. Unknown record
+    types and malformed lines are ignored.
     """
     path = find_rollout(thread_id, home=home)
     if path is None:
@@ -88,11 +86,11 @@ def lookup_context_usage(
                 info = payload.get("info")
                 if not isinstance(info, dict):
                     continue
-                total = info.get("total_token_usage")
+                last = info.get("last_token_usage")
                 mw = info.get("model_context_window")
-                if not isinstance(total, dict) or not isinstance(mw, int):
+                if not isinstance(last, dict) or not isinstance(mw, int):
                     continue
-                candidate = _used_tokens(total)
+                candidate = _context_tokens(last)
                 if candidate is None:
                     continue
                 used, window = candidate, mw
@@ -103,7 +101,7 @@ def lookup_context_usage(
     return ContextUsage(
         used_tokens=used,
         window_tokens=window,
-        ratio=round(used / window, 5),
+        ratio=context_usage_ratio(used, window),
         source="rollout",
     )
 

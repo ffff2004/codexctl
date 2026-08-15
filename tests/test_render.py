@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from io import StringIO
 
-from codexctl.model import HistorySnapshot, HistoryTurn, ProjectedEvent
-from codexctl.render import TextRenderer
+from codexctl.model import ContextUsage, HistorySnapshot, HistoryTurn, ProjectedEvent
+from codexctl.render import TextRenderer, format_context_line
 
 ITEMS = [
     {"type": "agentMessage", "text": "  hello  "},
@@ -73,3 +73,17 @@ def test_unknown_item_kind_is_ignored_by_both_text_paths():
         )
     )
     assert history_out.getvalue() == "Turn 0 turn-1 [completed]\n"
+
+
+def test_context_line_uses_effective_context_usage_ratio():
+    assert (
+        format_context_line(
+            ContextUsage(
+                used_tokens=83000,
+                window_tokens=200000,
+                ratio=0.38,
+                source="rollout",
+            )
+        )
+        == "Context: 83k / 200k (38%)"
+    )

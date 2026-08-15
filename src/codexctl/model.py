@@ -330,6 +330,30 @@ class ProjectedEvent:
 # ---------------------------------------------------------------------------
 
 
+# Matches the baseline reserved by the upstream TUI for system prompts,
+# fixed tool instructions, and compaction space.
+CONTEXT_BASELINE_TOKENS = 12_000
+
+
+def context_usage_ratio(used_tokens: int, window_tokens: int) -> float:
+    """Return the upstream-compatible effective context usage ratio.
+
+    The upstream TUI rounds the remaining percentage before deriving the used
+    percentage.  Keep that order here so text output and the JSON ratio agree
+    at half-percent boundaries as well.
+    """
+    if window_tokens <= CONTEXT_BASELINE_TOKENS:
+        return 1.0
+
+    effective_window = window_tokens - CONTEXT_BASELINE_TOKENS
+    used = max(used_tokens - CONTEXT_BASELINE_TOKENS, 0)
+    remaining = max(effective_window - used, 0)
+    remaining_percent = int(
+        min(max(remaining / effective_window * 100.0, 0.0), 100.0) + 0.5
+    )
+    return (100 - remaining_percent) / 100
+
+
 @dataclass(frozen=True)
 class ContextUsage:
     used_tokens: int

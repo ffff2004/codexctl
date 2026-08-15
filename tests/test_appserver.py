@@ -617,7 +617,11 @@ class TestProjectNotification:
                 "threadId": "t1",
                 "turnId": "u1",
                 "tokenUsage": {
-                    "total": {"inputTokens": 80000, "cachedInputTokens": 3000},
+                    "total": {
+                        "inputTokens": 1000000,
+                        "cachedInputTokens": 500000,
+                    },
+                    "last": {"totalTokens": 83000},
                     "modelContextWindow": 200000,
                 },
             },
@@ -627,7 +631,7 @@ class TestProjectNotification:
         assert event.extra["usage"] == {
             "usedTokens": 83000,
             "windowTokens": 200000,
-            "ratio": 0.415,
+            "ratio": 0.38,
         }
 
     def test_token_usage_dropped_without_window(self):
@@ -637,13 +641,14 @@ class TestProjectNotification:
         }
         assert project_notification(message) is None
 
-    def test_token_usage_dropped_when_total_is_malformed(self):
+    def test_token_usage_dropped_when_last_is_malformed(self):
         message = {
             "method": "thread/tokenUsage/updated",
             "params": {
                 "threadId": "t1",
                 "tokenUsage": {
-                    "total": "unavailable",
+                    "total": {"inputTokens": 5},
+                    "last": "unavailable",
                     "modelContextWindow": 200000,
                 },
             },

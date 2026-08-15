@@ -80,6 +80,16 @@ Consulted for rollout location and token-usage records.
   `sessions/YYYY/MM/DD/rollout-<timestamp>-<session_id>.jsonl` and the
   `event_msg` / `token_count` records carrying token usage.
 
+### Context usage display
+
+The upstream TUI context percentage and its baseline normalization were read
+from:
+
+- `codex-rs/tui/src/token_usage.rs` — baseline and remaining-percentage
+  calculation.
+- `codex-rs/tui/src/chatwidget/status_controls.rs` — conversion from
+  remaining percentage to displayed usage percentage.
+
 ### Cross-checked only
 
 - `docs/config.md` — `CODEX_HOME` semantics; not an implementation

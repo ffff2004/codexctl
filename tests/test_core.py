@@ -97,7 +97,11 @@ class TestStart:
                 "threadId": "t1",
                 "turnId": "u1",
                 "tokenUsage": {
-                    "total": {"inputTokens": 80000, "cachedInputTokens": 3000},
+                    "total": {
+                        "inputTokens": 1000000,
+                        "cachedInputTokens": 500000,
+                    },
+                    "last": {"totalTokens": 83000},
                     "modelContextWindow": 200000,
                 },
             },
@@ -108,7 +112,11 @@ class TestStart:
                 "threadId": "t1",
                 "turnId": "u1",
                 "tokenUsage": {
-                    "total": {"inputTokens": 90000, "cachedInputTokens": 4000},
+                    "total": {
+                        "inputTokens": 1100000,
+                        "cachedInputTokens": 600000,
+                    },
+                    "last": {"totalTokens": 94000},
                     "modelContextWindow": 200000,
                 },
             },
@@ -132,8 +140,8 @@ class TestStart:
         ]
         assert [event.source for event in usage_events] == ["live", "live"]
         assert [event.extra["usage"] for event in usage_events] == [
-            {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.415},
-            {"usedTokens": 94000, "windowTokens": 200000, "ratio": 0.47},
+            {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.38},
+            {"usedTokens": 94000, "windowTokens": 200000, "ratio": 0.44},
         ]
         assert terminal.status == "completed"
         assert terminal.context is not None
@@ -152,6 +160,7 @@ class TestStart:
                 "turnId": "u1",
                 "tokenUsage": {
                     "total": {"inputTokens": 80000},
+                    "last": {"totalTokens": 83000},
                 },
             },
         )
@@ -415,6 +424,7 @@ class TestStatus:
                         "input_tokens": 500,
                         "cached_input_tokens": 100,
                     },
+                    "last_token_usage": {"total_tokens": 600},
                     "model_context_window": 200000,
                 },
             },
@@ -560,7 +570,8 @@ class TestFollow:
                 "threadId": "t1",
                 "turnId": "u1",
                 "tokenUsage": {
-                    "total": {"inputTokens": 80000, "cachedInputTokens": 3000},
+                    "total": {"inputTokens": 1000000, "cachedInputTokens": 500000},
+                    "last": {"totalTokens": 83000},
                     "modelContextWindow": 200000,
                 },
             },

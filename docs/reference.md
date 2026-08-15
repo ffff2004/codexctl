@@ -96,11 +96,15 @@ Thread: <thread-id>
 Status: idle | active | notLoaded | systemError
 Flags:  waitingOnApproval, waitingOnUserInput   (only when present)
 Active turn: <turn-id> | -
-Context: 83k / 200k (42%) | -
+Context: 83k / 200k (38%) | -
 ```
 
-Context usage is best-effort enrichment from the Codex rollout store; `-`
-means unavailable. `status` never resumes the thread.
+Context usage is best-effort enrichment from the Codex runtime or rollout
+store; `-` means unavailable. `usedTokens` is the latest context size, not a
+cumulative session total. `ratio` is the effective context usage fraction
+after reserving 12,000 tokens for the system prompt, fixed tool instructions,
+and compaction space; the text output shows its rounded percentage.
+`status` never resumes the thread.
 
 ### history
 
@@ -224,7 +228,7 @@ Streaming commands in jsonl mode emit projected events, one per line:
 {"type": "turn/started", "threadId": "...", "turnId": "...", "source": "live"}
 {"type": "item/started", "threadId": "...", "turnId": "...", "item": {...}, "source": "live"}
 {"type": "item/completed", "threadId": "...", "turnId": "...", "item": {...}, "source": "live"}
-{"type": "thread/tokenUsage/updated", "threadId": "...", "turnId": "...", "source": "live", "usage": {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.415}}
+{"type": "thread/tokenUsage/updated", "threadId": "...", "turnId": "...", "source": "live", "usage": {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.38}}
 {"type": "turn/completed", "threadId": "...", "turnId": "...", "status": "completed", "source": "live"}
 ```
 
@@ -234,9 +238,10 @@ Streaming commands in jsonl mode emit projected events, one per line:
 - `item` is a projected item, see [Projected items](#projected-items).
 - `turn/completed` carries `status` (`completed`, `interrupted`, or
   `failed`) and, when present, `error: {"message": ...}`.
-- `thread/tokenUsage/updated` carries `usage` with `usedTokens`,
-  `windowTokens`, and `ratio` when the runtime provides a context window;
-  unavailable usage is omitted.
+- `thread/tokenUsage/updated` carries `usage` with the latest context size in
+  `usedTokens`, the model context window in `windowTokens`, and the
+  effective usage fraction in `ratio` when the runtime provides a context
+  window; unavailable usage is omitted.
 - `error` records carry `error: {"code", "message"}` with a stable
   [error code](#error-codes).
 
@@ -260,7 +265,7 @@ record (same as `follow` replay).
   "threadId": "...",
   "status": "active",
   "activeTurnId": "...",
-  "context": {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.415, "source": "live|rollout"},
+  "context": {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.38, "source": "live|rollout"},
   "activeFlags": ["waitingOnApproval"]
 }
 ```

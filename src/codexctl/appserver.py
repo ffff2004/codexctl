@@ -31,6 +31,7 @@ from .model import (
     SandboxPolicy,
     StartConfig,
     UsageError,
+    context_usage_ratio,
 )
 
 if TYPE_CHECKING:
@@ -774,20 +775,20 @@ def project_item(raw: Any) -> dict | None:
 def _project_usage(token_usage: Any) -> dict | None:
     if not isinstance(token_usage, dict):
         return None
-    total = token_usage.get("total") or {}
-    if not isinstance(total, dict):
+    last = token_usage.get("last") or {}
+    if not isinstance(last, dict):
         return None
     window = token_usage.get("modelContextWindow")
     if not isinstance(window, int) or window <= 0:
         return None
     try:
-        used = int(total.get("inputTokens", 0)) + int(total.get("cachedInputTokens", 0))
-    except (TypeError, ValueError):
+        used = int(last["totalTokens"])
+    except (KeyError, TypeError, ValueError):
         return None
     return {
         "usedTokens": used,
         "windowTokens": window,
-        "ratio": round(used / window, 5),
+        "ratio": context_usage_ratio(used, window),
     }
 
 

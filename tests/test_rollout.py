@@ -19,7 +19,11 @@ def _write_rollout(
     return path
 
 
-def _token_count_line(input_tokens: int, cached: int, window: int) -> str:
+def _token_count_line(
+    input_tokens: int, cached: int, window: int, last_total: int | None = None
+) -> str:
+    if last_total is None:
+        last_total = input_tokens + cached
     return json.dumps(
         {
             "timestamp": "2026-08-15T00:00:00Z",
@@ -27,7 +31,7 @@ def _token_count_line(input_tokens: int, cached: int, window: int) -> str:
             "payload": {
                 "type": "token_count",
                 "info": {
-                    "last_token_usage": {"input_tokens": 1},
+                    "last_token_usage": {"total_tokens": last_total},
                     "total_token_usage": {
                         "input_tokens": input_tokens,
                         "cached_input_tokens": cached,
@@ -72,14 +76,14 @@ class TestLookupContextUsage:
             [
                 json.dumps({"type": "session_meta", "payload": {}}),
                 _token_count_line(1000, 100, 200000),
-                _token_count_line(80000, 3000, 200000),
+                _token_count_line(80000, 3000, 200000, last_total=83000),
             ],
         )
         usage = rollout.lookup_context_usage("abc123")
         assert usage is not None
         assert usage.used_tokens == 83000
         assert usage.window_tokens == 200000
-        assert usage.ratio == 0.415
+        assert usage.ratio == 0.38
         assert usage.source == "rollout"
 
     def test_ignores_malformed_lines_and_unknown_records(self, isolated_codex_home):
@@ -94,6 +98,17 @@ class TestLookupContextUsage:
         )
         usage = rollout.lookup_context_usage("abc123")
         assert usage is not None and usage.used_tokens == 100
+
+    def test_uses_latest_context_size_not_cumulative_input(self, isolated_codex_home):
+        _write_rollout(
+            isolated_codex_home,
+            "abc123",
+            [_token_count_line(1000000, 500000, 200000, last_total=83000)],
+        )
+        usage = rollout.lookup_context_usage("abc123")
+        assert usage is not None
+        assert usage.used_tokens == 83000
+        assert usage.ratio == 0.38
 
     def test_none_without_usable_records(self, isolated_codex_home):
         _write_rollout(isolated_codex_home, "abc123", ["{}", "[]"])
