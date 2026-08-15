@@ -185,6 +185,7 @@ class TextRenderer:
                     item_id = str(item.get("id") or "")
                     self._started_items.add(item_id)
                     self._write(f"$ {command}\n")
+                    self._write("started\n")
         elif event.type == "turn/completed":
             status = event.extra.get("status")
             label = {"completed": "Turn completed"}.get(
@@ -206,10 +207,14 @@ class TextRenderer:
                 self._write(f"\n[{label}]\n{description.text}\n")
         elif description.kind == "commandExecution":
             item_id = str(item.get("id") or "")
-            if description.command and item_id not in self._started_items:
+            if description.command and (
+                description.exit_code is not None or item_id not in self._started_items
+            ):
                 self._write(f"$ {description.command}\n")
             if description.exit_code is not None:
                 self._write(f"exit {description.exit_code}\n")
+            else:
+                self._write("no exit code\n")
         elif description.kind == "fileChange":
             for change in description.changes:
                 path = change.get("path")

@@ -58,6 +58,37 @@ def test_stream_and_history_render_all_supported_item_kinds():
     )
 
 
+def test_stream_renders_command_lifecycle_with_status_and_exit_result():
+    out = StringIO()
+    renderer = TextRenderer(out=out)
+    item = {
+        "type": "commandExecution",
+        "id": "command-1",
+        "command": "echo hi",
+        "exitCode": 0,
+    }
+
+    renderer.event(ProjectedEvent(type="item/started", item=item))
+    renderer.event(ProjectedEvent(type="item/completed", item=item))
+
+    assert out.getvalue() == "$ echo hi\nstarted\n$ echo hi\nexit 0\n"
+
+
+def test_stream_renders_no_exit_code_without_repeating_command():
+    out = StringIO()
+    renderer = TextRenderer(out=out)
+    item = {
+        "type": "commandExecution",
+        "id": "command-1",
+        "command": "echo hi",
+    }
+
+    renderer.event(ProjectedEvent(type="item/started", item=item))
+    renderer.event(ProjectedEvent(type="item/completed", item=item))
+
+    assert out.getvalue() == "$ echo hi\nstarted\nno exit code\n"
+
+
 def test_unknown_item_kind_is_ignored_by_both_text_paths():
     item = {"type": "futureItem", "value": "ignored"}
 
