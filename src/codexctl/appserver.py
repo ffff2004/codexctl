@@ -30,6 +30,68 @@ UNSUPPORTED_INTERACTION_METHOD = "codexctl/unsupportedInteraction"
 TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
 
 
+# Each probe is the sole definition of a required operation: its projected
+# label and its private wire method and parameters. The report below derives
+# its operation vocabulary from these entries.
+@dataclass(frozen=True)
+class _LifecycleProbe:
+    label: str
+    method: str
+    params: dict[str, Any]
+
+
+_LIFECYCLE_PROBE_THREAD_ID = "00000000-0000-0000-0000-000000000000"
+_LIFECYCLE_PROBE_TURN_ID = "codexctl-doctor-probe"
+_LIFECYCLE_PROBES = (
+    _LifecycleProbe(
+        "start thread",
+        "thread/start",
+        {"ephemeral": True, "historyMode": "paginated"},
+    ),
+    _LifecycleProbe(
+        "resume thread",
+        "thread/resume",
+        {"threadId": _LIFECYCLE_PROBE_THREAD_ID},
+    ),
+    _LifecycleProbe(
+        "read thread",
+        "thread/read",
+        {"threadId": _LIFECYCLE_PROBE_THREAD_ID, "includeTurns": False},
+    ),
+    _LifecycleProbe(
+        "list threads",
+        "thread/list",
+        {"limit": 1},
+    ),
+    _LifecycleProbe(
+        "start turn",
+        "turn/start",
+        {
+            "threadId": _LIFECYCLE_PROBE_THREAD_ID,
+            "input": [{"type": "text", "text": "codexctl doctor probe"}],
+        },
+    ),
+    _LifecycleProbe(
+        "steer turn",
+        "turn/steer",
+        {
+            "threadId": _LIFECYCLE_PROBE_THREAD_ID,
+            "input": [{"type": "text", "text": "codexctl doctor probe"}],
+            "expectedTurnId": _LIFECYCLE_PROBE_TURN_ID,
+        },
+    ),
+    _LifecycleProbe(
+        "interrupt turn",
+        "turn/interrupt",
+        {
+            "threadId": _LIFECYCLE_PROBE_THREAD_ID,
+            "turnId": _LIFECYCLE_PROBE_TURN_ID,
+        },
+    ),
+)
+REQUIRED_LIFECYCLE_OPERATIONS = tuple(probe.label for probe in _LIFECYCLE_PROBES)
+
+
 class JsonRpcError(Exception):
     """A JSON-RPC error response from the app-server."""
 
@@ -132,6 +194,10 @@ class AppServerPort(Protocol):
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None: ...
 
     async def list_threads(self, cursor: str | None = None) -> ThreadListResponse: ...
+
+    async def check_lifecycle_operations(self) -> tuple[str, ...]:
+        """Return required lifecycle operation labels unavailable on the runtime."""
+        ...
 
     def notifications(self) -> AsyncIterator[ProjectedEvent]: ...
 
@@ -301,6 +367,25 @@ class UnixSocketAppServerAdapter:
         assert isinstance(response, ThreadListResponse)
         return response
 
+    async def check_lifecycle_operations(self) -> tuple[str, ...]:
+        """Probe the lifecycle RPC surface without starting useful work.
+
+        A JSON-RPC domain error still proves that the method was dispatched;
+        only explicit method-not-found responses count as incompatibility.
+        Older app-server versions report an unknown request variant as
+        ``-32600`` instead of ``-32601``, so that form is recognized too.
+        """
+        missing: list[str] = []
+        for probe in _LIFECYCLE_PROBES:
+            try:
+                await self._request(probe.method, probe.params)
+            except JsonRpcError as exc:
+                if _is_missing_method_error(exc):
+                    missing.append(probe.label)
+                elif exc.code == -32000 and "connection closed" in exc.message.lower():
+                    raise
+        return tuple(missing)
+
     # -- transport -----------------------------------------------------------
 
     async def _request(
@@ -411,6 +496,15 @@ class UnixSocketAppServerAdapter:
                 },
             }
         )
+
+
+def _is_missing_method_error(exc: JsonRpcError) -> bool:
+    if exc.code == -32601:
+        return True
+    if exc.code != -32600:
+        return False
+    message = exc.message.lower()
+    return "unknown variant" in message or "unknown method" in message
 
 
 def project_response(method: str, response: Any) -> AppServerResponse:

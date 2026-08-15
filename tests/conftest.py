@@ -13,6 +13,7 @@ from codexctl.appserver import (
     AppServerResponse,
     EmptyResponse,
     JsonRpcError,
+    REQUIRED_LIFECYCLE_OPERATIONS,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
@@ -37,6 +38,7 @@ class FakeAppServer:
         self._queue: asyncio.Queue[ProjectedEvent | None] = asyncio.Queue()
         self.closed = False
         self.unsubscribed: list[str] = []
+        self.missing_lifecycle_operations: set[str] = set()
 
     # -- scripting -----------------------------------------------------------
 
@@ -152,6 +154,13 @@ class FakeAppServer:
         response = await self._request("thread/list", params)
         assert isinstance(response, ThreadListResponse)
         return response
+
+    async def check_lifecycle_operations(self) -> tuple[str, ...]:
+        return tuple(
+            operation
+            for operation in REQUIRED_LIFECYCLE_OPERATIONS
+            if operation in self.missing_lifecycle_operations
+        )
 
     async def _request(
         self, method: str, params: dict | None = None

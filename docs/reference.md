@@ -178,8 +178,10 @@ codexctl doctor
 ```
 
 Runs diagnostics and prints a compatibility verdict: endpoint
-reachability, the initialize handshake, the local `codex` CLI version
-(managed mode only), and rollout-based context enrichment availability.
+reachability, the initialize handshake, required lifecycle operations, the
+local `codex` CLI version (managed mode only), and rollout-based context
+enrichment availability. Context enrichment is optional and does not make a
+runtime incompatible.
 Exit code 0 means the checks completed (regardless of verdict).
 
 ## Output modes

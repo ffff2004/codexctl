@@ -98,7 +98,9 @@ Selector parsing is pure and follows Python semantics exactly
 - **Doctor** reuses the same seams: endpoint resolution, connect +
   initialize handshake, the `codex --version` probe exposed as
   `EndpointPort.probe_cli_version()` (managed mode; external endpoints
-  return `None`), and the rollout sessions directory check.
+  return `None`), the app-server lifecycle compatibility probe, and the
+  rollout sessions directory check. The lifecycle probe is the compatibility
+  gate; rollout context enrichment remains diagnostic-only.
 
 ### endpoint.py — runtime resolution
 
@@ -141,6 +143,9 @@ A single reader task routes frames: responses resolve pending futures,
 notifications go to a queue, and server-initiated requests are answered
 immediately per the unattended policy described in
 [reference.md — Unattended operation](reference.md#unattended-operation).
+The adapter also probes the required lifecycle RPC surface for `doctor` using
+sentinel requests; method-not-found responses are reported as unavailable,
+while ordinary domain errors prove that dispatch succeeded.
 Internally, declined interactions are re-emitted as a synthetic
 `codexctl/unsupportedInteraction` notification so the core and renderers
 see them as ordinary stream events; that method name never appears on the

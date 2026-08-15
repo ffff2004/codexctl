@@ -789,6 +789,33 @@ class TestList:
 
 
 class TestDoctor:
+    async def test_compatible_runtime_reports_lifecycle_operations(self):
+        server = FakeAppServer()
+        snapshot = await make_ctl(server).run(Doctor())
+
+        assert snapshot.compatible is True
+        lifecycle_check = next(
+            c for c in snapshot.checks if c.name == "required lifecycle operations"
+        )
+        assert lifecycle_check.ok is True
+        assert lifecycle_check.detail == "all available"
+        context_check = next(
+            c for c in snapshot.checks if c.name == "context usage enrichment"
+        )
+        assert context_check.ok is False
+
+    async def test_missing_lifecycle_operation_reports_incompatible(self):
+        server = FakeAppServer()
+        server.missing_lifecycle_operations.add("steer turn")
+        snapshot = await make_ctl(server).run(Doctor())
+
+        assert snapshot.compatible is False
+        lifecycle_check = next(
+            c for c in snapshot.checks if c.name == "required lifecycle operations"
+        )
+        assert lifecycle_check.ok is False
+        assert lifecycle_check.detail == "unavailable: steer turn"
+
     async def test_unreachable_endpoint_reports_incompatible_false(self):
         endpoint = FakeEndpoint(
             resolve_error=CodexCtlError(

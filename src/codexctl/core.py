@@ -536,12 +536,32 @@ class CodexCtl:
             )
         try:
             adapter = await self._connect(endpoint)
-            checks.append(DoctorCheck("initialize handshake", True, None))
-            app_server_version = getattr(adapter, "app_server_version", None)
-            compatible = True
-            await adapter.close()
         except CodexCtlError as exc:
             checks.append(DoctorCheck("initialize handshake", False, exc.message))
+        else:
+            checks.append(DoctorCheck("initialize handshake", True, None))
+            app_server_version = getattr(adapter, "app_server_version", None)
+            try:
+                missing = await adapter.check_lifecycle_operations()
+            except JsonRpcError as exc:
+                checks.append(
+                    DoctorCheck("required lifecycle operations", False, exc.message)
+                )
+            else:
+                lifecycle_ok = not missing
+                checks.append(
+                    DoctorCheck(
+                        "required lifecycle operations",
+                        lifecycle_ok,
+                        "all available"
+                        if lifecycle_ok
+                        else "unavailable: "
+                        + ", ".join(missing),
+                    )
+                )
+                compatible = lifecycle_ok
+            finally:
+                await adapter.close()
         codex_cli_version = self._endpoint.probe_cli_version()
         if endpoint_mode == "managed":
             checks.append(

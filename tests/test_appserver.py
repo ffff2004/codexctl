@@ -10,6 +10,8 @@ from websockets.asyncio.server import unix_serve
 
 from codexctl.appserver import (
     AppServerTurn,
+    JsonRpcError,
+    REQUIRED_LIFECYCLE_OPERATIONS,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
@@ -157,6 +159,51 @@ class TestTypedOperations:
             ("thread/list", {"limit": 100, "cursor": "c1"}),
         ]
         assert not hasattr(adapter, "request")
+
+    async def test_lifecycle_probe_checks_each_required_operation(self, monkeypatch):
+        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        responses = {
+            "thread/start": {"thread": {"id": "probe"}},
+            "thread/resume": {"thread": {"id": "probe", "status": "idle"}},
+            "thread/read": {"thread": {"id": "probe", "status": "idle"}},
+            "thread/list": {"data": []},
+            "turn/start": {"turn": {"id": "probe"}},
+            "turn/steer": {"turnId": "probe"},
+            "turn/interrupt": {},
+        }
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, responses[method])
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        assert await adapter.check_lifecycle_operations() == ()
+        assert len(calls) == len(REQUIRED_LIFECYCLE_OPERATIONS)
+        assert [method for method, _ in calls] == [
+            "thread/start",
+            "thread/resume",
+            "thread/read",
+            "thread/list",
+            "turn/start",
+            "turn/steer",
+            "turn/interrupt",
+        ]
+        assert calls[0][1] == {"ephemeral": True, "historyMode": "paginated"}
+
+    async def test_lifecycle_probe_reports_method_not_found(self, monkeypatch):
+        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        missing = "steer turn"
+
+        async def request(method, params=None):
+            if method == "turn/steer":
+                raise JsonRpcError(-32601, "method not found")
+            return project_response(method, {})
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        assert await adapter.check_lifecycle_operations() == (missing,)
 
 
 class TestUnixSocketConnection:
