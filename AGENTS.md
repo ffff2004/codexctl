@@ -50,9 +50,6 @@ uv run codexctl  # run the CLI
 uv build         # build dist/ artifacts
 ```
 
-Python >= 3.11, src layout (`src/codexctl/`), pytest with
-`asyncio_mode = "auto"`.
-
 ## Code layout
 
 - `model.py` — closed vocabulary crossing `CodexCtl.run`: commands,

@@ -33,8 +33,4 @@ codexctl doctor
 
 ## Development
 
-```sh
-uv sync
-uv run pre-commit install --hook-type pre-commit --hook-type pre-push --install-hooks
-uv run pytest
-```
+See [CONTRIBUTING](CONTRIBUTING.md).
