@@ -1,0 +1,194 @@
+# codexctl Architecture
+
+Internal structure of `codexctl`. This document describes modules, seams,
+and protocol adaptation only. Everything observable from the outside —
+commands, output shapes, error codes, exit codes — is defined once in
+[reference.md](reference.md) and linked from here, never repeated.
+
+## Design principle
+
+`codexctl` is built as a chain of deep modules with narrow interfaces:
+
+```text
+argv ──> cli.py ──> CodexCtl.run(Command) -> Outcome ──> render.py ──> stdout/stderr
+                       │
+                       ├── endpoint.py   (where is the runtime?)
+                       ├── appserver.py  (how do we speak to it?)
+                       └── rollout.py    (best-effort context enrichment)
+```
+
+Each seam exists because two real production behaviors differ on either
+side of it:
+
+- CLI parsing/rendering vs execution, so output formats never influence
+  execution behavior.
+- `CodexCtl.run` vs the runtime, so the core vocabulary
+  ([model.py](#modelpy--the-closed-vocabulary)) never mentions JSON-RPC,
+  sockets, or Codex wire types.
+- Core vs endpoint resolution, because managed and external runtimes have
+  different lifecycle responsibilities.
+- Core vs protocol, because Codex protocol churn must be absorbed in one
+  place (the projection layer).
+
+## Module map
+
+| Module | Responsibility |
+|---|---|
+| `cli.py` | argv parsing, output-mode validation, signals, exit codes |
+| `model.py` | The closed vocabulary: commands, outcomes, projected events, selectors, error codes |
+| `core.py` | `CodexCtl`: command dispatch, orchestration, race handling, follow frontier, error mapping |
+| `endpoint.py` | Endpoint resolution: managed daemon lifecycle vs external socket |
+| `appserver.py` | Transport, JSON-RPC routing, initialize handshake, unattended interaction policy, projection |
+| `rollout.py` | Read-only, narrow, best-effort reader of Codex rollout files |
+| `render.py` | text/json/jsonl renderers; single source of structured JSON documents |
+
+### model.py — the closed vocabulary
+
+Everything crossing `CodexCtl.run` is defined here: `Command` values
+(`Start`, `Resume`, `Status`, `History`, `Follow`, `Steer`, `Interrupt`,
+`ListThreads`, `Doctor`), outcome values (snapshots,
+`EventStreamOutcome`, `TurnTerminal`), `ProjectedEvent`, selectors, and
+the stable error codes enumerated in
+[reference.md — Error codes](reference.md#error-codes).
+
+Selector parsing is pure and follows Python semantics exactly
+(`parse_turn_selector`, `parse_replay_selector`, `apply_turn_selector`,
+`select_replay_turns`); the accepted syntaxes are specified in
+[reference.md — history](reference.md#history) and
+[reference.md — follow](reference.md#follow).
+
+### core.py — orchestration
+
+`CodexCtl` owns all lifecycle behavior. Key internal decisions:
+
+- **Races resolve at the authoritative RPC.** `resume` reads thread state
+  first for fast, clear errors, but the `turn/start` result is
+  authoritative; a lost race maps to `THREAD_BUSY`. `steer` sends
+  `expectedTurnId` observed from a preceding read; mismatches map to
+  `NO_ACTIVE_TURN`.
+- **Streaming is pull-based with a terminal future.** `EventStreamOutcome`
+  pairs an async iterator of `ProjectedEvent` with a future resolving to
+  `TurnTerminal`. The iterator owns dedup, token-usage capture, and the
+  terminal detection; its `finally` block unsubscribes, closes, and
+  resolves the future — including the deterministic
+  `APP_SERVER_PROTOCOL_ERROR` path when the stream dies first. Losing the
+  stream never triggers a turn interrupt.
+- **follow frontier.** `follow` resumes for subscription, replays a
+  continuous suffix of the reconstructed snapshot (marked
+  `source="replay"`), then continues live. Both phases record dedup keys
+  in one shared set keyed by `(event type, turn id, item id)`,
+  so events visible in replay and live are emitted exactly once. Replay
+  only registers keys of events it actually emits, so a suppressed
+  replay event (an in-progress turn's `item/started`) is still
+  delivered live. The
+  stream exits only when the followed turn itself reaches a terminal
+  state; `turn/completed` notifications for other turns never end it.
+- **interrupt waits, never retries.** After `turn/interrupt` succeeds,
+  `core.py` polls the thread until the targeted turn is terminal (bounded
+  wait, `INTERRUPT_WAIT_SECONDS` / `INTERRUPT_POLL_INTERVAL`). A rejected
+  interrupt is mapped directly (`_map_interrupt_error`) instead of running
+  the keyword heuristics, so it always stays a domain error.
+- **Error mapping is keyword-heuristic plus code checks** (`_map_rpc_error`
+  and friends): `-32601` → `INCOMPATIBLE_CODEX`, "not found" markers →
+  `THREAD_NOT_FOUND`, active-turn markers → `THREAD_BUSY`,
+  `codexErrorInfo: ActiveTurnNotSteerable` → `TURN_NOT_STEERABLE`.
+  Recovery failure never falls back to creating a new thread.
+- **Doctor** reuses the same seams: endpoint resolution, connect +
+  initialize handshake, the `codex --version` probe exposed as
+  `EndpointPort.probe_cli_version()` (managed mode; external endpoints
+  return `None`), and the rollout sessions directory check.
+
+### endpoint.py — runtime resolution
+
+`EndpointPort.resolve() -> AppServerEndpoint(socket_path, runtime_pid,
+runtime_version)` has two implementations:
+
+- `ManagedDaemonAdapter` contains all daemon lifecycle knowledge: probe
+  the default control socket first (connecting + initializing to verify
+  the runtime responds), otherwise run `codex app-server daemon start`
+  and parse the last JSON line of stdout for `socketPath`/`pid`. No JSON
+  means `INCOMPATIBLE_CODEX`; binary-missing or non-zero exit means
+  `APP_SERVER_UNAVAILABLE`. The binary can be overridden with
+  `CODEXCTL_CODEX_BIN` (see
+  [reference.md — Runtime resolution](reference.md#runtime-resolution)).
+- `ExternalSocketAdapter` (`--socket`) only verifies the path exists and
+  performs no lifecycle mutation.
+
+The port also carries a best-effort `probe_cli_version()`: the managed
+adapter probes its own codex binary, while the external adapter returns
+`None` (it owns no binary lifecycle).
+
+### appserver.py — the compatibility firewall
+
+Raw Codex protocol messages never leave this module. Callers see request
+results, `JsonRpcError`, and `ProjectedEvent` only.
+
+Transport and session facts (verified against the Codex source):
+
+- The Unix control endpoint speaks websocket framing over the socket, so
+  the connection uses the `ws+unix://` scheme (`websockets` library).
+- Messages are JSON-RPC 2.0-shaped without the `"jsonrpc"` header.
+- Every connection performs the `initialize` request
+  (`clientInfo`, `capabilities: {experimentalApi: false}`) followed by the
+  `initialized` notification before any other traffic.
+
+A single reader task routes frames: responses resolve pending futures,
+notifications go to a queue, and server-initiated requests are answered
+immediately per the unattended policy described in
+[reference.md — Unattended operation](reference.md#unattended-operation).
+Internally, declined interactions are re-emitted as a synthetic
+`codexctl/unsupportedInteraction` notification so the core and renderers
+see them as ordinary stream events; that method name never appears on the
+wire.
+
+Projection is a set of pure functions (`project_thread_status`,
+`project_item`, `project_notification`) mapping Codex tagged unions into
+the stable vocabulary. Unknown variants are dropped, additive fields are
+tolerated, and command output content is intentionally not projected in
+v1. The public shapes they produce are specified in
+[reference.md — Projected items](reference.md#projected-items) and
+[reference.md — Streaming event records](reference.md#streaming-event-records-jsonl).
+
+### rollout.py — best-effort enrichment
+
+Rollout files are an internal Codex storage format. `codexctl` reads them
+only for optional context-window enrichment (`status`) and diagnostics
+(`doctor`). The reader parses narrowly (only `event_msg` / `token_count`
+records), ignores unknown or malformed lines, and returns `None` instead
+of raising on any drift. It is never a primary history source.
+
+### cli.py and render.py — outside the seam
+
+`cli.py` maps argv to commands and outcomes to exit codes. The
+output-mode matrix and the error-code → exit-code mapping implement the
+contracts specified in [reference.md — Output modes](reference.md#output-modes)
+and [reference.md — Exit codes](reference.md#exit-codes). SIGINT returns
+130 and sends no turn interrupt.
+
+Renderers consume outcomes and projected events; they never influence
+execution. `render.snapshot_document` is the single source of the JSON
+snapshot shapes listed in
+[reference.md — Snapshot documents](reference.md#snapshot-documents-json).
+Stream construction (stdout lazily resolved) keeps renderers testable
+with captured streams.
+
+## Testing strategy
+
+Tests drive `CodexCtl` through a scripted `FakeAppServer` implementing
+the `AppServerPort` shape (see `tests/conftest.py`); no sockets are
+opened. This covers all lifecycle behaviors pinned down above: start and
+resume contracts, busy detection, steer with `expectedTurnId`, interrupt
+waiting, read-only status, selector semantics, follow replay/live dedup
+and exit conditions, stream-loss behavior, and error mapping. Projection
+functions, rollout parsing, endpoint lifecycle-JSON parsing, and the CLI
+matrix are tested as units. The behavior assertions mirror
+[reference.md](reference.md); the test suite is where the specification
+becomes executable.
+
+## Compatibility stance
+
+`codexctl` does not gate on version numbers. Compatibility is discovered
+at runtime: missing methods (`-32601`) and missing daemon lifecycle JSON
+map to `INCOMPATIBLE_CODEX` (see
+[reference.md — Error codes](reference.md#error-codes)); projection drops
+unknown wire variants so newer Codex releases degrade additively.
