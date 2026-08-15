@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import FakeAppServer, FakeEndpoint, collect, make_ctl
 
 import codexctl.core as core
 from codexctl.appserver import UNSUPPORTED_INTERACTION_METHOD
@@ -36,9 +37,6 @@ from codexctl.model import (
     Steer,
     parse_turn_selector,
 )
-
-from conftest import FakeAppServer, FakeEndpoint, collect, make_ctl
-
 
 # ---------------------------------------------------------------------------
 # Wire-shape builders
@@ -302,8 +300,7 @@ class TestStart:
         errors = [e for e in events if e.type == "error"]
         assert len(errors) == 1
         assert (
-            errors[0].extra["error"]["code"]
-            == ErrorCode.UNSUPPORTED_INTERACTION.value
+            errors[0].extra["error"]["code"] == ErrorCode.UNSUPPORTED_INTERACTION.value
         )
 
 
@@ -414,7 +411,10 @@ class TestStatus:
             "payload": {
                 "type": "token_count",
                 "info": {
-                    "total_token_usage": {"input_tokens": 500, "cached_input_tokens": 100},
+                    "total_token_usage": {
+                        "input_tokens": 500,
+                        "cached_input_tokens": 100,
+                    },
                     "model_context_window": 200000,
                 },
             },
@@ -445,7 +445,9 @@ class TestStatus:
 def _history_server() -> FakeAppServer:
     server = FakeAppServer()
     turns = [
-        turn_doc(f"u{n}", status="completed", items=[agent_message(f"i{n}", f"msg {n}")])
+        turn_doc(
+            f"u{n}", status="completed", items=[agent_message(f"i{n}", f"msg {n}")]
+        )
         for n in range(4)
     ]
     server.result("thread/read", {"thread": thread_doc(turns=turns)})
@@ -545,7 +547,8 @@ class TestFollow:
         # Live: the same item completes again (must be deduplicated), then a
         # new message, then the terminal notification.
         server.emit(
-            "item/completed", {"threadId": "t1", "turnId": "u1", "item": command_item("i1")}
+            "item/completed",
+            {"threadId": "t1", "turnId": "u1", "item": command_item("i1")},
         )
         server.emit(
             "item/completed",
@@ -568,9 +571,7 @@ class TestFollow:
         assert outcome.turn_id == "u1"
         events, terminal = await collect(outcome)
 
-        assert [
-            (e.type, e.source, (e.item or {}).get("id")) for e in events
-        ] == [
+        assert [(e.type, e.source, (e.item or {}).get("id")) for e in events] == [
             ("item/completed", "replay", "i1"),  # replayed active-turn history
             ("item/completed", "live", "i2"),  # i1 live duplicate dropped
             ("thread/tokenUsage/updated", "live", None),
@@ -586,16 +587,15 @@ class TestFollow:
             [turn_doc("u1", status="inProgress", items=[command_item("i1")])]
         )
         server.emit(
-            "item/started", {"threadId": "t1", "turnId": "u1", "item": command_item("i1")}
+            "item/started",
+            {"threadId": "t1", "turnId": "u1", "item": command_item("i1")},
         )
         emit_completed(server, "t1", "u1")
 
         outcome = await make_ctl(server).run(Follow(thread_id="t1"))
         events, terminal = await collect(outcome)
 
-        assert [
-            (e.type, e.source, (e.item or {}).get("id")) for e in events
-        ] == [
+        assert [(e.type, e.source, (e.item or {}).get("id")) for e in events] == [
             ("item/completed", "replay", "i1"),  # snapshot fact, replayed
             ("item/started", "live", "i1"),  # not lost to replay suppression
             ("turn/completed", "live", None),
@@ -610,13 +610,9 @@ class TestFollow:
             ]
         )
         emit_completed(server, "t1", "u1")
-        outcome = await make_ctl(server).run(
-            Follow(thread_id="t1", replay=ReplayAll())
-        )
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", replay=ReplayAll()))
         events, _ = await collect(outcome)
-        assert [
-            (e.type, e.turn_id, e.source, e.turn_index) for e in events
-        ] == [
+        assert [(e.type, e.turn_id, e.source, e.turn_index) for e in events] == [
             ("item/started", "u0", "replay", 0),
             ("item/completed", "u0", "replay", 0),
             ("turn/completed", "u0", "replay", 0),
@@ -649,9 +645,7 @@ class TestFollow:
         # A completed notification for an older turn must not end the stream.
         emit_completed(server, "t1", "u0")
         emit_completed(server, "t1", "u1", status="interrupted")
-        outcome = await make_ctl(server).run(
-            Follow(thread_id="t1", replay=ReplayAll())
-        )
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", replay=ReplayAll()))
         events, terminal = await collect(outcome)
         assert terminal.status == "interrupted"
         live_completed = [
@@ -660,9 +654,7 @@ class TestFollow:
         assert len(live_completed) == 1 and live_completed[0].turn_id == "u1"
 
     async def test_connection_loss_never_interrupts(self):
-        server = _follow_server(
-            [turn_doc("u1", status="inProgress", items=[])]
-        )
+        server = _follow_server([turn_doc("u1", status="inProgress", items=[])])
         server.end_stream()
         outcome = await make_ctl(server).run(Follow(thread_id="t1"))
         events = [e async for e in outcome.events]
@@ -896,9 +888,7 @@ class TestDoctor:
 
     async def test_unreachable_endpoint_reports_incompatible_false(self):
         endpoint = FakeEndpoint(
-            resolve_error=CodexCtlError(
-                ErrorCode.APP_SERVER_UNAVAILABLE, "no daemon"
-            )
+            resolve_error=CodexCtlError(ErrorCode.APP_SERVER_UNAVAILABLE, "no daemon")
         )
         server = FakeAppServer()
         snapshot = await make_ctl(server, endpoint).run(Doctor())

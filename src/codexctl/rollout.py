@@ -80,7 +80,10 @@ def lookup_context_usage(
                 if not isinstance(record, dict) or record.get("type") != "event_msg":
                     continue
                 payload = record.get("payload")
-                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("type") != "token_count"
+                ):
                     continue
                 info = payload.get("info")
                 if not isinstance(info, dict):

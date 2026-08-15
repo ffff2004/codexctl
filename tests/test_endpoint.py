@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -54,8 +53,8 @@ class TestManagedDaemonAdapter:
         script = _write_script(
             tmp_path,
             "echo 'starting'\n"
-            "echo '{\"status\":\"started\",\"socketPath\":\"/tmp/fake.sock\","
-            "\"pid\":4242,\"appServerVersion\":\"0.101.0\"}'",
+            'echo \'{"status":"started","socketPath":"/tmp/fake.sock",'
+            '"pid":4242,"appServerVersion":"0.101.0"}\'',
         )
         adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
         endpoint = await adapter.resolve()
@@ -65,7 +64,9 @@ class TestManagedDaemonAdapter:
 
     async def test_already_running_status_also_yields_endpoint(self, tmp_path):
         home = tmp_path / "home"
-        payload = json.dumps({"status": "alreadyRunning", "socketPath": "/tmp/r.sock", "pid": 7})
+        payload = json.dumps(
+            {"status": "alreadyRunning", "socketPath": "/tmp/r.sock", "pid": 7}
+        )
         script = _write_script(tmp_path, f"echo '{payload}'")
         adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
         endpoint = await adapter.resolve()
@@ -80,7 +81,7 @@ class TestManagedDaemonAdapter:
         assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
 
     async def test_missing_socket_path_means_incompatible_codex(self, tmp_path):
-        script = _write_script(tmp_path, "echo '{\"status\":\"started\"}'")
+        script = _write_script(tmp_path, 'echo \'{"status":"started"}\'')
         adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
         with pytest.raises(CodexCtlError) as excinfo:
             await adapter.resolve()
@@ -143,11 +144,17 @@ class TestExternalEndpointAdapter:
         adapter = ExternalEndpointAdapter(f"unix://{tmp_path / 'external.sock'}")
         assert adapter.probe_cli_version() is None
 
-    async def test_tcp_endpoint_preserves_path_query_and_defers_token_read(self, tmp_path):
+    async def test_tcp_endpoint_preserves_path_query_and_defers_token_read(
+        self, tmp_path
+    ):
         token_file = tmp_path / "token"
-        adapter = ExternalEndpointAdapter("ws://127.0.0.1:7777/app?version=1", token_file)
+        adapter = ExternalEndpointAdapter(
+            "ws://127.0.0.1:7777/app?version=1", token_file
+        )
         endpoint = await adapter.resolve()
-        assert endpoint.target == TcpTarget("ws://127.0.0.1:7777/app?version=1", token_file)
+        assert endpoint.target == TcpTarget(
+            "ws://127.0.0.1:7777/app?version=1", token_file
+        )
 
     @pytest.mark.parametrize(
         "value",

@@ -7,7 +7,6 @@ from io import StringIO
 from codexctl.model import HistorySnapshot, HistoryTurn, ProjectedEvent
 from codexctl.render import TextRenderer
 
-
 ITEMS = [
     {"type": "agentMessage", "text": "  hello  "},
     {"type": "userMessage", "text": "  prompt  "},
@@ -63,9 +62,7 @@ def test_unknown_item_kind_is_ignored_by_both_text_paths():
     item = {"type": "futureItem", "value": "ignored"}
 
     stream_out = StringIO()
-    TextRenderer(out=stream_out).event(
-        ProjectedEvent(type="item/completed", item=item)
-    )
+    TextRenderer(out=stream_out).event(ProjectedEvent(type="item/completed", item=item))
     assert stream_out.getvalue() == ""
 
     history_out = StringIO()

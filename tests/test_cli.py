@@ -10,12 +10,12 @@ import json
 import pytest
 
 from codexctl.cli import (
+    _OUTPUT_MATRIX,
     EXIT_DOMAIN,
     EXIT_OK,
     EXIT_RUNTIME,
     EXIT_TURN,
     EXIT_USAGE,
-    _OUTPUT_MATRIX,
     _build_command,
     _split_prompt,
     build_parser,
@@ -58,9 +58,7 @@ class TestOutputModeRejection:
             (["status", "t1", "--jsonl"], "jsonl"),
         ],
     )
-    def test_structured_errors_use_stdout_for_requested_mode(
-        self, argv, mode, capsys
-    ):
+    def test_structured_errors_use_stdout_for_requested_mode(self, argv, mode, capsys):
         assert main(argv) == EXIT_USAGE
         captured = capsys.readouterr()
         assert captured.err == ""
@@ -151,9 +149,7 @@ class TestSandboxPolicy:
         ),
     )
     def test_parser_and_command_use_public_policy_vocabulary(self, argument, policy):
-        args = build_parser().parse_args(
-            ["start", "--sandbox", argument]
-        )
+        args = build_parser().parse_args(["start", "--sandbox", argument])
 
         command = _build_command(args, "hello")
 
@@ -167,7 +163,9 @@ class TestSandboxPolicy:
 
 class TestSplitPrompt:
     def test_prompt_after_double_dash(self):
-        argv, prompt = _split_prompt(["start", "-o", "jsonl", "--", "fix", "the", "bug"])
+        argv, prompt = _split_prompt(
+            ["start", "-o", "jsonl", "--", "fix", "the", "bug"]
+        )
         assert argv == ["start", "-o", "jsonl"]
         assert prompt == "fix the bug"
 

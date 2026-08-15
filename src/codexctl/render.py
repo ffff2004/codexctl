@@ -25,7 +25,6 @@ from .model import (
     TurnTerminal,
 )
 
-
 # ---------------------------------------------------------------------------
 # JSON documents (single source for structured shapes)
 # ---------------------------------------------------------------------------
@@ -194,9 +193,7 @@ class TextRenderer:
             self._write(f"\n{label}\n")
         elif event.type == "error":
             error = event.extra.get("error") or {}
-            self._err.write(
-                f"codexctl: {error.get('code')}: {error.get('message')}\n"
-            )
+            self._err.write(f"codexctl: {error.get('code')}: {error.get('message')}\n")
             self._err.flush()
 
     def _render_item(self, item: dict) -> None:
@@ -250,9 +247,7 @@ class TextRenderer:
             self._write(f"{line}\n" if line else "Context: -\n")
         elif isinstance(outcome, HistorySnapshot):
             for turn in outcome.turns:
-                self._write(
-                    f"Turn {turn.index} {turn.id} [{turn.status or '?'}]\n"
-                )
+                self._write(f"Turn {turn.index} {turn.id} [{turn.status or '?'}]\n")
                 for item in turn.items:
                     self._write(_summarize_item(item, indent="  "))
         elif isinstance(outcome, ThreadListSnapshot):

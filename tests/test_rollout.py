@@ -9,7 +9,9 @@ from pathlib import Path
 from codexctl import rollout
 
 
-def _write_rollout(home: Path, thread_id: str, lines: list[str], name: str | None = None) -> Path:
+def _write_rollout(
+    home: Path, thread_id: str, lines: list[str], name: str | None = None
+) -> Path:
     directory = home / "sessions" / "2026" / "08" / "15"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (name or f"rollout-2026-08-15T00-00-00-{thread_id}.jsonl")

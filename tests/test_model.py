@@ -86,9 +86,7 @@ class TestParseReplaySelector:
         assert parse_replay_selector("-3:") == ReplayTail(3)
         assert parse_replay_selector("-100:") == ReplayTail(100)
 
-    @pytest.mark.parametrize(
-        "bad", ["0", "1", "-0:", "5:", ":-1", "1:3", "abc", ""]
-    )
+    @pytest.mark.parametrize("bad", ["0", "1", "-0:", "5:", ":-1", "1:3", "abc", ""])
     def test_rejected_forms(self, bad):
         with pytest.raises(ValueError):
             parse_replay_selector(bad)

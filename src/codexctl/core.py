@@ -15,17 +15,17 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import rollout
 from .appserver import (
+    AppServerPort,
     AppServerThread,
     AppServerTurn,
-    AppServerPort,
     JsonRpcError,
     connect_endpoint,
 )
 from .endpoint import AppServerEndpoint, EndpointPort
 from .model import (
-    ContextUsage,
     CodexCtlError,
     Command,
+    ContextUsage,
     DetachedTurnStarted,
     Doctor,
     DoctorCheck,
@@ -129,7 +129,9 @@ class CodexCtl:
             try:
                 thread = await adapter.start_thread(config)
             except JsonRpcError as exc:
-                raise _map_rpc_error(exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR) from exc
+                raise _map_rpc_error(
+                    exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR
+                ) from exc
             thread_id = thread.id if thread is not None else None
             if not thread_id:
                 raise CodexCtlError(
@@ -460,13 +462,13 @@ class CodexCtl:
             except JsonRpcError as exc:
                 # A rejected interrupt means the target turn changed or ended;
                 # never retry against a different turn.
-                raise _map_interrupt_error(
-                    exc, command.thread_id
-                ) from exc
+                raise _map_interrupt_error(exc, command.thread_id) from exc
             deadline = time.monotonic() + INTERRUPT_WAIT_SECONDS
             while True:
                 current = await self._read_thread(adapter, command.thread_id)
-                target = next((turn for turn in current.turns if turn.id == turn_id), None)
+                target = next(
+                    (turn for turn in current.turns if turn.id == turn_id), None
+                )
                 if target is not None and target.is_terminal:
                     return InterruptResult(
                         thread_id=command.thread_id,
@@ -526,11 +528,11 @@ class CodexCtl:
         endpoint_mode = getattr(self._endpoint, "mode", "managed")
         try:
             endpoint = await self._endpoint.resolve()
-            checks.append(
-                DoctorCheck("endpoint reachable", True, endpoint.display)
-            )
+            checks.append(DoctorCheck("endpoint reachable", True, endpoint.display))
             if endpoint.runtime_pid is not None:
-                checks.append(DoctorCheck("runtime pid", True, str(endpoint.runtime_pid)))
+                checks.append(
+                    DoctorCheck("runtime pid", True, str(endpoint.runtime_pid))
+                )
         except CodexCtlError as exc:
             checks.append(DoctorCheck("endpoint reachable", False, exc.message))
             return DoctorSnapshot(
@@ -560,8 +562,7 @@ class CodexCtl:
                         lifecycle_ok,
                         "all available"
                         if lifecycle_ok
-                        else "unavailable: "
-                        + ", ".join(missing),
+                        else "unavailable: " + ", ".join(missing),
                     )
                 )
                 compatible = lifecycle_ok
@@ -677,7 +678,9 @@ def _map_steer_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
         code = ErrorCode.INCOMPATIBLE_CODEX
     elif "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
         code = ErrorCode.TURN_NOT_STEERABLE
-    elif "expectedturn" in lowered or "no active turn" in lowered or "invalid" in lowered:
+    elif (
+        "expectedturn" in lowered or "no active turn" in lowered or "invalid" in lowered
+    ):
         code = ErrorCode.NO_ACTIVE_TURN
     else:
         code = ErrorCode.APP_SERVER_PROTOCOL_ERROR

@@ -13,17 +13,28 @@ import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Protocol, TypeAlias, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Literal,
+    Protocol,
+    TypeAlias,
+    runtime_checkable,
+)
 
 from .model import (
-    CodexCtlError,
     DEFAULT_SANDBOX_POLICY,
+    CodexCtlError,
     ErrorCode,
     ProjectedEvent,
     SandboxPolicy,
     StartConfig,
     UsageError,
 )
+
+if TYPE_CHECKING:
+    from .endpoint import AppServerEndpoint
 
 CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
@@ -203,6 +214,10 @@ AppServerResponse: TypeAlias = (
 @runtime_checkable
 class AppServerPort(Protocol):
     """Typed app-server operations used by the orchestration layer."""
+
+    user_agent: str | None
+    app_server_version: str | None
+    server_codex_home: str | None
 
     async def read_thread(self, thread_id: str) -> AppServerThread | None: ...
 
@@ -512,7 +527,9 @@ class WebSocketAppServerAdapter:
         )
 
 
-async def connect_endpoint(endpoint: "AppServerEndpoint", timeout: float = 15.0) -> AppServerPort:
+async def connect_endpoint(
+    endpoint: "AppServerEndpoint", timeout: float = 15.0
+) -> AppServerPort:
     """Connect one resolved endpoint without exposing transport to callers."""
     # Delayed import avoids an endpoint -> appserver import cycle during
     # managed-runtime probing.
@@ -767,10 +784,16 @@ def _project_usage(token_usage: Any) -> dict | None:
         used = int(total.get("inputTokens", 0)) + int(total.get("cachedInputTokens", 0))
     except (TypeError, ValueError):
         return None
-    return {"usedTokens": used, "windowTokens": window, "ratio": round(used / window, 5)}
+    return {
+        "usedTokens": used,
+        "windowTokens": window,
+        "ratio": round(used / window, 5),
+    }
 
 
-def project_notification(message: dict, source: str | None = None) -> ProjectedEvent | None:
+def project_notification(
+    message: dict, source: Literal["live", "replay"] | None = None
+) -> ProjectedEvent | None:
     """Project one raw notification into a stable projected event, or drop it."""
     method = message.get("method", "")
     params = message.get("params") or {}
@@ -794,7 +817,9 @@ def project_notification(message: dict, source: str | None = None) -> ProjectedE
 
     if method == "thread/started":
         thread = params.get("thread") or {}
-        return ProjectedEvent("thread/started", thread_id=thread.get("id"), source=source)
+        return ProjectedEvent(
+            "thread/started", thread_id=thread.get("id"), source=source
+        )
 
     if method == "turn/started":
         turn = params.get("turn") or {}

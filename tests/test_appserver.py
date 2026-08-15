@@ -13,13 +13,13 @@ import pytest
 from websockets.asyncio.server import serve, unix_serve
 
 from codexctl.appserver import (
+    REQUIRED_LIFECYCLE_OPERATIONS,
+    UNSUPPORTED_INTERACTION_METHOD,
     AppServerTurn,
     JsonRpcError,
-    REQUIRED_LIFECYCLE_OPERATIONS,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
-    UNSUPPORTED_INTERACTION_METHOD,
     WebSocketAppServerAdapter,
     connect_endpoint,
     parse_user_agent_version,
@@ -28,8 +28,8 @@ from codexctl.appserver import (
     project_response,
     project_thread_status,
 )
-from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, StartConfig
 from codexctl.endpoint import AppServerEndpoint, TcpTarget, UnixTarget
+from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, StartConfig
 
 
 class TestProjectThreadStatus:
@@ -120,9 +120,7 @@ class TestTypedOperations:
             (SandboxPolicy.workspaceWrite, "workspace-write"),
             (SandboxPolicy.dangerFullAccess, "danger-full-access"),
         ):
-            assert (
-                await adapter.start_thread(StartConfig(sandbox=policy))
-            ).id == "t1"
+            assert (await adapter.start_thread(StartConfig(sandbox=policy))).id == "t1"
             assert calls[-1] == (
                 "thread/start",
                 {"approvalPolicy": "never", "sandbox": wire_value},
@@ -164,11 +162,11 @@ class TestTypedOperations:
 
         monkeypatch.setattr(adapter, "_request", request)
 
-        assert (await adapter.start_thread(
-            StartConfig(
-                cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly
+        assert (
+            await adapter.start_thread(
+                StartConfig(cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly)
             )
-        )).id == "t1"
+        ).id == "t1"
         assert await adapter.start_turn("t1", "hello", effort="high") == "u1"
         assert (await adapter.read_thread("t1")).id == "t1"
         assert (await adapter.resume_thread("t1")).id == "t1"
@@ -285,9 +283,7 @@ class TestUnixSocketConnection:
                 b"HTTP/1.1 101 Switching Protocols\r\n"
                 b"Upgrade: websocket\r\n"
                 b"Connection: Upgrade\r\n"
-                b"Sec-WebSocket-Accept: "
-                + accept
-                + b"\r\n\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
             )
             payload = json.dumps(
                 {
@@ -325,7 +321,9 @@ class TestUnixSocketConnection:
         server = await asyncio.start_unix_server(handle, path=socket_path)
         adapter = None
         try:
-            adapter = await connect_endpoint(AppServerEndpoint(str(socket_path), UnixTarget(socket_path)))
+            adapter = await connect_endpoint(
+                AppServerEndpoint(str(socket_path), UnixTarget(socket_path))
+            )
         finally:
             if adapter is not None:
                 await adapter.close()
@@ -334,7 +332,9 @@ class TestUnixSocketConnection:
 
         assert adapter.user_agent == "codex-app-server/0.147.0"
 
-    async def test_connects_over_unix_socket_and_completes_initialization(self, tmp_path):
+    async def test_connects_over_unix_socket_and_completes_initialization(
+        self, tmp_path
+    ):
         socket_path = tmp_path / "app-server.sock"
         received: list[dict] = []
         request_headers: list[dict[str, str]] = []
@@ -363,7 +363,9 @@ class TestUnixSocketConnection:
         server = await unix_serve(handle, str(socket_path))
         adapter = None
         try:
-            adapter = await connect_endpoint(AppServerEndpoint(str(socket_path), UnixTarget(socket_path)))
+            adapter = await connect_endpoint(
+                AppServerEndpoint(str(socket_path), UnixTarget(socket_path))
+            )
             await asyncio.wait_for(initialized.wait(), timeout=1.0)
         finally:
             if adapter is not None:
@@ -419,12 +421,17 @@ class TestUnixSocketConnection:
             await server.wait_closed()
 
         assert adapter.user_agent == "codex-app-server/0.101.0"
-        assert [message["method"] for message in received] == ["initialize", "initialized"]
+        assert [message["method"] for message in received] == [
+            "initialize",
+            "initialized",
+        ]
         assert requests[0][0] == "/app-server?client=test"
         assert "authorization" not in requests[0][1]
         assert "sec-websocket-extensions" not in requests[0][1]
 
-    async def test_tcp_connect_passes_token_path_query_and_no_compression(self, tmp_path, monkeypatch):
+    async def test_tcp_connect_passes_token_path_query_and_no_compression(
+        self, tmp_path, monkeypatch
+    ):
         captured: dict = {}
 
         class Connection:
@@ -460,21 +467,27 @@ class TestUnixSocketConnection:
         await adapter.close()
 
         assert captured["url"] == "ws://127.0.0.1:7777/app-server?client=test"
-        assert captured["additional_headers"] == {"Authorization": "Bearer secret-token"}
+        assert captured["additional_headers"] == {
+            "Authorization": "Bearer secret-token"
+        }
         assert captured["compression"] is None
 
     @pytest.mark.parametrize("contents", ["", " \n"])
     async def test_empty_tcp_token_is_unavailable(self, tmp_path, contents):
         token_file = tmp_path / "token"
         token_file.write_text(contents, encoding="utf-8")
-        endpoint = AppServerEndpoint("ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file))
+        endpoint = AppServerEndpoint(
+            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+        )
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_endpoint(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_missing_tcp_token_is_unavailable(self, tmp_path):
         token_file = tmp_path / "missing-token"
-        endpoint = AppServerEndpoint("ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file))
+        endpoint = AppServerEndpoint(
+            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+        )
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_endpoint(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
@@ -512,7 +525,11 @@ class TestProjectItem:
                 {"type": "text", "text": "world"},
             ],
         }
-        assert project_item(raw) == {"id": "i1", "type": "userMessage", "text": "hello world"}
+        assert project_item(raw) == {
+            "id": "i1",
+            "type": "userMessage",
+            "text": "hello world",
+        }
 
     def test_agent_message(self):
         raw = {"type": "agentMessage", "id": "i2", "text": "done", "extraField": 1}
@@ -650,7 +667,12 @@ class TestProjectNotification:
     def test_error_notification(self):
         message = {
             "method": "error",
-            "params": {"threadId": "t1", "turnId": "u1", "error": {"message": "x"}, "willRetry": True},
+            "params": {
+                "threadId": "t1",
+                "turnId": "u1",
+                "error": {"message": "x"},
+                "willRetry": True,
+            },
         }
         event = project_notification(message)
         assert event is not None

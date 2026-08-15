@@ -9,11 +9,11 @@ from typing import Any, AsyncIterator, Callable
 import pytest
 
 from codexctl.appserver import (
-    AppServerThread,
+    REQUIRED_LIFECYCLE_OPERATIONS,
     AppServerResponse,
+    AppServerThread,
     EmptyResponse,
     JsonRpcError,
-    REQUIRED_LIFECYCLE_OPERATIONS,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
@@ -43,7 +43,9 @@ class FakeAppServer:
 
     # -- scripting -----------------------------------------------------------
 
-    def on(self, method: str, handler: Callable[[dict | None], dict]) -> "FakeAppServer":
+    def on(
+        self, method: str, handler: Callable[[dict | None], dict]
+    ) -> "FakeAppServer":
         self.handlers[method] = handler
         return self
 
@@ -212,7 +214,9 @@ class FakeEndpoint:
     async def resolve(self) -> AppServerEndpoint:
         if self._resolve_error is not None:
             raise self._resolve_error
-        return AppServerEndpoint(display="/fake.sock", target=UnixTarget(Path("/fake.sock")))
+        return AppServerEndpoint(
+            display="/fake.sock", target=UnixTarget(Path("/fake.sock"))
+        )
 
     def probe_cli_version(self) -> str | None:
         return self._cli_version

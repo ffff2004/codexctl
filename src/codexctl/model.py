@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, AsyncIterator, Literal, Union
 
-
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -247,9 +246,7 @@ def parse_replay_selector(text: str) -> ReplaySelector:
         head = text[:-1].strip()
         if head.startswith("-") and head[1:].isdigit() and int(head[1:]) >= 1:
             return ReplayTail(count=int(head[1:]))
-    raise ValueError(
-        f"invalid replay selector: {text!r} (accepted forms: -1, -N:, :)"
-    )
+    raise ValueError(f"invalid replay selector: {text!r} (accepted forms: -1, -N:, :)")
 
 
 def apply_turn_selector(

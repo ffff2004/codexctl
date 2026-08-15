@@ -26,9 +26,9 @@ from .model import (
     Interrupt,
     ListThreads,
     Resume,
+    SandboxPolicy,
     Start,
     StartConfig,
-    SandboxPolicy,
     Status,
     Steer,
     UsageError,
@@ -113,7 +113,9 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codexctl")
-    parser.add_argument("--version", action="version", version=f"codexctl {CLIENT_VERSION}")
+    parser.add_argument(
+        "--version", action="version", version=f"codexctl {CLIENT_VERSION}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("start", help="create a new thread and start its first turn")
@@ -294,7 +296,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.endpoint is not None:
-            endpoint: Any = ExternalEndpointAdapter(args.endpoint, args.endpoint_token_file)
+            endpoint: Any = ExternalEndpointAdapter(
+                args.endpoint, args.endpoint_token_file
+            )
         elif args.endpoint_token_file is not None:
             raise UsageError("--endpoint-token-file requires --endpoint")
         else:

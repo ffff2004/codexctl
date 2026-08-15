@@ -114,7 +114,8 @@ class ManagedDaemonAdapter:
 
         try:
             adapter = await connect_endpoint(
-                AppServerEndpoint(str(socket_path), UnixTarget(socket_path)), timeout=5.0
+                AppServerEndpoint(str(socket_path), UnixTarget(socket_path)),
+                timeout=5.0,
             )
         except CodexCtlError:
             return None
@@ -224,7 +225,9 @@ class ExternalEndpointAdapter:
         return None
 
 
-def parse_external_endpoint(endpoint: str, token_file: Path | None = None) -> AppServerEndpoint:
+def parse_external_endpoint(
+    endpoint: str, token_file: Path | None = None
+) -> AppServerEndpoint:
     """Parse the deliberately small external endpoint vocabulary.
 
     Tokens are represented only by their file path and are read by the TCP
@@ -250,7 +253,9 @@ def parse_external_endpoint(endpoint: str, token_file: Path | None = None) -> Ap
         ):
             raise UsageError("--endpoint unix URI must be unix:///absolute/path")
         if token_file is not None:
-            raise UsageError("--endpoint-token-file is supported only for ws:// endpoints")
+            raise UsageError(
+                "--endpoint-token-file is supported only for ws:// endpoints"
+            )
         path = Path(unquote(parsed.path))
         if not path.is_absolute():  # Defensive: keep URI validation explicit.
             raise UsageError("--endpoint unix URI must be unix:///absolute/path")
@@ -272,5 +277,7 @@ def parse_external_endpoint(endpoint: str, token_file: Path | None = None) -> Ap
         key.casefold() in _CREDENTIAL_QUERY_KEYS
         for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
     ):
-        raise UsageError("--endpoint must not carry credentials; use --endpoint-token-file")
+        raise UsageError(
+            "--endpoint must not carry credentials; use --endpoint-token-file"
+        )
     return AppServerEndpoint(display=endpoint, target=TcpTarget(endpoint, token_file))
