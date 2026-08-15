@@ -37,7 +37,7 @@ side of it:
 | `cli.py` | argv parsing, output-mode validation, signals, exit codes |
 | `model.py` | The closed vocabulary: commands, outcomes, projected events, selectors, error codes |
 | `core.py` | `CodexCtl`: command dispatch, orchestration, race handling, follow frontier, error mapping |
-| `endpoint.py` | Endpoint resolution: managed daemon lifecycle vs external socket |
+| `endpoint.py` | Endpoint resolution: managed daemon lifecycle vs external endpoint |
 | `appserver.py` | Transport, JSON-RPC routing, initialize handshake, unattended interaction policy, projection |
 | `rollout.py` | Read-only, narrow, best-effort reader of Codex rollout files |
 | `render.py` | text/json/jsonl renderers; single source of structured JSON documents |
@@ -104,8 +104,9 @@ Selector parsing is pure and follows Python semantics exactly
 
 ### endpoint.py — runtime resolution
 
-`EndpointPort.resolve() -> AppServerEndpoint(socket_path, runtime_pid,
-runtime_version)` has two implementations:
+`EndpointPort.resolve() -> AppServerEndpoint(display, target, runtime_pid,
+runtime_version)` has two implementations. `target` is a closed Unix/TCP
+transport detail and is opaque to `core.py`:
 
 - `ManagedDaemonAdapter` contains all daemon lifecycle knowledge: probe
   the default control socket first (connecting + initializing to verify
@@ -115,8 +116,10 @@ runtime_version)` has two implementations:
   `APP_SERVER_UNAVAILABLE`. The binary can be overridden with
   `CODEXCTL_CODEX_BIN` (see
   [reference.md — Runtime resolution](reference.md#runtime-resolution)).
-- `ExternalSocketAdapter` (`--socket`) only verifies the path exists and
-  performs no lifecycle mutation.
+- `ExternalEndpointAdapter` resolves external endpoint configuration using
+  the [public endpoint contract](reference.md#runtime-resolution), then
+  performs no lifecycle mutation. Its resolved target is transport-private;
+  token contents are never part of the resolved endpoint.
 
 The port also carries a best-effort `probe_cli_version()`: the managed
 adapter probes its own codex binary, while the external adapter returns
@@ -131,9 +134,10 @@ module; protocol method names and payload construction do not cross the port.
 
 Transport and session facts (verified against the Codex source):
 
-- The Unix control endpoint speaks websocket framing over the socket, so
-  `websockets.asyncio.client.unix_connect` supplies the socket path while the
-  client uses a normal websocket HTTP upgrade URI.
+- `connect_endpoint()` is the sole transport entry point. It owns transport
+  selection, credential-file loading, connection options, and construction of
+  the shared WebSocket session; compression is disabled for Codex
+  compatibility.
 - Messages are JSON-RPC 2.0-shaped without the `"jsonrpc"` header.
 - Every connection performs the `initialize` request
   (`clientInfo`, `capabilities: {experimentalApi: false}`) followed by the

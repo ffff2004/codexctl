@@ -10,7 +10,7 @@ import struct
 from pathlib import Path
 
 import pytest
-from websockets.asyncio.server import unix_serve
+from websockets.asyncio.server import serve, unix_serve
 
 from codexctl.appserver import (
     AppServerTurn,
@@ -20,7 +20,8 @@ from codexctl.appserver import (
     ThreadResponse,
     TurnResponse,
     UNSUPPORTED_INTERACTION_METHOD,
-    UnixSocketAppServerAdapter,
+    WebSocketAppServerAdapter,
+    connect_endpoint,
     parse_user_agent_version,
     project_item,
     project_notification,
@@ -28,6 +29,7 @@ from codexctl.appserver import (
     project_thread_status,
 )
 from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, StartConfig
+from codexctl.endpoint import AppServerEndpoint, TcpTarget, UnixTarget
 
 
 class TestProjectThreadStatus:
@@ -103,7 +105,7 @@ class TestProjectResponse:
 
 class TestTypedOperations:
     async def test_start_thread_serializes_upstream_sandbox_enum(self, monkeypatch):
-        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        adapter = WebSocketAppServerAdapter(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
@@ -127,7 +129,7 @@ class TestTypedOperations:
             )
 
     async def test_start_thread_rejects_unsupported_sandbox_policy(self, monkeypatch):
-        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        adapter = WebSocketAppServerAdapter(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
@@ -144,7 +146,7 @@ class TestTypedOperations:
         assert calls == []
 
     async def test_operations_keep_wire_requests_inside_the_adapter(self, monkeypatch):
-        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        adapter = WebSocketAppServerAdapter(None, "/fake.sock")
         calls = []
         responses = {
             "thread/start": {"thread": {"id": "t1"}},
@@ -208,7 +210,7 @@ class TestTypedOperations:
         assert not hasattr(adapter, "request")
 
     async def test_lifecycle_probe_checks_each_required_operation(self, monkeypatch):
-        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        adapter = WebSocketAppServerAdapter(None, "/fake.sock")
         responses = {
             "thread/start": {"thread": {"id": "probe"}},
             "thread/resume": {"thread": {"id": "probe", "status": "idle"}},
@@ -240,7 +242,7 @@ class TestTypedOperations:
         assert calls[0][1] == {"ephemeral": True, "historyMode": "paginated"}
 
     async def test_lifecycle_probe_reports_method_not_found(self, monkeypatch):
-        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        adapter = WebSocketAppServerAdapter(None, "/fake.sock")
         missing = "steer turn"
 
         async def request(method, params=None):
@@ -323,7 +325,7 @@ class TestUnixSocketConnection:
         server = await asyncio.start_unix_server(handle, path=socket_path)
         adapter = None
         try:
-            adapter = await UnixSocketAppServerAdapter.connect(socket_path)
+            adapter = await connect_endpoint(AppServerEndpoint(str(socket_path), UnixTarget(socket_path)))
         finally:
             if adapter is not None:
                 await adapter.close()
@@ -335,9 +337,11 @@ class TestUnixSocketConnection:
     async def test_connects_over_unix_socket_and_completes_initialization(self, tmp_path):
         socket_path = tmp_path / "app-server.sock"
         received: list[dict] = []
+        request_headers: list[dict[str, str]] = []
         initialized = asyncio.Event()
 
         async def handle(connection):
+            request_headers.append(dict(connection.request.headers))
             async for frame in connection:
                 message = json.loads(frame)
                 received.append(message)
@@ -359,7 +363,7 @@ class TestUnixSocketConnection:
         server = await unix_serve(handle, str(socket_path))
         adapter = None
         try:
-            adapter = await UnixSocketAppServerAdapter.connect(socket_path)
+            adapter = await connect_endpoint(AppServerEndpoint(str(socket_path), UnixTarget(socket_path)))
             await asyncio.wait_for(initialized.wait(), timeout=1.0)
         finally:
             if adapter is not None:
@@ -373,6 +377,128 @@ class TestUnixSocketConnection:
             "initialize",
             "initialized",
         ]
+        assert "sec-websocket-extensions" not in request_headers[0]
+
+    async def test_tcp_connects_initializes_without_auth_or_compression(self):
+        received: list[dict] = []
+        requests: list[tuple[str, dict[str, str]]] = []
+        initialized = asyncio.Event()
+
+        async def handle(connection):
+            requests.append((connection.request.path, dict(connection.request.headers)))
+            async for frame in connection:
+                message = json.loads(frame)
+                received.append(message)
+                if message.get("method") == "initialize":
+                    await connection.send(
+                        json.dumps(
+                            {
+                                "id": message["id"],
+                                "result": {"userAgent": "codex-app-server/0.101.0"},
+                            }
+                        )
+                    )
+                elif message.get("method") == "initialized":
+                    initialized.set()
+
+        server = await serve(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        adapter = None
+        try:
+            adapter = await connect_endpoint(
+                AppServerEndpoint(
+                    f"ws://127.0.0.1:{port}/app-server?client=test",
+                    TcpTarget(f"ws://127.0.0.1:{port}/app-server?client=test", None),
+                )
+            )
+            await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        finally:
+            if adapter is not None:
+                await adapter.close()
+            server.close()
+            await server.wait_closed()
+
+        assert adapter.user_agent == "codex-app-server/0.101.0"
+        assert [message["method"] for message in received] == ["initialize", "initialized"]
+        assert requests[0][0] == "/app-server?client=test"
+        assert "authorization" not in requests[0][1]
+        assert "sec-websocket-extensions" not in requests[0][1]
+
+    async def test_tcp_connect_passes_token_path_query_and_no_compression(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        class Connection:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def close(self):
+                pass
+
+        async def fake_connect(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Connection()
+
+        async def initialize(self):
+            pass
+
+        import websockets.asyncio.client
+
+        monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
+        monkeypatch.setattr(WebSocketAppServerAdapter, "_initialize", initialize)
+        token_file = tmp_path / "token"
+        endpoint = AppServerEndpoint(
+            "ws://127.0.0.1:7777/app-server?client=test",
+            TcpTarget("ws://127.0.0.1:7777/app-server?client=test", token_file),
+        )
+        # The file intentionally does not exist until connection time.
+        token_file.write_text("  secret-token\n", encoding="utf-8")
+        adapter = await connect_endpoint(endpoint)
+        await adapter.close()
+
+        assert captured["url"] == "ws://127.0.0.1:7777/app-server?client=test"
+        assert captured["additional_headers"] == {"Authorization": "Bearer secret-token"}
+        assert captured["compression"] is None
+
+    @pytest.mark.parametrize("contents", ["", " \n"])
+    async def test_empty_tcp_token_is_unavailable(self, tmp_path, contents):
+        token_file = tmp_path / "token"
+        token_file.write_text(contents, encoding="utf-8")
+        endpoint = AppServerEndpoint("ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file))
+        with pytest.raises(CodexCtlError) as excinfo:
+            await connect_endpoint(endpoint)
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+
+    async def test_missing_tcp_token_is_unavailable(self, tmp_path):
+        token_file = tmp_path / "missing-token"
+        endpoint = AppServerEndpoint("ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file))
+        with pytest.raises(CodexCtlError) as excinfo:
+            await connect_endpoint(endpoint)
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+
+    async def test_unreadable_tcp_token_is_unavailable_without_exposing_path_or_contents(
+        self, tmp_path, monkeypatch
+    ):
+        token_file = tmp_path / "token"
+        endpoint = AppServerEndpoint(
+            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+        )
+        original_read_text = Path.read_text
+
+        def unreadable_read_text(path, *args, **kwargs):
+            if path == token_file:
+                raise PermissionError("secret-token")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unreadable_read_text)
+        with pytest.raises(CodexCtlError) as excinfo:
+            await connect_endpoint(endpoint)
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+        assert "secret-token" not in excinfo.value.message
+        assert str(token_file) not in excinfo.value.message
 
 
 class TestProjectItem:

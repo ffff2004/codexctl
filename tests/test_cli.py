@@ -132,6 +132,14 @@ class TestUsageErrors:
         assert main(["--version"]) == EXIT_OK
         assert "codexctl" in capsys.readouterr().out
 
+    def test_endpoint_token_file_requires_endpoint(self, capsys):
+        assert main(["list", "--endpoint-token-file", "/tmp/token"]) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_legacy_socket_option_is_removed(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["list", "--socket", "/tmp/app.sock"])
+
 
 class TestSandboxPolicy:
     @pytest.mark.parametrize(

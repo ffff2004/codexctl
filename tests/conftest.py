@@ -21,7 +21,7 @@ from codexctl.appserver import (
     project_notification,
     project_response,
 )
-from codexctl.endpoint import AppServerEndpoint
+from codexctl.endpoint import AppServerEndpoint, UnixTarget
 from codexctl.model import ProjectedEvent, StartConfig
 
 
@@ -212,7 +212,7 @@ class FakeEndpoint:
     async def resolve(self) -> AppServerEndpoint:
         if self._resolve_error is not None:
             raise self._resolve_error
-        return AppServerEndpoint(socket_path=Path("/fake.sock"))
+        return AppServerEndpoint(display="/fake.sock", target=UnixTarget(Path("/fake.sock")))
 
     def probe_cli_version(self) -> str | None:
         return self._cli_version

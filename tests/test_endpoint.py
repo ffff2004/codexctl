@@ -1,4 +1,4 @@
-"""Endpoint resolution: daemon lifecycle JSON parsing and external sockets."""
+"""Endpoint resolution: daemon lifecycle JSON parsing and external endpoints."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 
 from codexctl.endpoint import (
-    ExternalSocketAdapter,
+    ExternalEndpointAdapter,
     ManagedDaemonAdapter,
+    TcpTarget,
+    UnixTarget,
     _last_json_object,
     default_control_socket_path,
 )
@@ -57,7 +59,7 @@ class TestManagedDaemonAdapter:
         )
         adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
         endpoint = await adapter.resolve()
-        assert endpoint.socket_path == Path("/tmp/fake.sock")
+        assert endpoint.target == UnixTarget(Path("/tmp/fake.sock"))
         assert endpoint.runtime_pid == 4242
         assert endpoint.runtime_version == "0.101.0"
 
@@ -67,7 +69,7 @@ class TestManagedDaemonAdapter:
         script = _write_script(tmp_path, f"echo '{payload}'")
         adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
         endpoint = await adapter.resolve()
-        assert endpoint.socket_path == Path("/tmp/r.sock")
+        assert endpoint.target == UnixTarget(Path("/tmp/r.sock"))
         assert endpoint.runtime_pid == 7
 
     async def test_no_json_means_incompatible_codex(self, tmp_path):
@@ -121,9 +123,9 @@ class TestManagedDaemonAdapter:
         assert adapter.probe_cli_version() is None
 
 
-class TestExternalSocketAdapter:
+class TestExternalEndpointAdapter:
     async def test_missing_socket_is_unavailable(self, tmp_path):
-        adapter = ExternalSocketAdapter(tmp_path / "missing.sock")
+        adapter = ExternalEndpointAdapter(f"unix://{tmp_path / 'missing.sock'}")
         with pytest.raises(CodexCtlError) as excinfo:
             await adapter.resolve()
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
@@ -131,15 +133,78 @@ class TestExternalSocketAdapter:
     async def test_existing_socket_resolves_without_lifecycle(self, tmp_path):
         socket_path = tmp_path / "external.sock"
         socket_path.touch()
-        adapter = ExternalSocketAdapter(socket_path)
+        adapter = ExternalEndpointAdapter(f"unix://{socket_path}")
         endpoint = await adapter.resolve()
-        assert endpoint.socket_path == socket_path
+        assert endpoint.target == UnixTarget(socket_path)
         assert endpoint.runtime_pid is None
         assert adapter.mode == "external"
 
     def test_probe_cli_version_is_none(self, tmp_path):
-        adapter = ExternalSocketAdapter(tmp_path / "external.sock")
+        adapter = ExternalEndpointAdapter(f"unix://{tmp_path / 'external.sock'}")
         assert adapter.probe_cli_version() is None
+
+    async def test_tcp_endpoint_preserves_path_query_and_defers_token_read(self, tmp_path):
+        token_file = tmp_path / "token"
+        adapter = ExternalEndpointAdapter("ws://127.0.0.1:7777/app?version=1", token_file)
+        endpoint = await adapter.resolve()
+        assert endpoint.target == TcpTarget("ws://127.0.0.1:7777/app?version=1", token_file)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "unix:/tmp/app-server.sock",
+            "unix:////tmp/app-server.sock",
+            "unix://relative/path",
+            "unix://host/path",
+            "unix:///tmp/app-server.sock?mode=test",
+            "unix:///tmp/app-server.sock?",
+            "unix:///tmp/app-server.sock#fragment",
+            "unix:///tmp/app-server.sock#",
+            "ws://host",
+            "wss://host:443",
+            "http://host:80",
+            "ws://user@host:80",
+            "ws://host:80/#fragment",
+            "ws://host:80/#",
+        ],
+    )
+    def test_invalid_endpoint_is_usage_error(self, value):
+        with pytest.raises(CodexCtlError) as excinfo:
+            ExternalEndpointAdapter(value)
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "token=secret",
+            "token",
+            "token=",
+            "access_token=secret",
+            "ACCESS_TOKEN=secret",
+            "id_token=secret",
+            "refresh_token=secret",
+            "bearer_token=secret",
+            "authorization=Bearer%20secret",
+        ],
+    )
+    def test_ws_endpoint_rejects_url_credentials_without_reflecting_them(self, query):
+        with pytest.raises(CodexCtlError) as excinfo:
+            ExternalEndpointAdapter(f"ws://127.0.0.1:7777/app?{query}")
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+        assert "secret" not in excinfo.value.message
+
+    def test_ws_endpoint_keeps_ordinary_query_parameters(self):
+        endpoint = ExternalEndpointAdapter(
+            "ws://127.0.0.1:7777/app?client=codexctl&trace=1"
+        )._endpoint
+        assert endpoint.target == TcpTarget(
+            "ws://127.0.0.1:7777/app?client=codexctl&trace=1", None
+        )
+
+    def test_token_file_is_rejected_for_unix_endpoint(self, tmp_path):
+        with pytest.raises(CodexCtlError) as excinfo:
+            ExternalEndpointAdapter("unix:///tmp/app-server.sock", tmp_path / "token")
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
 
 
 class TestDefaultControlSocketPath:

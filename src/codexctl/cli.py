@@ -15,7 +15,7 @@ from typing import Any
 
 from .appserver import CLIENT_VERSION
 from .core import CodexCtl, history_to_events
-from .endpoint import ExternalSocketAdapter, ManagedDaemonAdapter
+from .endpoint import ExternalEndpointAdapter, ManagedDaemonAdapter
 from .model import (
     CodexCtlError,
     Doctor,
@@ -96,7 +96,19 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--json", dest="output_json", action="store_true")
     parser.add_argument("--jsonl", dest="output_jsonl", action="store_true")
-    parser.add_argument("--socket", type=Path, default=None)
+    parser.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="URI",
+        help="use an external unix:/// or ws:// app-server endpoint",
+    )
+    parser.add_argument(
+        "--endpoint-token-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Bearer token file for a ws:// endpoint",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -280,10 +292,16 @@ def main(argv: list[str] | None = None) -> int:
         _emit_error(UsageError(str(exc)), mode)
         return EXIT_USAGE
 
-    if args.socket is not None:
-        endpoint: Any = ExternalSocketAdapter(args.socket)
-    else:
-        endpoint = ManagedDaemonAdapter()
+    try:
+        if args.endpoint is not None:
+            endpoint: Any = ExternalEndpointAdapter(args.endpoint, args.endpoint_token_file)
+        elif args.endpoint_token_file is not None:
+            raise UsageError("--endpoint-token-file requires --endpoint")
+        else:
+            endpoint = ManagedDaemonAdapter()
+    except UsageError as exc:
+        _emit_error(exc, mode)
+        return EXIT_USAGE
     ctl = CodexCtl(endpoint)
 
     try:

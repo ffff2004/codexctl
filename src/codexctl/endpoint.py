@@ -4,7 +4,7 @@ Two real production behaviors justify this seam:
 
 - ``ManagedDaemonAdapter`` may start the experimental Codex daemon lifecycle
   to make a compatible shared app-server available.
-- ``ExternalSocketAdapter`` honors ``--socket`` and performs no lifecycle
+- ``ExternalEndpointAdapter`` honors ``--endpoint`` and performs no lifecycle
   mutation at all.
 
 Core execution only ever sees an :class:`AppServerEndpoint`.
@@ -16,19 +16,49 @@ import asyncio
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import parse_qsl, unquote, urlsplit
 
-from .model import CodexCtlError, ErrorCode
+from .model import CodexCtlError, ErrorCode, UsageError
 from .rollout import codex_home
 
 
 @dataclass(frozen=True)
 class AppServerEndpoint:
-    socket_path: Path
+    """A resolved app-server location, opaque outside transport code."""
+
+    display: str
+    target: "UnixTarget | TcpTarget" = field(repr=False)
     runtime_pid: int | None = None
     runtime_version: str | None = None
+
+
+@dataclass(frozen=True)
+class UnixTarget:
+    path: Path
+
+
+@dataclass(frozen=True)
+class TcpTarget:
+    url: str
+    token_file: Path | None
+
+
+# Endpoint URLs are locations, never credential carriers. Keep this closed
+# list deliberately specific so ordinary application query parameters remain
+# opaque and are forwarded unchanged.
+_CREDENTIAL_QUERY_KEYS = frozenset(
+    {
+        "token",
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "bearer_token",
+        "authorization",
+    }
+)
 
 
 @runtime_checkable
@@ -80,16 +110,19 @@ class ManagedDaemonAdapter:
     async def _probe(self, socket_path: Path) -> AppServerEndpoint | None:
         if not socket_path.exists():
             return None
-        from .appserver import UnixSocketAppServerAdapter
+        from .appserver import connect_endpoint
 
         try:
-            adapter = await UnixSocketAppServerAdapter.connect(socket_path, timeout=5.0)
+            adapter = await connect_endpoint(
+                AppServerEndpoint(str(socket_path), UnixTarget(socket_path)), timeout=5.0
+            )
         except CodexCtlError:
             return None
         version = adapter.app_server_version
         await adapter.close()
         return AppServerEndpoint(
-            socket_path=socket_path,
+            display=str(socket_path),
+            target=UnixTarget(socket_path),
             runtime_pid=_pid_from_pidfile(self._home),
             runtime_version=version,
         )
@@ -131,7 +164,8 @@ class ManagedDaemonAdapter:
             )
         pid = payload.get("pid")
         return AppServerEndpoint(
-            socket_path=Path(socket_path),
+            display=str(socket_path),
+            target=UnixTarget(Path(socket_path)),
             runtime_pid=int(pid) if pid is not None else None,
             runtime_version=payload.get("appServerVersion"),
         )
@@ -168,22 +202,75 @@ def _last_json_object(text: str) -> dict | None:
     return None
 
 
-class ExternalSocketAdapter:
+class ExternalEndpointAdapter:
     """Resolves a caller-supplied endpoint; never manages its lifecycle."""
 
     mode = "external"
 
-    def __init__(self, socket_path: Path) -> None:
-        self._socket_path = socket_path
+    def __init__(self, endpoint: str, token_file: Path | None = None) -> None:
+        self._endpoint = parse_external_endpoint(endpoint, token_file)
 
     async def resolve(self) -> AppServerEndpoint:
-        if not self._socket_path.exists():
+        target = self._endpoint.target
+        if isinstance(target, UnixTarget) and not target.path.exists():
             raise CodexCtlError(
                 ErrorCode.APP_SERVER_UNAVAILABLE,
-                f"external app-server socket does not exist: {self._socket_path}",
+                f"external app-server socket does not exist: {target.path}",
             )
-        return AppServerEndpoint(socket_path=self._socket_path)
+        return self._endpoint
 
     def probe_cli_version(self) -> str | None:
         # External endpoints own no codex binary lifecycle.
         return None
+
+
+def parse_external_endpoint(endpoint: str, token_file: Path | None = None) -> AppServerEndpoint:
+    """Parse the deliberately small external endpoint vocabulary.
+
+    Tokens are represented only by their file path and are read by the TCP
+    transport immediately before it opens a connection.
+    """
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        # Do not reflect a caller-provided URI: it could contain a credential.
+        raise UsageError("invalid --endpoint") from exc
+
+    if parsed.scheme == "unix":
+        if (
+            not endpoint.startswith("unix:///")
+            or endpoint.startswith("unix:////")
+            or parsed.netloc
+            # urlsplit() cannot distinguish an absent delimiter from an empty
+            # query or fragment, but Unix endpoints permit neither.
+            or "?" in endpoint
+            or "#" in endpoint
+            or not parsed.path.startswith("/")
+        ):
+            raise UsageError("--endpoint unix URI must be unix:///absolute/path")
+        if token_file is not None:
+            raise UsageError("--endpoint-token-file is supported only for ws:// endpoints")
+        path = Path(unquote(parsed.path))
+        if not path.is_absolute():  # Defensive: keep URI validation explicit.
+            raise UsageError("--endpoint unix URI must be unix:///absolute/path")
+        return AppServerEndpoint(display=endpoint, target=UnixTarget(path))
+
+    if parsed.scheme != "ws":
+        raise UsageError("--endpoint must use unix:///absolute/path or ws://host:port")
+    if (
+        not parsed.hostname
+        or port is None
+        # Preserve the URL path/query verbatim, but never accept a fragment
+        # delimiter (including an empty fragment) as part of the endpoint.
+        or "#" in endpoint
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise UsageError("--endpoint ws URI must be ws://host:port[/path][?query]")
+    if any(
+        key.casefold() in _CREDENTIAL_QUERY_KEYS
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    ):
+        raise UsageError("--endpoint must not carry credentials; use --endpoint-token-file")
+    return AppServerEndpoint(display=endpoint, target=TcpTarget(endpoint, token_file))

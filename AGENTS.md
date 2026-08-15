@@ -58,8 +58,8 @@ Python >= 3.11, src layout (`src/codexctl/`), pytest with
   outcomes, projected events, selectors, error codes. No wire types here.
 - `core.py` — `CodexCtl`: dispatch, orchestration, race handling, follow
   replay/live frontier, error mapping.
-- `endpoint.py` — managed daemon lifecycle vs external `--socket`.
-- `appserver.py` — JSON-RPC over websocket Unix socket, initialize
+- `endpoint.py` — managed daemon lifecycle vs external `--endpoint`.
+- `appserver.py` — JSON-RPC over websocket transports, initialize
   handshake, unattended interaction policy, projection (compatibility
   firewall; raw Codex wire types never leave this module).
 - `rollout.py` — best-effort read-only rollout reader; never raises.

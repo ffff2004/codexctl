@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Protocol, TypeAlias, runtime_checkable
 
 from .model import (
+    CodexCtlError,
     DEFAULT_SANDBOX_POLICY,
     ErrorCode,
     ProjectedEvent,
@@ -236,17 +237,17 @@ class AppServerPort(Protocol):
     async def close(self) -> None: ...
 
 
-class UnixSocketAppServerAdapter:
-    """Production adapter: JSON-RPC over websocket on a Unix control socket.
+class WebSocketAppServerAdapter:
+    """Production adapter: JSON-RPC over an initialized websocket session.
 
-    The Codex app-server Unix endpoint speaks websocket framing over the
-    socket (standard HTTP Upgrade handshake). The websockets client's Unix
-    socket connector supplies the socket path separately from the HTTP URI.
+    Transport setup is intentionally outside this session implementation so
+    Unix and TCP endpoints share reader routing, projection, and the
+    unattended interaction policy.
     """
 
-    def __init__(self, conn: Any, socket_path: Path) -> None:
+    def __init__(self, conn: Any, display: str) -> None:
         self._conn = conn
-        self.socket_path = socket_path
+        self._display = display
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
         self._ids = itertools.count(1)
@@ -258,28 +259,6 @@ class UnixSocketAppServerAdapter:
         self.interaction_count = 0
 
     # -- lifecycle -----------------------------------------------------------
-
-    @classmethod
-    async def connect(cls, socket_path: Path, timeout: float = 15.0) -> "UnixSocketAppServerAdapter":
-        from websockets.asyncio.client import unix_connect
-
-        try:
-            conn = await asyncio.wait_for(
-                # Codex's Unix transport closes the handshake when this
-                # client advertises its default permessage-deflate extension.
-                unix_connect(str(Path(socket_path)), max_size=None, compression=None),
-                timeout,
-            )
-        except Exception as exc:  # noqa: BLE001 - mapped to application error
-            raise _unavailable(socket_path, exc) from exc
-        adapter = cls(conn, socket_path)
-        adapter._reader_task = asyncio.create_task(adapter._reader())
-        try:
-            await adapter._initialize()
-        except Exception:
-            await adapter.close()
-            raise
-        return adapter
 
     async def _initialize(self) -> None:
         result = await self._request(
@@ -427,7 +406,7 @@ class UnixSocketAppServerAdapter:
         self, method: str, params: dict | None = None
     ) -> AppServerResponse:
         if self._closed:
-            raise _unavailable(self.socket_path, RuntimeError("connection closed"))
+            raise _unavailable(self._display, RuntimeError("connection closed"))
         request_id = next(self._ids)
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
@@ -533,6 +512,72 @@ class UnixSocketAppServerAdapter:
         )
 
 
+async def connect_endpoint(endpoint: "AppServerEndpoint", timeout: float = 15.0) -> AppServerPort:
+    """Connect one resolved endpoint without exposing transport to callers."""
+    # Delayed import avoids an endpoint -> appserver import cycle during
+    # managed-runtime probing.
+    from .endpoint import TcpTarget, UnixTarget
+
+    target = endpoint.target
+    try:
+        if isinstance(target, UnixTarget):
+            from websockets.asyncio.client import unix_connect
+
+            # Codex's Unix transport rejects the client's default
+            # permessage-deflate offer.
+            conn = await asyncio.wait_for(
+                unix_connect(str(target.path), max_size=None, compression=None), timeout
+            )
+        elif isinstance(target, TcpTarget):
+            from websockets.asyncio.client import connect
+
+            headers: dict[str, str] | None = None
+            if target.token_file is not None:
+                token = _read_endpoint_token(target.token_file)
+                headers = {"Authorization": f"Bearer {token}"}
+            conn = await asyncio.wait_for(
+                connect(
+                    target.url,
+                    additional_headers=headers,
+                    max_size=None,
+                    compression=None,
+                ),
+                timeout,
+            )
+        else:  # pragma: no cover - targets are a closed endpoint vocabulary
+            raise RuntimeError("unknown app-server endpoint target")
+    except CodexCtlError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - mapped to application error
+        raise _unavailable(endpoint.display, exc) from exc
+
+    adapter = WebSocketAppServerAdapter(conn, endpoint.display)
+    adapter._reader_task = asyncio.create_task(adapter._reader())
+    try:
+        await adapter._initialize()
+    except Exception:
+        await adapter.close()
+        raise
+    return adapter
+
+
+def _read_endpoint_token(token_file: Path) -> str:
+    try:
+        token = token_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_UNAVAILABLE,
+            "cannot read app-server endpoint token file",
+            cause=exc,
+        ) from exc
+    if not token:
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_UNAVAILABLE,
+            "app-server endpoint token file is empty",
+        )
+    return token
+
+
 def _is_missing_method_error(exc: JsonRpcError) -> bool:
     if exc.code == -32601:
         return True
@@ -627,12 +672,10 @@ def _project_codex_error_info(data: Any) -> str | None:
     return str(value) if value is not None else None
 
 
-def _unavailable(socket_path: Path, cause: Exception) -> Exception:
-    from .model import CodexCtlError
-
+def _unavailable(endpoint: str, cause: Exception) -> Exception:
     return CodexCtlError(
         ErrorCode.APP_SERVER_UNAVAILABLE,
-        f"cannot reach app-server at {socket_path}: {cause}",
+        f"cannot reach app-server at {endpoint}: {cause}",
         cause=cause,
     )
 

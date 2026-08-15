@@ -19,7 +19,7 @@ from .appserver import (
     AppServerTurn,
     AppServerPort,
     JsonRpcError,
-    UnixSocketAppServerAdapter,
+    connect_endpoint,
 )
 from .endpoint import AppServerEndpoint, EndpointPort
 from .model import (
@@ -527,7 +527,7 @@ class CodexCtl:
         try:
             endpoint = await self._endpoint.resolve()
             checks.append(
-                DoctorCheck("endpoint reachable", True, str(endpoint.socket_path))
+                DoctorCheck("endpoint reachable", True, endpoint.display)
             )
             if endpoint.runtime_pid is not None:
                 checks.append(DoctorCheck("runtime pid", True, str(endpoint.runtime_pid)))
@@ -601,7 +601,7 @@ class CodexCtl:
 
 
 async def _default_connect(endpoint: AppServerEndpoint) -> AppServerPort:
-    return await UnixSocketAppServerAdapter.connect(endpoint.socket_path)
+    return await connect_endpoint(endpoint)
 
 
 def _usage_to_context(usage: dict | None) -> ContextUsage | None:

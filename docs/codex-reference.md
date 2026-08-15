@@ -20,8 +20,9 @@ as an alternative source for current architecture or behavior.
 
 ### Control socket and transport
 
-Consulted for the websocket-over-unix-socket transport and the default
-control socket path.
+Consulted for the websocket-over-unix-socket transport, the default control
+socket path, and the common WebSocket handshake behavior used by external TCP
+endpoints.
 
 - `codex-rs/app-server/README.md` — transport list: the unix socket
   endpoint serves websocket connections (standard HTTP Upgrade
@@ -33,6 +34,9 @@ control socket path.
   upgrade error path.
 - `codex-rs/app-server-transport/src/transport/unix_socket_tests.rs` —
   upstream Unix socket handshake test using `tokio_tungstenite`.
+- `codex-rs/app-server-transport/src/transport/websocket.rs` — WebSocket
+  transport handshake and request-header handling consulted for TCP endpoint
+  compatibility.
 
 ### JSON-RPC protocol surface
 

@@ -47,7 +47,8 @@ Every command accepts:
 | `-o, --output {text,json,jsonl}` | Output mode (default `text`) |
 | `--json` | Shorthand for `-o json` |
 | `--jsonl` | Shorthand for `-o jsonl` |
-| `--socket <path>` | Use an externally managed app-server socket; `codexctl` performs no daemon lifecycle actions in this mode |
+| `--endpoint <uri>` | Use an externally managed app-server endpoint; `codexctl` performs no daemon lifecycle actions in this mode |
+| `--endpoint-token-file <path>` | Read a Bearer token from this file immediately before connecting to a `ws://` endpoint |
 
 ### start
 
@@ -313,7 +314,7 @@ may add new item types and fields (callers must ignore unknowns).
 
 ## Runtime resolution
 
-Without `--socket`, `codexctl` uses the managed shared runtime:
+Without `--endpoint`, `codexctl` uses the managed shared runtime:
 
 1. Probe the default control socket
    (`$CODEX_HOME/app-server-control/app-server-control.sock`, with
@@ -324,6 +325,19 @@ Without `--socket`, `codexctl` uses the managed shared runtime:
 
 If the daemon command produces no parseable lifecycle JSON, `codexctl`
 reports `INCOMPATIBLE_CODEX` rather than guessing.
+
+External endpoints use one of these forms:
+
+- `unix:///absolute/path` connects over the local Unix control socket.
+- `ws://HOST:PORT[/PATH][?QUERY]` connects over TCP and preserves the path
+  and query exactly. `--endpoint-token-file` is accepted only for this form;
+  its trimmed, non-empty contents are sent as `Authorization: Bearer ...`.
+  Credential-bearing query parameters (`token`, `access_token`, `id_token`,
+  `refresh_token`, `bearer_token`, and `authorization`, case-insensitively)
+  are rejected; credentials must not be placed in an endpoint URL.
+
+Malformed endpoint configuration is a `USAGE_ERROR`. An unavailable endpoint,
+or a missing, unreadable, or empty token file, is `APP_SERVER_UNAVAILABLE`.
 
 Environment variables:
 

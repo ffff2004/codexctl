@@ -14,8 +14,8 @@ uv sync
 ```
 
 Requires a local `codex` CLI with app-server support (managed mode starts
-the shared daemon automatically), or an externally managed socket via
-`--socket`.
+the shared daemon automatically), or an externally managed endpoint via
+`--endpoint`.
 
 ## Quick start
 
