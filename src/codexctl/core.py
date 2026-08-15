@@ -608,10 +608,10 @@ def _map_rpc_error(
     info = ""
     info = exc.codex_error_info or ""
     code = default
-    if "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
-        code = ErrorCode.TURN_NOT_STEERABLE
-    elif exc.code == -32601:
+    if exc.code == -32601:
         code = ErrorCode.INCOMPATIBLE_CODEX
+    elif "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
+        code = ErrorCode.TURN_NOT_STEERABLE
     elif any(marker in lowered for marker in _THREAD_NOT_FOUND_MARKERS):
         code = ErrorCode.THREAD_NOT_FOUND
     elif any(marker in lowered for marker in ("active turn", "already active", "busy")):
@@ -622,7 +622,9 @@ def _map_rpc_error(
 def _map_resume_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
     message = exc.message or ""
     lowered = message.lower()
-    if any(marker in lowered for marker in _THREAD_NOT_FOUND_MARKERS):
+    if exc.code == -32601:
+        code = ErrorCode.INCOMPATIBLE_CODEX
+    elif any(marker in lowered for marker in _THREAD_NOT_FOUND_MARKERS):
         code = ErrorCode.THREAD_NOT_FOUND
     else:
         # Recovery failure never silently creates a replacement thread.
@@ -633,8 +635,12 @@ def _map_resume_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
 def _map_interrupt_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
     # A rejected interrupt is always a domain condition: the turn we targeted
     # is gone or un-interruptible. Message keywords must not reclassify it.
-    code = ErrorCode.INCOMPATIBLE_CODEX if exc.code == -32601 else ErrorCode.NO_ACTIVE_TURN
-    return CodexCtlError(code, exc.message or "", thread_id=thread_id, cause=exc)
+    return CodexCtlError(
+        ErrorCode.NO_ACTIVE_TURN,
+        exc.message or "",
+        thread_id=thread_id,
+        cause=exc,
+    )
 
 
 def _map_steer_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
@@ -642,7 +648,9 @@ def _map_steer_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
     lowered = message.lower()
     info = ""
     info = exc.codex_error_info or ""
-    if "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
+    if exc.code == -32601:
+        code = ErrorCode.INCOMPATIBLE_CODEX
+    elif "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
         code = ErrorCode.TURN_NOT_STEERABLE
     elif "expectedturn" in lowered or "no active turn" in lowered or "invalid" in lowered:
         code = ErrorCode.NO_ACTIVE_TURN

@@ -182,6 +182,19 @@ class TestStart:
             await make_ctl(server).run(Start(prompt="hello"))
         assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
 
+    async def test_missing_method_precedes_not_steerable_mapping(self):
+        server = FakeAppServer()
+        server.result("thread/start", {"thread": {"id": "t1"}})
+        server.fail(
+            "turn/start",
+            -32601,
+            "active turn cannot be steered",
+            {"codexErrorInfo": "ActiveTurnNotSteerable"},
+        )
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(Start(prompt="hello"))
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
+
     async def test_notifications_from_other_threads_are_ignored(self):
         server = FakeAppServer()
         self._script(server)
@@ -288,6 +301,13 @@ class TestResume:
         with pytest.raises(CodexCtlError) as excinfo:
             await make_ctl(server).run(Resume(thread_id="t1", prompt="more"))
         assert excinfo.value.code == ErrorCode.THREAD_NOT_FOUND
+
+    async def test_missing_resume_method_maps_to_incompatible(self):
+        server = FakeAppServer()
+        server.fail("thread/resume", -32601, "method not found: thread/resume")
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(Resume(thread_id="t1", prompt="more"))
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
 
     async def test_recovery_failure_never_creates_replacement_thread(self):
         server = FakeAppServer()
@@ -647,6 +667,33 @@ class TestSteer:
             await make_ctl(server).run(Steer(thread_id="t1", input="x"))
         assert excinfo.value.code == ErrorCode.NO_ACTIVE_TURN
 
+    async def test_missing_steer_method_maps_to_incompatible(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/read",
+            {"thread": thread_doc(turns=[turn_doc("u1", status="inProgress")])},
+        )
+        server.fail("turn/steer", -32601, "method not found: turn/steer")
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(Steer(thread_id="t1", input="x"))
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
+
+    async def test_missing_steer_method_precedes_not_steerable_mapping(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/read",
+            {"thread": thread_doc(turns=[turn_doc("u1", status="inProgress")])},
+        )
+        server.fail(
+            "turn/steer",
+            -32601,
+            "active turn cannot be steered",
+            {"codexErrorInfo": "ActiveTurnNotSteerable"},
+        )
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(Steer(thread_id="t1", input="x"))
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
+
 
 # ---------------------------------------------------------------------------
 # interrupt
@@ -691,6 +738,18 @@ class TestInterrupt:
             {"thread": thread_doc(turns=[turn_doc("u1", status="inProgress")])},
         )
         server.fail("turn/interrupt", -32000, "no active turn")
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(Interrupt(thread_id="t1"))
+        assert excinfo.value.code == ErrorCode.NO_ACTIVE_TURN
+        assert server.methods_requested.count("turn/interrupt") == 1
+
+    async def test_missing_interrupt_method_is_no_active_turn(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/read",
+            {"thread": thread_doc(turns=[turn_doc("u1", status="inProgress")])},
+        )
+        server.fail("turn/interrupt", -32601, "method not found: turn/interrupt")
         with pytest.raises(CodexCtlError) as excinfo:
             await make_ctl(server).run(Interrupt(thread_id="t1"))
         assert excinfo.value.code == ErrorCode.NO_ACTIVE_TURN
