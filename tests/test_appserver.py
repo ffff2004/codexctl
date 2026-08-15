@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -251,6 +254,84 @@ class TestTypedOperations:
 
 
 class TestUnixSocketConnection:
+    async def test_codex_socket_handshake_disables_permessage_deflate(self, tmp_path):
+        socket_path = tmp_path / "app-server.sock"
+
+        async def handle(reader, writer):
+            request = await reader.readuntil(b"\r\n\r\n")
+
+            # Codex v0.147's Unix transport uses tokio_tungstenite::accept_async,
+            # which closes the socket when websockets advertises its default
+            # permessage-deflate extension instead of completing the upgrade.
+            if b"sec-websocket-extensions: permessage-deflate" in request.lower():
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            headers = {
+                line.split(b":", 1)[0].lower(): line.split(b":", 1)[1].strip()
+                for line in request.split(b"\r\n")[1:]
+                if b":" in line
+            }
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    headers[b"sec-websocket-key"]
+                    + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                ).digest()
+            )
+            response = (
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: "
+                + accept
+                + b"\r\n\r\n"
+            )
+            payload = json.dumps(
+                {
+                    "id": 1,
+                    "result": {
+                        "userAgent": "codex-app-server/0.147.0",
+                        "codexHome": str(tmp_path / "codex-home"),
+                    },
+                }
+            ).encode()
+            if len(payload) < 126:
+                frame_header = bytes((0x81, len(payload)))
+            else:
+                frame_header = b"\x81\x7e" + struct.pack("!H", len(payload))
+            writer.write(response + frame_header + payload)
+            await writer.drain()
+
+            # Consume the client's initialize and initialized frames, then
+            # complete the close handshake when the adapter is cleaned up.
+            while True:
+                first, second = await reader.readexactly(2)
+                frame_length = second & 0x7F
+                if frame_length == 126:
+                    frame_length = struct.unpack("!H", await reader.readexactly(2))[0]
+                elif frame_length == 127:
+                    frame_length = struct.unpack("!Q", await reader.readexactly(8))[0]
+                if second & 0x80:
+                    await reader.readexactly(4)
+                await reader.readexactly(frame_length)
+                if first & 0x0F == 0x08:
+                    writer.write(b"\x88\x00")
+                    await writer.drain()
+                    break
+
+        server = await asyncio.start_unix_server(handle, path=socket_path)
+        adapter = None
+        try:
+            adapter = await UnixSocketAppServerAdapter.connect(socket_path)
+        finally:
+            if adapter is not None:
+                await adapter.close()
+            server.close()
+            await server.wait_closed()
+
+        assert adapter.user_agent == "codex-app-server/0.147.0"
+
     async def test_connects_over_unix_socket_and_completes_initialization(self, tmp_path):
         socket_path = tmp_path / "app-server.sock"
         received: list[dict] = []

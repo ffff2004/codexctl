@@ -27,6 +27,11 @@ control socket path.
   handshake) at `$CODEX_HOME/app-server-control/app-server-control.sock`.
 - `codex-rs/app-server-transport/src/transport/mod.rs` — socket
   directory/file name constants confirming the default path layout.
+- `codex-rs/app-server-transport/src/transport/unix_socket.rs` — control
+  socket acceptor implementation and its `tokio_tungstenite::accept_async`
+  upgrade error path.
+- `codex-rs/app-server-transport/src/transport/unix_socket_tests.rs` —
+  upstream Unix socket handshake test using `tokio_tungstenite`.
 
 ### JSON-RPC protocol surface
 
@@ -58,6 +63,9 @@ Consulted for `codex app-server daemon start` semantics.
 - `codex-rs/app-server-daemon/src/lib.rs` — idempotent start; JSON
   status on stdout (`alreadyRunning` / `bootstrapped`, `socketPath`,
   version fields).
+- `codex-rs/app-server-daemon/src/client.rs` — daemon-side control socket
+  probe using `tokio_tungstenite::client_async` and the `ws://localhost/`
+  handshake URI.
 
 ### Rollout files
 

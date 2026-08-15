@@ -263,7 +263,10 @@ class UnixSocketAppServerAdapter:
 
         try:
             conn = await asyncio.wait_for(
-                unix_connect(str(Path(socket_path)), max_size=None), timeout
+                # Codex's Unix transport closes the handshake when this
+                # client advertises its default permessage-deflate extension.
+                unix_connect(str(Path(socket_path)), max_size=None, compression=None),
+                timeout,
             )
         except Exception as exc:  # noqa: BLE001 - mapped to application error
             raise _unavailable(socket_path, exc) from exc
