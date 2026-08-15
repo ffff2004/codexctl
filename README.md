@@ -7,17 +7,11 @@ interrupting Codex threads through a shared Codex app-server runtime.
 object that survives process exits, terminal closures, and machine restarts,
 and it never queues, forks, or silently replaces threads.
 
-## Install
-
-```sh
-uv sync
-```
+## Quick start
 
 Requires a local `codex` CLI with app-server support (managed mode starts
 the shared daemon automatically), or an externally managed endpoint via
 `--endpoint`.
-
-## Quick start
 
 ```sh
 codexctl start -- fix the failing test in src/
@@ -41,8 +35,6 @@ codexctl doctor
 
 ```sh
 uv sync
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push --install-hooks
 uv run pytest
-uv run ruff check .
-uv run ruff format --check .
-uv run pyright
 ```

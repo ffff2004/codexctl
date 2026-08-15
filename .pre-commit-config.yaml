@@ -1,0 +1,32 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --locked ruff format
+        language: system
+        types_or: [python, pyi]
+        stages: [pre-commit]
+
+      - id: ruff-check-fix
+        name: ruff check --fix
+        entry: uv run --locked ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        stages: [pre-commit]
+
+      - id: pyright
+        name: pyright
+        entry: uv run --locked pyright
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: pytest
+        name: pytest
+        entry: uv run --locked pytest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
