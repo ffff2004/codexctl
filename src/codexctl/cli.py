@@ -255,9 +255,7 @@ def main(argv: list[str] | None = None) -> int:
             f"output mode {mode!r} is not supported for {args.command}"
             + (" --detach" if detach else ""),
         )
-        # The requested mode is invalid by definition, so the rejection is
-        # always plain text on stderr.
-        TextRenderer().error(error)
+        _emit_error(error, mode)
         return EXIT_USAGE
 
     try:

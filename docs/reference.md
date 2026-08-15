@@ -200,9 +200,10 @@ The allowed output modes per command (the full contract):
 | `list` | ✓ | ✓ | — |
 | `doctor` | ✓ | ✓ | — |
 
-Requesting an unsupported mode is a usage error: `codexctl` prints
-`OUTPUT_MODE_NOT_SUPPORTED` as plain text on stderr and exits 2 without
-touching the runtime.
+Requesting an unsupported mode is a usage error and exits 2 without touching
+the runtime. The error uses the requested output mode: human-readable text is
+written to stderr, while `json` and `jsonl` use their structured error shapes
+on stdout.
 
 - **text** — human-readable rendering on stdout; diagnostics on stderr.
 - **json** — exactly one complete JSON document on stdout (snapshot

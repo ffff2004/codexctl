@@ -5,6 +5,8 @@ All paths tested here return before any runtime connection is attempted.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from codexctl.cli import (
@@ -47,30 +49,46 @@ class TestOutputMatrixContract:
 
 
 class TestOutputModeRejection:
-    def test_json_for_streaming_command_is_usage_error(self, capsys):
-        code = main(["start", "-o", "json", "--", "hello"])
-        assert code == EXIT_USAGE
+    @pytest.mark.parametrize(
+        ("argv", "mode"),
+        [
+            (["start", "-o", "json", "--", "hello"], "json"),
+            (["status", "t1", "--jsonl"], "jsonl"),
+        ],
+    )
+    def test_structured_errors_use_stdout_for_requested_mode(
+        self, argv, mode, capsys
+    ):
+        assert main(argv) == EXIT_USAGE
         captured = capsys.readouterr()
-        assert "OUTPUT_MODE_NOT_SUPPORTED" in captured.err
+        assert captured.err == ""
 
-    def test_jsonl_for_status_is_usage_error(self, capsys):
-        code = main(["status", "t1", "--jsonl"])
-        assert code == EXIT_USAGE
+        document = json.loads(captured.out)
+        if mode == "jsonl":
+            assert document.pop("type") == "error"
+        assert set(document) == {"error"}
+        assert set(document["error"]) == {"code", "message"}
+        assert document["error"]["code"] == "OUTPUT_MODE_NOT_SUPPORTED"
+
+    def test_text_errors_stay_on_stderr(self, capsys):
+        assert main(["start"]) == EXIT_USAGE
         captured = capsys.readouterr()
         assert captured.out == ""
-        assert "OUTPUT_MODE_NOT_SUPPORTED" in captured.err
+        assert "USAGE_ERROR" in captured.err
 
     def test_jsonl_for_detached_start_rejected(self, capsys):
         code = main(["start", "--detach", "--jsonl", "--", "hello"])
         assert code == EXIT_USAGE
 
     def test_json_error_document_for_jsonl_mode(self, capsys):
-        # doctor -o jsonl is rejected before any runtime access; the rejection
-        # is plain text on stderr because the requested mode is invalid.
+        # doctor -o jsonl is rejected before any runtime access.
         code = main(["doctor", "-o", "jsonl"])
         assert code == EXIT_USAGE
         captured = capsys.readouterr()
-        assert "OUTPUT_MODE_NOT_SUPPORTED" in captured.err
+        assert captured.err == ""
+        assert json.loads(captured.out)["error"]["code"] == (
+            "OUTPUT_MODE_NOT_SUPPORTED"
+        )
 
 
 class TestUsageErrors:
