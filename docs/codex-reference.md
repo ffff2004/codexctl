@@ -3,7 +3,7 @@
 Record of the Codex source files consulted when implementing codexctl's
 interoperability with the Codex app-server runtime.
 
-This document is a external reference only: it records *where each
+This document is an upstream reference only: it records *where each
 protocol fact was read from*, not the facts themselves. Current public
 behavior is defined in [reference.md](reference.md); current internal
 design in [architecture.md](architecture.md). Do not use this document
