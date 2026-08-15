@@ -16,11 +16,13 @@ from codexctl.cli import (
     EXIT_TURN,
     EXIT_USAGE,
     _OUTPUT_MATRIX,
+    _build_command,
     _split_prompt,
+    build_parser,
     exit_code_for,
     main,
 )
-from codexctl.model import CodexCtlError, ErrorCode
+from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, Start
 
 
 class TestOutputMatrixContract:
@@ -124,6 +126,30 @@ class TestUsageErrors:
     def test_version_flag(self, capsys):
         assert main(["--version"]) == EXIT_OK
         assert "codexctl" in capsys.readouterr().out
+
+
+class TestSandboxPolicy:
+    @pytest.mark.parametrize(
+        ("argument", "policy"),
+        (
+            ("read-only", SandboxPolicy.readOnly),
+            ("workspace-write", SandboxPolicy.workspaceWrite),
+            ("danger-full-access", SandboxPolicy.dangerFullAccess),
+        ),
+    )
+    def test_parser_and_command_use_public_policy_vocabulary(self, argument, policy):
+        args = build_parser().parse_args(
+            ["start", "--sandbox", argument]
+        )
+
+        command = _build_command(args, "hello")
+
+        assert isinstance(command, Start)
+        assert command.config.sandbox is policy
+
+    def test_parser_rejects_legacy_camel_case_policy(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["start", "--sandbox", "readOnly"])
 
 
 class TestSplitPrompt:

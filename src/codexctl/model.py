@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from typing import Any, AsyncIterator, Literal, Union
 
 
@@ -76,6 +76,26 @@ class UsageError(CodexCtlError):
 
 
 # ---------------------------------------------------------------------------
+# Start configuration
+# ---------------------------------------------------------------------------
+
+
+class SandboxPolicy(Enum):
+    """Domain sandbox presets accepted by ``start --sandbox``.
+
+    These values are deliberately independent of the app-server wire enum;
+    serialization belongs to the app-server adapter.
+    """
+
+    readOnly = auto()
+    workspaceWrite = auto()
+    dangerFullAccess = auto()
+
+
+DEFAULT_SANDBOX_POLICY = SandboxPolicy.workspaceWrite
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -84,15 +104,14 @@ class UsageError(CodexCtlError):
 class StartConfig:
     """Deliberately limited start-time configuration.
 
-    ``sandbox`` uses Codex sandbox modes: ``readOnly``, ``workspaceWrite``,
-    ``dangerFullAccess``. Approval policy is fixed to unattended execution
-    and is not caller-configurable in v1.
+    ``sandbox`` uses the public Codex sandbox presets. Approval policy is
+    fixed to unattended execution and is not caller-configurable in v1.
     """
 
     cwd: str | None = None
     model: str | None = None
     effort: str | None = None
-    sandbox: str | None = None
+    sandbox: SandboxPolicy | None = None
 
 
 @dataclass(frozen=True)

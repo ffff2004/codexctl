@@ -53,7 +53,7 @@ Every command accepts:
 
 ```sh
 codexctl start [--detach] [--cwd DIR] [--model MODEL] [--effort EFFORT]
-               [--sandbox {readOnly,workspaceWrite,dangerFullAccess}] -- PROMPT...
+               [--sandbox {read-only,workspace-write,danger-full-access}] -- PROMPT...
 ```
 
 Creates a new thread and starts its first turn with the prompt. Everything
@@ -61,7 +61,7 @@ after the bare `--` is prompt text (flags included).
 
 - The approval policy is fixed to unattended execution; it is not
   caller-configurable.
-- The sandbox defaults to `workspaceWrite` when `--sandbox` is omitted.
+- The sandbox defaults to `workspace-write` when `--sandbox` is omitted.
 - `--detach` returns as soon as the turn has started and disconnects; the
   turn keeps running in the shared runtime.
 

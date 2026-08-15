@@ -17,6 +17,7 @@ from codexctl.appserver import (
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
+    _serialize_sandbox_policy,
     project_notification,
     project_response,
 )
@@ -99,7 +100,7 @@ class FakeAppServer:
     async def start_thread(self, config: StartConfig) -> AppServerThread | None:
         params: dict[str, Any] = {
             "approvalPolicy": "never",
-            "sandbox": config.sandbox or "workspaceWrite",
+            "sandbox": _serialize_sandbox_policy(config.sandbox),
         }
         if config.cwd:
             params["cwd"] = config.cwd

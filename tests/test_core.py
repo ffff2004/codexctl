@@ -27,6 +27,7 @@ from codexctl.model import (
     ReplayAll,
     ReplayTail,
     Resume,
+    SandboxPolicy,
     Start,
     StartConfig,
     Status,
@@ -130,7 +131,7 @@ class TestStart:
 
         assert server.params_of("thread/start") == {
             "approvalPolicy": "never",
-            "sandbox": "workspaceWrite",
+            "sandbox": "workspace-write",
         }
         assert server.params_of("turn/start") == {
             "threadId": "t1",
@@ -145,14 +146,17 @@ class TestStart:
             Start(
                 prompt="hi",
                 config=StartConfig(
-                    cwd="/work", model="gpt-5", effort="low", sandbox="readOnly"
+                    cwd="/work",
+                    model="gpt-5",
+                    effort="low",
+                    sandbox=SandboxPolicy.readOnly,
                 ),
             )
         )
         await collect(outcome)
         assert server.params_of("thread/start") == {
             "approvalPolicy": "never",
-            "sandbox": "readOnly",
+            "sandbox": "read-only",
             "cwd": "/work",
             "model": "gpt-5",
         }

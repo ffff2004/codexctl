@@ -28,6 +28,7 @@ from .model import (
     Resume,
     Start,
     StartConfig,
+    SandboxPolicy,
     Status,
     Steer,
     UsageError,
@@ -74,7 +75,11 @@ _OUTPUT_MATRIX: dict[tuple[str, bool], set[str]] = {
     ("doctor", False): {"text", "json"},
 }
 
-_SANDBOX_CHOICES = ("readOnly", "workspaceWrite", "dangerFullAccess")
+_SANDBOX_POLICY_BY_ARGUMENT = {
+    "read-only": SandboxPolicy.readOnly,
+    "workspace-write": SandboxPolicy.workspaceWrite,
+    "danger-full-access": SandboxPolicy.dangerFullAccess,
+}
 
 
 def exit_code_for(error: CodexCtlError) -> int:
@@ -105,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", default=None)
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
-    p.add_argument("--sandbox", choices=_SANDBOX_CHOICES, default=None)
+    p.add_argument("--sandbox", choices=_SANDBOX_POLICY_BY_ARGUMENT, default=None)
 
     p = sub.add_parser("resume", help="continue an existing thread with a new turn")
     _add_common(p)
@@ -167,7 +172,14 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
         return Start(
             prompt=prompt,
             config=StartConfig(
-                cwd=args.cwd, model=args.model, effort=args.effort, sandbox=args.sandbox
+                cwd=args.cwd,
+                model=args.model,
+                effort=args.effort,
+                sandbox=(
+                    _SANDBOX_POLICY_BY_ARGUMENT[args.sandbox]
+                    if args.sandbox is not None
+                    else None
+                ),
             ),
             detach=args.detach,
         )

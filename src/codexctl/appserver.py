@@ -15,12 +15,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol, TypeAlias, runtime_checkable
 
-from .model import ErrorCode, ProjectedEvent, StartConfig
+from .model import (
+    DEFAULT_SANDBOX_POLICY,
+    ErrorCode,
+    ProjectedEvent,
+    SandboxPolicy,
+    StartConfig,
+    UsageError,
+)
 
 CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
 DEFAULT_APPROVAL_POLICY = "never"
-DEFAULT_SANDBOX = "workspaceWrite"
 THREAD_LIST_PAGE_SIZE = 100
 
 # Synthetic notification method used to surface server-initiated interaction
@@ -28,6 +34,26 @@ THREAD_LIST_PAGE_SIZE = 100
 UNSUPPORTED_INTERACTION_METHOD = "codexctl/unsupportedInteraction"
 
 TERMINAL_TURN_STATUSES = {"completed", "interrupted", "failed"}
+
+_SANDBOX_POLICY_TO_WIRE: dict[SandboxPolicy, str] = {
+    SandboxPolicy.readOnly: "read-only",
+    SandboxPolicy.workspaceWrite: "workspace-write",
+    SandboxPolicy.dangerFullAccess: "danger-full-access",
+}
+
+
+def _serialize_sandbox_policy(policy: SandboxPolicy | None) -> str:
+    """Translate the public sandbox policy to the app-server wire enum."""
+    if policy is None:
+        policy = DEFAULT_SANDBOX_POLICY
+
+    try:
+        return _SANDBOX_POLICY_TO_WIRE[policy]
+    except (KeyError, TypeError) as exc:
+        choices = ", ".join(_SANDBOX_POLICY_TO_WIRE.values())
+        raise UsageError(
+            f"unsupported sandbox policy {policy!r}; expected one of: {choices}"
+        ) from exc
 
 
 # Each probe is the sole definition of a required operation: its projected
@@ -311,7 +337,7 @@ class UnixSocketAppServerAdapter:
     async def start_thread(self, config: StartConfig) -> AppServerThread | None:
         params: dict[str, Any] = {
             "approvalPolicy": DEFAULT_APPROVAL_POLICY,
-            "sandbox": config.sandbox or DEFAULT_SANDBOX,
+            "sandbox": _serialize_sandbox_policy(config.sandbox),
         }
         if config.cwd:
             params["cwd"] = config.cwd

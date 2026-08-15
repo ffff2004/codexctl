@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from websockets.asyncio.server import unix_serve
 
 from codexctl.appserver import (
@@ -23,7 +24,7 @@ from codexctl.appserver import (
     project_response,
     project_thread_status,
 )
-from codexctl.model import ErrorCode, StartConfig
+from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, StartConfig
 
 
 class TestProjectThreadStatus:
@@ -98,6 +99,47 @@ class TestProjectResponse:
 
 
 class TestTypedOperations:
+    async def test_start_thread_serializes_upstream_sandbox_enum(self, monkeypatch):
+        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, {"thread": {"id": "t1"}})
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        for policy, wire_value in (
+            (None, "workspace-write"),
+            (SandboxPolicy.readOnly, "read-only"),
+            (SandboxPolicy.workspaceWrite, "workspace-write"),
+            (SandboxPolicy.dangerFullAccess, "danger-full-access"),
+        ):
+            assert (
+                await adapter.start_thread(StartConfig(sandbox=policy))
+            ).id == "t1"
+            assert calls[-1] == (
+                "thread/start",
+                {"approvalPolicy": "never", "sandbox": wire_value},
+            )
+
+    async def test_start_thread_rejects_unsupported_sandbox_policy(self, monkeypatch):
+        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, {"thread": {"id": "t1"}})
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await adapter.start_thread(StartConfig(sandbox="not-a-policy"))  # type: ignore[arg-type]
+
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+        assert "unsupported sandbox policy 'not-a-policy'" in excinfo.value.message
+        assert calls == []
+
     async def test_operations_keep_wire_requests_inside_the_adapter(self, monkeypatch):
         adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
         calls = []
@@ -118,7 +160,9 @@ class TestTypedOperations:
         monkeypatch.setattr(adapter, "_request", request)
 
         assert (await adapter.start_thread(
-            StartConfig(cwd="/tmp", model="o4-mini", sandbox="readOnly")
+            StartConfig(
+                cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly
+            )
         )).id == "t1"
         assert await adapter.start_turn("t1", "hello", effort="high") == "u1"
         assert (await adapter.read_thread("t1")).id == "t1"
@@ -132,7 +176,7 @@ class TestTypedOperations:
                 "thread/start",
                 {
                     "approvalPolicy": "never",
-                    "sandbox": "readOnly",
+                    "sandbox": "read-only",
                     "cwd": "/tmp",
                     "model": "o4-mini",
                 },
