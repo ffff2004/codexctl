@@ -148,10 +148,14 @@ class FakeAppServer:
         )
         assert isinstance(response, EmptyResponse)
 
-    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse:
+    async def list_threads(
+        self, cursor: str | None = None, cwd: str | None = None
+    ) -> ThreadListResponse:
         params: dict[str, Any] = {"limit": 100}
         if cursor is not None:
             params["cursor"] = cursor
+        if cwd is not None:
+            params["cwd"] = cwd
         response = await self._request("thread/list", params)
         assert isinstance(response, ThreadListResponse)
         return response

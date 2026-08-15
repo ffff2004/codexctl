@@ -62,6 +62,8 @@ after the bare `--` is prompt text (flags included).
 - The approval policy is fixed to unattended execution; it is not
   caller-configurable.
 - The sandbox defaults to `workspace-write` when `--sandbox` is omitted.
+- When `--cwd` is omitted, `codexctl` passes its current directory explicitly
+  as the new thread's cwd.
 - `--detach` returns as soon as the turn has started and disconnects; the
   turn keeps running in the shared runtime.
 
@@ -162,10 +164,11 @@ against a different turn.
 ### list
 
 ```sh
-codexctl list
+codexctl list [--all]
 ```
 
-Lists stored threads known to the shared runtime, newest activity first:
+By default, lists stored threads whose workspace is the current directory,
+newest activity first. `--all` lists threads across all workspaces:
 
 ```text
 <thread-id>  idle  <preview>

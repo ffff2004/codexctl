@@ -8,6 +8,8 @@ stable error mapping, and the unattended interaction policy.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import codexctl.core as core
@@ -166,7 +168,8 @@ class TestStart:
         ]
         assert terminal.context is None
 
-    async def test_unattended_defaults_on_the_wire(self):
+    async def test_unattended_defaults_on_the_wire(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
         server = FakeAppServer()
         self._script(server)
         emit_completed(server, "t1", "u1")
@@ -176,6 +179,7 @@ class TestStart:
         assert server.params_of("thread/start") == {
             "approvalPolicy": "never",
             "sandbox": "workspace-write",
+            "cwd": str(Path.cwd()),
         }
         assert server.params_of("turn/start") == {
             "threadId": "t1",
@@ -822,7 +826,8 @@ class TestInterrupt:
 
 
 class TestList:
-    async def test_pagination(self):
+    async def test_pagination(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
         server = FakeAppServer()
         pages = iter(
             [
@@ -844,8 +849,21 @@ class TestList:
         assert [t.thread_id for t in snapshot.threads] == ["t1", "t2"]
         assert snapshot.threads[0].preview == "first"
         assert snapshot.threads[1].status == "active"
+        assert server.requests[0][1] == {"limit": 100, "cwd": str(tmp_path)}
         # second request carried the cursor
-        assert server.requests[1][1] == {"limit": 100, "cursor": "c1"}
+        assert server.requests[1][1] == {
+            "limit": 100,
+            "cursor": "c1",
+            "cwd": str(tmp_path),
+        }
+
+    async def test_all_lists_across_workspaces(self):
+        server = FakeAppServer()
+        server.result("thread/list", {"data": []})
+
+        await make_ctl(server).run(ListThreads(all_threads=True))
+
+        assert server.params_of("thread/list") == {"limit": 100}
 
 
 class TestDoctor:

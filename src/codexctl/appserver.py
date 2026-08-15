@@ -219,7 +219,9 @@ class AppServerPort(Protocol):
 
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None: ...
 
-    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse: ...
+    async def list_threads(
+        self, cursor: str | None = None, cwd: str | None = None
+    ) -> ThreadListResponse: ...
 
     async def check_lifecycle_operations(self) -> tuple[str, ...]:
         """Return required lifecycle operation labels unavailable on the runtime."""
@@ -388,10 +390,14 @@ class UnixSocketAppServerAdapter:
         )
         assert isinstance(response, EmptyResponse)
 
-    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse:
+    async def list_threads(
+        self, cursor: str | None = None, cwd: str | None = None
+    ) -> ThreadListResponse:
         params: dict[str, Any] = {"limit": THREAD_LIST_PAGE_SIZE}
         if cursor is not None:
             params["cursor"] = cursor
+        if cwd is not None:
+            params["cwd"] = cwd
         response = await self._request("thread/list", params)
         assert isinstance(response, ThreadListResponse)
         return response

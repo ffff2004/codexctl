@@ -172,7 +172,7 @@ class TestTypedOperations:
         assert (await adapter.resume_thread("t1")).id == "t1"
         assert await adapter.steer_turn("t1", "more", "u1") == "u1"
         await adapter.interrupt_turn("t1", "u1")
-        assert (await adapter.list_threads("c1")).next_cursor == "next"
+        assert (await adapter.list_threads("c1", cwd="/tmp")).next_cursor == "next"
 
         assert calls == [
             (
@@ -203,7 +203,7 @@ class TestTypedOperations:
                 },
             ),
             ("turn/interrupt", {"threadId": "t1", "turnId": "u1"}),
-            ("thread/list", {"limit": 100, "cursor": "c1"}),
+            ("thread/list", {"limit": 100, "cursor": "c1", "cwd": "/tmp"}),
         ]
         assert not hasattr(adapter, "request")
 

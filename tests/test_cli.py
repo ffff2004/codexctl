@@ -22,7 +22,7 @@ from codexctl.cli import (
     exit_code_for,
     main,
 )
-from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, Start
+from codexctl.model import CodexCtlError, ErrorCode, ListThreads, SandboxPolicy, Start
 
 
 class TestOutputMatrixContract:
@@ -109,6 +109,11 @@ class TestUsageErrors:
 
     def test_unknown_command(self, capsys):
         assert main(["frobnicate"]) == EXIT_USAGE
+
+    def test_list_all_builds_global_list_command(self):
+        args = build_parser().parse_args(["list", "--all"])
+
+        assert _build_command(args, None) == ListThreads(all_threads=True)
 
     def test_usage_errors_do_not_reuse_output_mode_code(self, capsys):
         # OUTPUT_MODE_NOT_SUPPORTED is reserved for the output-mode matrix;

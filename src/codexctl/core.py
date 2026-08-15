@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import rollout
@@ -85,7 +86,7 @@ class CodexCtl:
         if isinstance(command, Interrupt):
             return await self._interrupt(command)
         if isinstance(command, ListThreads):
-            return await self._list()
+            return await self._list(command)
         if isinstance(command, Doctor):
             return await self._doctor()
         raise CodexCtlError(
@@ -120,10 +121,13 @@ class CodexCtl:
     # -- start ----------------------------------------------------------------
 
     async def _start(self, command: Start) -> Any:
+        config = command.config
+        if config.cwd is None:
+            config = replace(config, cwd=str(Path.cwd()))
         adapter = await self._open()
         try:
             try:
-                thread = await adapter.start_thread(command.config)
+                thread = await adapter.start_thread(config)
             except JsonRpcError as exc:
                 raise _map_rpc_error(exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR) from exc
             thread_id = thread.id if thread is not None else None
@@ -133,7 +137,7 @@ class CodexCtl:
                     "thread/start returned no thread id",
                 )
             turn_id = await self._turn_start(
-                adapter, thread_id, command.prompt, effort=command.config.effort
+                adapter, thread_id, command.prompt, effort=config.effort
             )
         except Exception:
             await adapter.close()
@@ -482,14 +486,15 @@ class CodexCtl:
 
     # -- list ---------------------------------------------------------------------
 
-    async def _list(self) -> ThreadListSnapshot:
+    async def _list(self, command: ListThreads) -> ThreadListSnapshot:
         adapter = await self._open()
         try:
             records: list[ThreadRecord] = []
             cursor: str | None = None
+            cwd = None if command.all_threads else str(Path.cwd())
             for _ in range(25):  # pagination safety cap
                 try:
-                    page = await adapter.list_threads(cursor)
+                    page = await adapter.list_threads(cursor, cwd=cwd)
                 except JsonRpcError as exc:
                     raise _map_rpc_error(
                         exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR

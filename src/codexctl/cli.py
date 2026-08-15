@@ -141,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("list", help="list stored threads")
     _add_common(p)
+    p.add_argument("--all", action="store_true", dest="all_threads")
 
     p = sub.add_parser("doctor", help="diagnose runtime compatibility")
     _add_common(p)
@@ -210,7 +211,7 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
     if args.command == "interrupt":
         return Interrupt(thread_id=args.thread_id)
     if args.command == "list":
-        return ListThreads()
+        return ListThreads(all_threads=args.all_threads)
     if args.command == "doctor":
         return Doctor()
     raise _CliUsageError(f"unknown command: {args.command}")

@@ -158,7 +158,7 @@ class Interrupt:
 
 @dataclass(frozen=True)
 class ListThreads:
-    pass
+    all_threads: bool = False
 
 
 @dataclass(frozen=True)
