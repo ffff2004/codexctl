@@ -130,7 +130,8 @@ module; protocol method names and payload construction do not cross the port.
 Transport and session facts (verified against the Codex source):
 
 - The Unix control endpoint speaks websocket framing over the socket, so
-  the connection uses the `ws+unix://` scheme (`websockets` library).
+  `websockets.asyncio.client.unix_connect` supplies the socket path while the
+  client uses a normal websocket HTTP upgrade URI.
 - Messages are JSON-RPC 2.0-shaped without the `"jsonrpc"` header.
 - Every connection performs the `initialize` request
   (`clientInfo`, `capabilities: {experimentalApi: false}`) followed by the

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
+
+from websockets.asyncio.server import unix_serve
 
 from codexctl.appserver import (
     AppServerTurn,
@@ -153,6 +157,50 @@ class TestTypedOperations:
             ("thread/list", {"limit": 100, "cursor": "c1"}),
         ]
         assert not hasattr(adapter, "request")
+
+
+class TestUnixSocketConnection:
+    async def test_connects_over_unix_socket_and_completes_initialization(self, tmp_path):
+        socket_path = tmp_path / "app-server.sock"
+        received: list[dict] = []
+        initialized = asyncio.Event()
+
+        async def handle(connection):
+            async for frame in connection:
+                message = json.loads(frame)
+                received.append(message)
+                if message.get("method") == "initialize":
+                    await connection.send(
+                        json.dumps(
+                            {
+                                "id": message["id"],
+                                "result": {
+                                    "userAgent": "codex-app-server/0.101.0",
+                                    "codexHome": str(tmp_path / "codex-home"),
+                                },
+                            }
+                        )
+                    )
+                elif message.get("method") == "initialized":
+                    initialized.set()
+
+        server = await unix_serve(handle, str(socket_path))
+        adapter = None
+        try:
+            adapter = await UnixSocketAppServerAdapter.connect(socket_path)
+            await asyncio.wait_for(initialized.wait(), timeout=1.0)
+        finally:
+            if adapter is not None:
+                await adapter.close()
+            server.close()
+            await server.wait_closed()
+
+        assert adapter.user_agent == "codex-app-server/0.101.0"
+        assert adapter.server_codex_home == str(tmp_path / "codex-home")
+        assert [message["method"] for message in received] == [
+            "initialize",
+            "initialized",
+        ]
 
 
 class TestProjectItem:

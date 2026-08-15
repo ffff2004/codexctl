@@ -146,8 +146,8 @@ class UnixSocketAppServerAdapter:
     """Production adapter: JSON-RPC over websocket on a Unix control socket.
 
     The Codex app-server Unix endpoint speaks websocket framing over the
-    socket (standard HTTP Upgrade handshake), so the connection URI uses the
-    ``ws+unix://`` scheme.
+    socket (standard HTTP Upgrade handshake). The websockets client's Unix
+    socket connector supplies the socket path separately from the HTTP URI.
     """
 
     def __init__(self, conn: Any, socket_path: Path) -> None:
@@ -167,11 +167,12 @@ class UnixSocketAppServerAdapter:
 
     @classmethod
     async def connect(cls, socket_path: Path, timeout: float = 15.0) -> "UnixSocketAppServerAdapter":
-        from websockets.asyncio.client import connect as ws_connect
+        from websockets.asyncio.client import unix_connect
 
-        uri = "ws+unix://" + str(Path(socket_path))
         try:
-            conn = await asyncio.wait_for(ws_connect(uri, max_size=None), timeout)
+            conn = await asyncio.wait_for(
+                unix_connect(str(Path(socket_path)), max_size=None), timeout
+            )
         except Exception as exc:  # noqa: BLE001 - mapped to application error
             raise _unavailable(socket_path, exc) from exc
         adapter = cls(conn, socket_path)
