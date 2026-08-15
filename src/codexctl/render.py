@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from typing import Any, TextIO
 
 from .model import (
@@ -130,6 +131,35 @@ def format_context_line(context: ContextUsage | None) -> str | None:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ItemDescription:
+    kind: str
+    text: str = ""
+    command: Any = None
+    exit_code: Any = None
+    changes: tuple[dict[str, Any], ...] = ()
+
+
+def _describe_item(item: dict[str, Any]) -> _ItemDescription | None:
+    kind = item.get("type")
+    if kind == "agentMessage" or kind == "userMessage":
+        return _ItemDescription(kind=kind, text=item.get("text") or "")
+    if kind == "commandExecution":
+        return _ItemDescription(
+            kind=kind,
+            command=item.get("command"),
+            exit_code=item.get("exitCode"),
+        )
+    if kind == "fileChange":
+        return _ItemDescription(
+            kind=kind,
+            changes=tuple(item.get("changes") or ()),
+        )
+    if kind == "contextCompaction":
+        return _ItemDescription(kind=kind)
+    return None
+
+
 class TextRenderer:
     """Human-readable streaming and snapshot rendering."""
 
@@ -170,30 +200,26 @@ class TextRenderer:
             self._err.flush()
 
     def _render_item(self, item: dict) -> None:
-        kind = item.get("type")
-        if kind == "agentMessage":
-            text = item.get("text") or ""
-            if text:
-                self._write(f"\n[agent]\n{text}\n")
-        elif kind == "userMessage":
-            text = item.get("text") or ""
-            if text:
-                self._write(f"\n[user]\n{text}\n")
-        elif kind == "commandExecution":
+        description = _describe_item(item)
+        if description is None:
+            return
+        if description.kind == "agentMessage" or description.kind == "userMessage":
+            if description.text:
+                label = "agent" if description.kind == "agentMessage" else "user"
+                self._write(f"\n[{label}]\n{description.text}\n")
+        elif description.kind == "commandExecution":
             item_id = str(item.get("id") or "")
-            command = item.get("command")
-            if command and item_id not in self._started_items:
-                self._write(f"$ {command}\n")
-            exit_code = item.get("exitCode")
-            if exit_code is not None:
-                self._write(f"exit {exit_code}\n")
-        elif kind == "fileChange":
-            for change in item.get("changes") or []:
+            if description.command and item_id not in self._started_items:
+                self._write(f"$ {description.command}\n")
+            if description.exit_code is not None:
+                self._write(f"exit {description.exit_code}\n")
+        elif description.kind == "fileChange":
+            for change in description.changes:
                 path = change.get("path")
                 if path:
                     kind_letter = str(change.get("kind") or "M")[:1].upper() or "M"
                     self._write(f"{kind_letter} {path}\n")
-        elif kind == "contextCompaction":
+        elif description.kind == "contextCompaction":
             self._write("[context compacted]\n")
 
     def stream_footer(self, terminal: TurnTerminal) -> None:
@@ -255,23 +281,26 @@ class TextRenderer:
 
 
 def _summarize_item(item: dict, indent: str = "") -> str:
-    kind = item.get("type")
-    if kind == "agentMessage":
-        text = (item.get("text") or "").strip()
-        return f"{indent}[agent] {text}\n" if text else ""
-    if kind == "userMessage":
-        text = (item.get("text") or "").strip()
-        return f"{indent}[user] {text}\n" if text else ""
-    if kind == "commandExecution":
-        exit_code = item.get("exitCode")
-        suffix = f" (exit {exit_code})" if exit_code is not None else ""
-        return f"{indent}$ {item.get('command')}{suffix}\n"
-    if kind == "fileChange":
+    description = _describe_item(item)
+    if description is None:
+        return ""
+    if description.kind == "agentMessage" or description.kind == "userMessage":
+        text = description.text.strip()
+        label = "agent" if description.kind == "agentMessage" else "user"
+        return f"{indent}[{label}] {text}\n" if text else ""
+    if description.kind == "commandExecution":
+        suffix = (
+            f" (exit {description.exit_code})"
+            if description.exit_code is not None
+            else ""
+        )
+        return f"{indent}$ {description.command}{suffix}\n"
+    if description.kind == "fileChange":
         lines = []
-        for change in item.get("changes") or []:
+        for change in description.changes:
             lines.append(f"{indent}~ {change.get('path')}\n")
         return "".join(lines)
-    if kind == "contextCompaction":
+    if description.kind == "contextCompaction":
         return f"{indent}[context compacted]\n"
     return ""
 
