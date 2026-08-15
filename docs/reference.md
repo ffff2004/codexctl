@@ -220,6 +220,7 @@ Streaming commands in jsonl mode emit projected events, one per line:
 {"type": "turn/started", "threadId": "...", "turnId": "...", "source": "live"}
 {"type": "item/started", "threadId": "...", "turnId": "...", "item": {...}, "source": "live"}
 {"type": "item/completed", "threadId": "...", "turnId": "...", "item": {...}, "source": "live"}
+{"type": "thread/tokenUsage/updated", "threadId": "...", "turnId": "...", "source": "live", "usage": {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.415}}
 {"type": "turn/completed", "threadId": "...", "turnId": "...", "status": "completed", "source": "live"}
 ```
 
@@ -229,10 +230,11 @@ Streaming commands in jsonl mode emit projected events, one per line:
 - `item` is a projected item, see [Projected items](#projected-items).
 - `turn/completed` carries `status` (`completed`, `interrupted`, or
   `failed`) and, when present, `error: {"message": ...}`.
+- `thread/tokenUsage/updated` carries `usage` with `usedTokens`,
+  `windowTokens`, and `ratio` when the runtime provides a context window;
+  unavailable usage is omitted.
 - `error` records carry `error: {"code", "message"}` with a stable
   [error code](#error-codes).
-- Token usage updates are never emitted as events; they only enrich the
-  terminal context line in text mode.
 
 `history -o jsonl` emits one finite lifecycle-shaped sequence per selected
 turn: `turn/started`, one `item/completed` per item, `turn/completed` —

@@ -706,6 +706,8 @@ def _project_usage(token_usage: Any) -> dict | None:
     if not isinstance(token_usage, dict):
         return None
     total = token_usage.get("total") or {}
+    if not isinstance(total, dict):
+        return None
     window = token_usage.get("modelContextWindow")
     if not isinstance(window, int) or window <= 0:
         return None

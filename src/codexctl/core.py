@@ -239,11 +239,11 @@ class CodexCtl:
                         continue
                     if notification.type == "thread/tokenUsage/updated":
                         usage = notification.extra.get("usage")
-                        continue
                     ev = replace(notification, source="live")
-                    if ev.dedup_key() in seen:
-                        continue
-                    seen.add(ev.dedup_key())
+                    if ev.type != "thread/tokenUsage/updated":
+                        if ev.dedup_key() in seen:
+                            continue
+                        seen.add(ev.dedup_key())
                     yield ev
                     if ev.type == "turn/completed" and ev.turn_id == turn_id:
                         terminal_status = str(ev.extra.get("status") or "")

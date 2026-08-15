@@ -413,6 +413,19 @@ class TestProjectNotification:
         }
         assert project_notification(message) is None
 
+    def test_token_usage_dropped_when_total_is_malformed(self):
+        message = {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "t1",
+                "tokenUsage": {
+                    "total": "unavailable",
+                    "modelContextWindow": 200000,
+                },
+            },
+        }
+        assert project_notification(message) is None
+
     def test_unsupported_interaction_becomes_error_event(self):
         message = {
             "method": UNSUPPORTED_INTERACTION_METHOD,

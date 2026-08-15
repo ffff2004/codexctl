@@ -102,6 +102,17 @@ class TestStart:
                 },
             },
         )
+        server.emit(
+            "thread/tokenUsage/updated",
+            {
+                "threadId": "t1",
+                "turnId": "u1",
+                "tokenUsage": {
+                    "total": {"inputTokens": 90000, "cachedInputTokens": 4000},
+                    "modelContextWindow": 200000,
+                },
+            },
+        )
         emit_completed(server, "t1", "u1")
 
         outcome = await make_ctl(server).run(Start(prompt="hello"))
@@ -112,15 +123,48 @@ class TestStart:
         assert [e.type for e in events] == [
             "turn/started",  # synthesized start marker
             "item/completed",
+            "thread/tokenUsage/updated",
+            "thread/tokenUsage/updated",
             "turn/completed",
         ]
-        # tokenUsage is captured for the footer, never emitted as an event
+        usage_events = [
+            event for event in events if event.type == "thread/tokenUsage/updated"
+        ]
+        assert [event.source for event in usage_events] == ["live", "live"]
+        assert [event.extra["usage"] for event in usage_events] == [
+            {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.415},
+            {"usedTokens": 94000, "windowTokens": 200000, "ratio": 0.47},
+        ]
         assert terminal.status == "completed"
         assert terminal.context is not None
-        assert terminal.context.used_tokens == 83000
+        assert terminal.context.used_tokens == 94000
         assert terminal.context.source == "live"
         assert "t1" in server.unsubscribed
         assert server.closed
+
+    async def test_unavailable_usage_is_omitted_without_failing(self):
+        server = FakeAppServer()
+        self._script(server)
+        server.emit(
+            "thread/tokenUsage/updated",
+            {
+                "threadId": "t1",
+                "turnId": "u1",
+                "tokenUsage": {
+                    "total": {"inputTokens": 80000},
+                },
+            },
+        )
+        emit_completed(server, "t1", "u1")
+
+        outcome = await make_ctl(server).run(Start(prompt="hello"))
+        events, terminal = await collect(outcome)
+
+        assert [event.type for event in events] == [
+            "turn/started",
+            "turn/completed",
+        ]
+        assert terminal.context is None
 
     async def test_unattended_defaults_on_the_wire(self):
         server = FakeAppServer()
@@ -503,6 +547,17 @@ class TestFollow:
             "item/completed",
             {"threadId": "t1", "turnId": "u1", "item": agent_message("i2")},
         )
+        server.emit(
+            "thread/tokenUsage/updated",
+            {
+                "threadId": "t1",
+                "turnId": "u1",
+                "tokenUsage": {
+                    "total": {"inputTokens": 80000, "cachedInputTokens": 3000},
+                    "modelContextWindow": 200000,
+                },
+            },
+        )
         emit_completed(server, "t1", "u1")
 
         outcome = await make_ctl(server).run(Follow(thread_id="t1"))
@@ -514,6 +569,7 @@ class TestFollow:
         ] == [
             ("item/completed", "replay", "i1"),  # replayed active-turn history
             ("item/completed", "live", "i2"),  # i1 live duplicate dropped
+            ("thread/tokenUsage/updated", "live", None),
             ("turn/completed", "live", None),
         ]
         assert terminal.status == "completed"
