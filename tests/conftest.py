@@ -8,8 +8,19 @@ from typing import Any, AsyncIterator, Callable
 
 import pytest
 
-from codexctl.appserver import JsonRpcError
+from codexctl.appserver import (
+    AppServerThread,
+    AppServerResponse,
+    EmptyResponse,
+    JsonRpcError,
+    ThreadListResponse,
+    ThreadResponse,
+    TurnResponse,
+    project_notification,
+    project_response,
+)
 from codexctl.endpoint import AppServerEndpoint
+from codexctl.model import ProjectedEvent, StartConfig
 
 
 class FakeAppServer:
@@ -23,7 +34,7 @@ class FakeAppServer:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict | None]] = []
         self.handlers: dict[str, Callable[[dict | None], dict]] = {}
-        self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[ProjectedEvent | None] = asyncio.Queue()
         self.closed = False
         self.unsubscribed: list[str] = []
 
@@ -57,7 +68,9 @@ class FakeAppServer:
         return self
 
     def emit(self, method: str, params: dict | None) -> None:
-        self._queue.put_nowait({"method": method, "params": params})
+        event = project_notification({"method": method, "params": params})
+        if event is not None:
+            self._queue.put_nowait(event)
 
     def end_stream(self) -> None:
         self._queue.put_nowait(None)
@@ -74,17 +87,85 @@ class FakeAppServer:
 
     # -- AppServerPort ---------------------------------------------------------
 
-    async def request(self, method: str, params: dict | None = None) -> dict:
+    async def read_thread(self, thread_id: str) -> AppServerThread | None:
+        response = await self._request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def start_thread(self, config: StartConfig) -> AppServerThread | None:
+        params: dict[str, Any] = {
+            "approvalPolicy": "never",
+            "sandbox": config.sandbox or "workspaceWrite",
+        }
+        if config.cwd:
+            params["cwd"] = config.cwd
+        if config.model:
+            params["model"] = config.model
+        response = await self._request("thread/start", params)
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def start_turn(
+        self, thread_id: str, prompt: str, effort: str | None = None
+    ) -> str | None:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if effort:
+            params["effort"] = effort
+        response = await self._request("turn/start", params)
+        assert isinstance(response, TurnResponse)
+        return response.turn_id if response.turn_id else None
+
+    async def resume_thread(self, thread_id: str) -> AppServerThread | None:
+        response = await self._request("thread/resume", {"threadId": thread_id})
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def steer_turn(
+        self, thread_id: str, input_text: str, expected_turn_id: str
+    ) -> str | None:
+        response = await self._request(
+            "turn/steer",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": input_text}],
+                "expectedTurnId": expected_turn_id,
+            },
+        )
+        assert isinstance(response, TurnResponse)
+        return response.turn_id
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        response = await self._request(
+            "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+        )
+        assert isinstance(response, EmptyResponse)
+
+    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse:
+        params: dict[str, Any] = {"limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await self._request("thread/list", params)
+        assert isinstance(response, ThreadListResponse)
+        return response
+
+    async def _request(
+        self, method: str, params: dict | None = None
+    ) -> AppServerResponse:
         self.requests.append((method, params))
         handler = self.handlers.get(method)
         if handler is None:
             raise JsonRpcError(-32601, f"method not found: {method}")
-        return handler(params)
+        return project_response(method, handler(params))
 
-    def notifications(self) -> AsyncIterator[dict]:
+    def notifications(self) -> AsyncIterator[ProjectedEvent]:
         return self._iter()
 
-    async def _iter(self) -> AsyncIterator[dict]:
+    async def _iter(self) -> AsyncIterator[ProjectedEvent]:
         while True:
             message = await self._queue.get()
             if message is None:

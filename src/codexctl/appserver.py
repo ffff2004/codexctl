@@ -11,13 +11,17 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Protocol, TypeAlias, runtime_checkable
 
-from .model import ErrorCode, ProjectedEvent
+from .model import ErrorCode, ProjectedEvent, StartConfig
 
 CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
+DEFAULT_APPROVAL_POLICY = "never"
+DEFAULT_SANDBOX = "workspaceWrite"
+THREAD_LIST_PAGE_SIZE = 100
 
 # Synthetic notification method used to surface server-initiated interaction
 # requests that v1 cannot broker. Internal to codexctl; never on the wire.
@@ -33,16 +37,103 @@ class JsonRpcError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-        self.data = data
+        self.codex_error_info = _project_codex_error_info(data)
+
+
+@dataclass(frozen=True)
+class AppServerTurn:
+    """Projected turn state used by the orchestration layer."""
+
+    id: str
+    status: str
+    items: list[dict[str, Any]]
+
+    @property
+    def in_progress(self) -> bool:
+        return self.status == "inProgress"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_TURN_STATUSES
+
+
+@dataclass(frozen=True)
+class AppServerThread:
+    """Projected thread state used by the orchestration layer."""
+
+    id: str
+    status: str
+    active_flags: list[str]
+    turns: list[AppServerTurn]
+
+
+@dataclass(frozen=True)
+class ThreadResponse:
+    thread: AppServerThread | None
+
+
+@dataclass(frozen=True)
+class TurnResponse:
+    turn_id: str | None
+
+
+@dataclass(frozen=True)
+class InitializeResponse:
+    user_agent: str | None
+    codex_home: str | None
+
+
+@dataclass(frozen=True)
+class ThreadSummary:
+    id: str
+    status: str
+    preview: str | None
+    updated_at: int | None
+
+
+@dataclass(frozen=True)
+class ThreadListResponse:
+    threads: list[ThreadSummary]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class EmptyResponse:
+    pass
+
+
+AppServerResponse: TypeAlias = (
+    ThreadResponse
+    | TurnResponse
+    | InitializeResponse
+    | ThreadListResponse
+    | EmptyResponse
+)
 
 
 @runtime_checkable
 class AppServerPort(Protocol):
-    """Internal low-level seam shaped around what CodexCtl needs."""
+    """Typed app-server operations used by the orchestration layer."""
 
-    async def request(self, method: str, params: dict | None = None) -> dict: ...
+    async def read_thread(self, thread_id: str) -> AppServerThread | None: ...
 
-    def notifications(self) -> AsyncIterator[dict]: ...
+    async def start_thread(self, config: StartConfig) -> AppServerThread | None: ...
+
+    async def start_turn(
+        self, thread_id: str, prompt: str, effort: str | None = None
+    ) -> str | None: ...
+
+    async def resume_thread(self, thread_id: str) -> AppServerThread | None: ...
+
+    async def steer_turn(
+        self, thread_id: str, input_text: str, expected_turn_id: str
+    ) -> str | None: ...
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None: ...
+
+    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse: ...
+
+    def notifications(self) -> AsyncIterator[ProjectedEvent]: ...
 
     async def unsubscribe(self, thread_id: str) -> None:
         """Best-effort unsubscribe; never raises."""
@@ -93,7 +184,7 @@ class UnixSocketAppServerAdapter:
         return adapter
 
     async def _initialize(self) -> None:
-        result = await self.request(
+        result = await self._request(
             "initialize",
             {
                 "clientInfo": {
@@ -104,8 +195,9 @@ class UnixSocketAppServerAdapter:
                 "capabilities": {"experimentalApi": False},
             },
         )
-        self.user_agent = result.get("userAgent")
-        self.server_codex_home = result.get("codexHome")
+        assert isinstance(result, InitializeResponse)
+        self.user_agent = result.user_agent
+        self.server_codex_home = result.codex_home
         self.app_server_version = parse_user_agent_version(self.user_agent)
         await self._notify("initialized")
 
@@ -124,7 +216,7 @@ class UnixSocketAppServerAdapter:
         """Best-effort unsubscribe; never raises."""
         try:
             await asyncio.wait_for(
-                self.request("thread/unsubscribe", {"threadId": thread_id}), 5.0
+                self._request("thread/unsubscribe", {"threadId": thread_id}), 5.0
             )
         except Exception:  # noqa: BLE001 - cleanup is best-effort
             pass
@@ -140,7 +232,79 @@ class UnixSocketAppServerAdapter:
             message["params"] = params
         await self._send(message)
 
-    async def request(self, method: str, params: dict | None = None) -> dict:
+    # -- typed app-server operations -----------------------------------------
+
+    async def read_thread(self, thread_id: str) -> AppServerThread | None:
+        response = await self._request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def start_thread(self, config: StartConfig) -> AppServerThread | None:
+        params: dict[str, Any] = {
+            "approvalPolicy": DEFAULT_APPROVAL_POLICY,
+            "sandbox": config.sandbox or DEFAULT_SANDBOX,
+        }
+        if config.cwd:
+            params["cwd"] = config.cwd
+        if config.model:
+            params["model"] = config.model
+        response = await self._request("thread/start", params)
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def start_turn(
+        self, thread_id: str, prompt: str, effort: str | None = None
+    ) -> str | None:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if effort:
+            params["effort"] = effort
+        response = await self._request("turn/start", params)
+        assert isinstance(response, TurnResponse)
+        return response.turn_id
+
+    async def resume_thread(self, thread_id: str) -> AppServerThread | None:
+        response = await self._request("thread/resume", {"threadId": thread_id})
+        assert isinstance(response, ThreadResponse)
+        return response.thread
+
+    async def steer_turn(
+        self, thread_id: str, input_text: str, expected_turn_id: str
+    ) -> str | None:
+        response = await self._request(
+            "turn/steer",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": input_text}],
+                "expectedTurnId": expected_turn_id,
+            },
+        )
+        assert isinstance(response, TurnResponse)
+        return response.turn_id
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        response = await self._request(
+            "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+        )
+        assert isinstance(response, EmptyResponse)
+
+    async def list_threads(self, cursor: str | None = None) -> ThreadListResponse:
+        params: dict[str, Any] = {"limit": THREAD_LIST_PAGE_SIZE}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await self._request("thread/list", params)
+        assert isinstance(response, ThreadListResponse)
+        return response
+
+    # -- transport -----------------------------------------------------------
+
+    async def _request(
+        self, method: str, params: dict | None = None
+    ) -> AppServerResponse:
         if self._closed:
             raise _unavailable(self.socket_path, RuntimeError("connection closed"))
         request_id = next(self._ids)
@@ -151,19 +315,21 @@ class UnixSocketAppServerAdapter:
             message["params"] = params
         try:
             await self._send(message)
-            return await future
+            return project_response(method, await future)
         finally:
             self._pending.pop(request_id, None)
 
-    def notifications(self) -> AsyncIterator[dict]:
+    def notifications(self) -> AsyncIterator[ProjectedEvent]:
         return self._iter_notifications()
 
-    async def _iter_notifications(self) -> AsyncIterator[dict]:
+    async def _iter_notifications(self) -> AsyncIterator[ProjectedEvent]:
         while True:
             message = await self._queue.get()
             if message is None:
                 return
-            yield message
+            event = project_notification(message)
+            if event is not None:
+                yield event
 
     async def _reader(self) -> None:
         try:
@@ -244,6 +410,91 @@ class UnixSocketAppServerAdapter:
                 },
             }
         )
+
+
+def project_response(method: str, response: Any) -> AppServerResponse:
+    """Project one JSON-RPC result into the adapter's typed interface."""
+    payload = response if isinstance(response, dict) else {}
+    if method == "initialize":
+        return InitializeResponse(
+            user_agent=_project_string(payload.get("userAgent")),
+            codex_home=_project_string(payload.get("codexHome")),
+        )
+    if method in ("thread/start", "thread/read", "thread/resume"):
+        return ThreadResponse(thread=_project_thread(payload.get("thread")))
+    if method in ("turn/start", "turn/steer"):
+        if method == "turn/start":
+            turn = _project_turn(payload.get("turn"))
+            return TurnResponse(turn_id=turn.id if turn is not None else None)
+        return TurnResponse(turn_id=_project_string(payload.get("turnId")))
+    if method == "thread/list":
+        entries = payload.get("data")
+        threads = [
+            projected
+            for entry in (entries if isinstance(entries, list) else [])
+            if (projected := _project_thread_summary(entry)) is not None
+        ]
+        return ThreadListResponse(
+            threads=threads,
+            next_cursor=_project_string(payload.get("nextCursor")),
+        )
+    return EmptyResponse()
+
+
+def _project_thread(raw: Any) -> AppServerThread | None:
+    if not isinstance(raw, dict):
+        return None
+    status, flags = project_thread_status(raw.get("status"))
+    turns = [
+        projected
+        for turn in raw.get("turns") or []
+        if (projected := _project_turn(turn)) is not None
+    ]
+    return AppServerThread(
+        id=_project_string(raw.get("id")) or "",
+        status=status,
+        active_flags=flags,
+        turns=turns,
+    )
+
+
+def _project_turn(raw: Any) -> AppServerTurn | None:
+    if not isinstance(raw, dict):
+        return None
+    items = [
+        projected
+        for item in raw.get("items") or []
+        if (projected := project_item(item)) is not None
+    ]
+    return AppServerTurn(
+        id=_project_string(raw.get("id")) or "",
+        status=_project_string(raw.get("status")) or "",
+        items=items,
+    )
+
+
+def _project_thread_summary(raw: Any) -> ThreadSummary | None:
+    if not isinstance(raw, dict):
+        return None
+    status, _ = project_thread_status(raw.get("status"))
+    updated_at = raw.get("updatedAt")
+    return ThreadSummary(
+        id=_project_string(raw.get("id")) or "",
+        status=status,
+        preview=_project_string(raw.get("preview")),
+        updated_at=updated_at if isinstance(updated_at, int) else None,
+    )
+
+
+def _project_string(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _project_codex_error_info(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get("codexErrorInfo")
+    return str(value) if value is not None else None
 
 
 def _unavailable(socket_path: Path, cause: Exception) -> Exception:

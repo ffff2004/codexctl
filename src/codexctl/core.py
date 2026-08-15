@@ -9,17 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import rollout
 from .appserver import (
-    TERMINAL_TURN_STATUSES,
+    AppServerThread,
+    AppServerTurn,
     AppServerPort,
     JsonRpcError,
     UnixSocketAppServerAdapter,
-    project_item,
-    project_notification,
-    project_thread_status,
 )
 from .endpoint import AppServerEndpoint, EndpointPort
 from .model import (
@@ -53,8 +52,6 @@ from .model import (
     select_replay_turns,
 )
 
-DEFAULT_APPROVAL_POLICY = "never"
-DEFAULT_SANDBOX = "workspaceWrite"
 INTERRUPT_WAIT_SECONDS = 120.0
 INTERRUPT_POLL_INTERVAL = 0.5
 
@@ -103,43 +100,33 @@ class CodexCtl:
         return await self._connect(endpoint)
 
     @staticmethod
-    def _find_active_turn(thread: dict) -> dict | None:
-        for turn in reversed(thread.get("turns") or []):
-            if isinstance(turn, dict) and turn.get("status") == "inProgress":
+    def _find_active_turn(thread: AppServerThread) -> AppServerTurn | None:
+        for turn in reversed(thread.turns):
+            if turn.in_progress:
                 return turn
         return None
 
     @staticmethod
-    async def _read_thread(adapter: AppServerPort, thread_id: str) -> dict:
+    async def _read_thread(adapter: AppServerPort, thread_id: str) -> AppServerThread:
         try:
-            resp = await adapter.request(
-                "thread/read", {"threadId": thread_id, "includeTurns": True}
-            )
+            thread = await adapter.read_thread(thread_id)
         except JsonRpcError as exc:
             await adapter.close()
             raise _map_rpc_error(
                 exc, default=ErrorCode.THREAD_NOT_FOUND, thread_id=thread_id
             ) from exc
-        return resp.get("thread") or {}
+        return thread or AppServerThread(thread_id, "notLoaded", [], [])
 
     # -- start ----------------------------------------------------------------
 
     async def _start(self, command: Start) -> Any:
         adapter = await self._open()
         try:
-            params: dict[str, Any] = {
-                "approvalPolicy": DEFAULT_APPROVAL_POLICY,
-                "sandbox": command.config.sandbox or DEFAULT_SANDBOX,
-            }
-            if command.config.cwd:
-                params["cwd"] = command.config.cwd
-            if command.config.model:
-                params["model"] = command.config.model
             try:
-                resp = await adapter.request("thread/start", params)
+                thread = await adapter.start_thread(command.config)
             except JsonRpcError as exc:
                 raise _map_rpc_error(exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR) from exc
-            thread_id = (resp.get("thread") or {}).get("id")
+            thread_id = thread.id if thread is not None else None
             if not thread_id:
                 raise CodexCtlError(
                     ErrorCode.APP_SERVER_PROTOCOL_ERROR,
@@ -164,20 +151,13 @@ class CodexCtl:
         prompt: str,
         effort: str | None = None,
     ) -> str:
-        params: dict[str, Any] = {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
-        }
-        if effort:
-            params["effort"] = effort
         try:
-            resp = await adapter.request("turn/start", params)
+            turn_id = await adapter.start_turn(thread_id, prompt, effort)
         except JsonRpcError as exc:
-            # The actual turn/start result is authoritative for races.
+            # The actual start-turn result is authoritative for races.
             raise _map_rpc_error(
                 exc, default=ErrorCode.THREAD_BUSY, thread_id=thread_id
             ) from exc
-        turn_id = (resp.get("turn") or {}).get("id")
         if not turn_id:
             raise CodexCtlError(
                 ErrorCode.APP_SERVER_PROTOCOL_ERROR,
@@ -192,20 +172,17 @@ class CodexCtl:
         adapter = await self._open()
         try:
             try:
-                resp = await adapter.request(
-                    "thread/resume", {"threadId": command.thread_id}
-                )
+                thread = await adapter.resume_thread(command.thread_id)
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
-            thread = resp.get("thread") or {}
-            status, _ = project_thread_status(thread.get("status"))
-            if status == "active" or self._find_active_turn(thread) is not None:
+            thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
+            if thread.status == "active" or self._find_active_turn(thread) is not None:
                 raise CodexCtlError(
                     ErrorCode.THREAD_BUSY,
                     "thread has an active turn",
                     thread_id=command.thread_id,
                 )
-            # Resume never queues and never becomes steer: one turn/start, or fail.
+            # Resume never queues and never becomes steer: one start-turn, or fail.
             turn_id = await self._turn_start(adapter, command.thread_id, command.prompt)
         except Exception:
             await adapter.close()
@@ -256,20 +233,14 @@ class CodexCtl:
                 if prelude is not None:
                     async for ev in prelude(seen):
                         yield ev
-                async for raw in adapter.notifications():
-                    params = raw.get("params") or {}
-                    notif_thread = params.get("threadId")
+                async for notification in adapter.notifications():
+                    notif_thread = notification.thread_id
                     if notif_thread is not None and notif_thread != thread_id:
                         continue
-                    method = raw.get("method")
-                    if method == "thread/tokenUsage/updated":
-                        ev = project_notification(raw)
-                        if ev is not None:
-                            usage = ev.extra.get("usage")
+                    if notification.type == "thread/tokenUsage/updated":
+                        usage = notification.extra.get("usage")
                         continue
-                    ev = project_notification(raw, source="live")
-                    if ev is None:
-                        continue
+                    ev = replace(notification, source="live")
                     if ev.dedup_key() in seen:
                         continue
                     seen.add(ev.dedup_key())
@@ -326,18 +297,18 @@ class CodexCtl:
     async def _status(self, command: Status) -> StatusSnapshot:
         adapter = await self._open()
         try:
-            # Strictly read-only: never thread/resume for status.
+            # Strictly read-only: never recover or start a thread for status.
             thread = await self._read_thread(adapter, command.thread_id)
         finally:
             await adapter.close()
-        status, flags = project_thread_status(thread.get("status"))
+        status, flags = thread.status, thread.active_flags
         active = self._find_active_turn(thread)
         context = rollout.lookup_context_usage(command.thread_id)
         return StatusSnapshot(
             thread_id=command.thread_id,
             status=status,
             active_flags=flags,
-            active_turn_id=(active or {}).get("id"),
+            active_turn_id=active.id if active is not None else None,
             context=context,
         )
 
@@ -349,7 +320,7 @@ class CodexCtl:
             thread = await self._read_thread(adapter, command.thread_id)
         finally:
             await adapter.close()
-        turns = thread.get("turns") or []
+        turns = thread.turns
         try:
             selected = apply_turn_selector(turns, command.selector)
         except IndexError as exc:
@@ -362,16 +333,12 @@ class CodexCtl:
             ) from exc
         history_turns = []
         for index, turn in selected:
-            items = [
-                projected
-                for projected in (project_item(item) for item in turn.get("items") or [])
-                if projected is not None
-            ]
+            items = list(turn.items)
             history_turns.append(
                 HistoryTurn(
-                    id=turn.get("id") or "",
+                    id=turn.id,
                     index=index,
-                    status=str(turn.get("status") or ""),
+                    status=turn.status,
                     items=items,
                 )
             )
@@ -383,12 +350,10 @@ class CodexCtl:
         adapter = await self._open()
         try:
             try:
-                resp = await adapter.request(
-                    "thread/resume", {"threadId": command.thread_id}
-                )
+                thread = await adapter.resume_thread(command.thread_id)
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
-            thread = resp.get("thread") or {}
+            thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
         except Exception:
             await adapter.close()
             raise
@@ -401,8 +366,8 @@ class CodexCtl:
                 "thread has no active turn to follow",
                 thread_id=command.thread_id,
             )
-        active_turn_id = active.get("id") or ""
-        turns = thread.get("turns") or []
+        active_turn_id = active.id
+        turns = thread.turns
         replay_pairs = select_replay_turns(turns, command.replay)
 
         async def replay(seen: set[tuple]) -> AsyncIterator[ProjectedEvent]:
@@ -410,10 +375,8 @@ class CodexCtl:
             # snapshot, then continue live. Events visible in both are
             # deduplicated by stable Codex identities.
             for index, turn in replay_pairs:
-                turn_id = turn.get("id")
-                for projected in (project_item(item) for item in turn.get("items") or []):
-                    if projected is None:
-                        continue
+                turn_id = turn.id
+                for projected in turn.items:
                     for phase in ("item/started", "item/completed"):
                         ev = ProjectedEvent(
                             phase,
@@ -425,21 +388,21 @@ class CodexCtl:
                         )
                         if ev.dedup_key() in seen:
                             continue
-                        if turn.get("status") != "inProgress" or phase == "item/completed":
+                        if not turn.in_progress or phase == "item/completed":
                             # Only events actually emitted occupy ``seen``: a
                             # suppressed replay event (item/started of an
                             # in-progress turn) must not swallow its live
                             # delivery.
                             seen.add(ev.dedup_key())
                             yield ev
-                if turn.get("status") != "inProgress":
+                if not turn.in_progress:
                     completed = ProjectedEvent(
                         "turn/completed",
                         thread_id=command.thread_id,
                         turn_id=turn_id,
                         source="replay",
                         turn_index=index,
-                        extra={"status": turn.get("status")},
+                        extra={"status": turn.status},
                     )
                     if completed.dedup_key() not in seen:
                         seen.add(completed.dedup_key())
@@ -460,21 +423,16 @@ class CodexCtl:
                     "thread has no active turn to steer",
                     thread_id=command.thread_id,
                 )
-            expected_turn_id = active.get("id") or ""
+            expected_turn_id = active.id
             try:
-                resp = await adapter.request(
-                    "turn/steer",
-                    {
-                        "threadId": command.thread_id,
-                        "input": [{"type": "text", "text": command.input}],
-                        "expectedTurnId": expected_turn_id,
-                    },
+                turn_id = await adapter.steer_turn(
+                    command.thread_id, command.input, expected_turn_id
                 )
             except JsonRpcError as exc:
                 raise _map_steer_error(exc, command.thread_id) from exc
             return SteerAcknowledged(
                 thread_id=command.thread_id,
-                turn_id=resp.get("turnId") or expected_turn_id,
+                turn_id=turn_id or expected_turn_id,
             )
         finally:
             await adapter.close()
@@ -492,12 +450,9 @@ class CodexCtl:
                     "thread has no active turn to interrupt",
                     thread_id=command.thread_id,
                 )
-            turn_id = active.get("id") or ""
+            turn_id = active.id
             try:
-                await adapter.request(
-                    "turn/interrupt",
-                    {"threadId": command.thread_id, "turnId": turn_id},
-                )
+                await adapter.interrupt_turn(command.thread_id, turn_id)
             except JsonRpcError as exc:
                 # A rejected interrupt means the target turn changed or ended;
                 # never retry against a different turn.
@@ -507,18 +462,12 @@ class CodexCtl:
             deadline = time.monotonic() + INTERRUPT_WAIT_SECONDS
             while True:
                 current = await self._read_thread(adapter, command.thread_id)
-                target = next(
-                    (
-                        turn
-                        for turn in current.get("turns") or []
-                        if isinstance(turn, dict) and turn.get("id") == turn_id
-                    ),
-                    None,
-                )
-                status = (target or {}).get("status")
-                if status in TERMINAL_TURN_STATUSES:
+                target = next((turn for turn in current.turns if turn.id == turn_id), None)
+                if target is not None and target.is_terminal:
                     return InterruptResult(
-                        thread_id=command.thread_id, turn_id=turn_id, status=str(status)
+                        thread_id=command.thread_id,
+                        turn_id=turn_id,
+                        status=target.status,
                     )
                 if time.monotonic() >= deadline:
                     raise CodexCtlError(
@@ -539,28 +488,22 @@ class CodexCtl:
             records: list[ThreadRecord] = []
             cursor: str | None = None
             for _ in range(25):  # pagination safety cap
-                params: dict[str, Any] = {"limit": 100}
-                if cursor is not None:
-                    params["cursor"] = cursor
                 try:
-                    resp = await adapter.request("thread/list", params)
+                    page = await adapter.list_threads(cursor)
                 except JsonRpcError as exc:
                     raise _map_rpc_error(
                         exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR
                     ) from exc
-                for entry in resp.get("data") or []:
-                    if not isinstance(entry, dict):
-                        continue
-                    status, _ = project_thread_status(entry.get("status"))
+                for entry in page.threads:
                     records.append(
                         ThreadRecord(
-                            thread_id=entry.get("id") or "",
-                            status=status,
-                            preview=entry.get("preview") or None,
-                            updated_at=entry.get("updatedAt"),
+                            thread_id=entry.id,
+                            status=entry.status,
+                            preview=entry.preview,
+                            updated_at=entry.updated_at,
                         )
                     )
-                cursor = resp.get("nextCursor")
+                cursor = page.next_cursor
                 if not cursor:
                     break
             return ThreadListSnapshot(threads=records)
@@ -663,8 +606,7 @@ def _map_rpc_error(
     message = exc.message or ""
     lowered = message.lower()
     info = ""
-    if isinstance(exc.data, dict):
-        info = str(exc.data.get("codexErrorInfo") or "")
+    info = exc.codex_error_info or ""
     code = default
     if "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
         code = ErrorCode.TURN_NOT_STEERABLE
@@ -699,8 +641,7 @@ def _map_steer_error(exc: JsonRpcError, thread_id: str) -> CodexCtlError:
     message = exc.message or ""
     lowered = message.lower()
     info = ""
-    if isinstance(exc.data, dict):
-        info = str(exc.data.get("codexErrorInfo") or "")
+    info = exc.codex_error_info or ""
     if "ActiveTurnNotSteerable" in info or "not steerable" in lowered:
         code = ErrorCode.TURN_NOT_STEERABLE
     elif "expectedturn" in lowered or "no active turn" in lowered or "invalid" in lowered:

@@ -122,8 +122,10 @@ adapter probes its own codex binary, while the external adapter returns
 
 ### appserver.py — the compatibility firewall
 
-Raw Codex protocol messages never leave this module. Callers see request
-results, `JsonRpcError`, and `ProjectedEvent` only.
+Raw Codex protocol messages never leave this module. Callers use typed
+thread/turn operations and see projected results, `JsonRpcError`, and
+`ProjectedEvent` only. The generic JSON-RPC request helper is private to this
+module; protocol method names and payload construction do not cross the port.
 
 Transport and session facts (verified against the Codex source):
 

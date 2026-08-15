@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from codexctl.appserver import (
+    AppServerTurn,
+    ThreadListResponse,
+    ThreadResponse,
+    TurnResponse,
     UNSUPPORTED_INTERACTION_METHOD,
+    UnixSocketAppServerAdapter,
     parse_user_agent_version,
     project_item,
     project_notification,
+    project_response,
     project_thread_status,
 )
-from codexctl.model import ErrorCode
+from codexctl.model import ErrorCode, StartConfig
 
 
 class TestProjectThreadStatus:
@@ -29,6 +37,122 @@ class TestProjectThreadStatus:
             "active",
             [],
         )
+
+
+class TestProjectResponse:
+    def test_thread_response_projects_nested_turns_and_items(self):
+        response = project_response(
+            "thread/read",
+            {
+                "thread": {
+                    "id": "t1",
+                    "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+                    "turns": [
+                        {
+                            "id": "u1",
+                            "status": "inProgress",
+                            "items": [
+                                {"type": "agentMessage", "id": "i1", "text": "hello"},
+                                {"type": "plan", "id": "i2"},
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+
+        assert isinstance(response, ThreadResponse)
+        assert response.thread is not None
+        assert response.thread.id == "t1"
+        assert response.thread.status == "active"
+        assert response.thread.active_flags == ["waitingOnApproval"]
+        turn = response.thread.turns[0]
+        assert isinstance(turn, AppServerTurn)
+        assert turn.in_progress
+        assert turn.items == [{"id": "i1", "type": "agentMessage", "text": "hello"}]
+        assert not isinstance(response, dict)
+
+    def test_operation_specific_results_are_projected(self):
+        assert project_response("turn/start", {"turn": {"id": "u1"}}) == TurnResponse(
+            turn_id="u1"
+        )
+        assert project_response("turn/steer", {"turnId": "u1"}) == TurnResponse(
+            turn_id="u1"
+        )
+        response = project_response(
+            "thread/list",
+            {
+                "data": [{"id": "t1", "status": {"type": "idle"}}],
+                "nextCursor": "next",
+            },
+        )
+        assert isinstance(response, ThreadListResponse)
+        assert response.next_cursor == "next"
+        assert response.threads[0].status == "idle"
+
+
+class TestTypedOperations:
+    async def test_operations_keep_wire_requests_inside_the_adapter(self, monkeypatch):
+        adapter = UnixSocketAppServerAdapter(None, Path("/fake.sock"))
+        calls = []
+        responses = {
+            "thread/start": {"thread": {"id": "t1"}},
+            "turn/start": {"turn": {"id": "u1"}},
+            "thread/read": {"thread": {"id": "t1", "status": "idle"}},
+            "thread/resume": {"thread": {"id": "t1", "status": "idle"}},
+            "turn/steer": {"turnId": "u1"},
+            "turn/interrupt": {},
+            "thread/list": {"data": [], "nextCursor": "next"},
+        }
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, responses[method])
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        assert (await adapter.start_thread(
+            StartConfig(cwd="/tmp", model="o4-mini", sandbox="readOnly")
+        )).id == "t1"
+        assert await adapter.start_turn("t1", "hello", effort="high") == "u1"
+        assert (await adapter.read_thread("t1")).id == "t1"
+        assert (await adapter.resume_thread("t1")).id == "t1"
+        assert await adapter.steer_turn("t1", "more", "u1") == "u1"
+        await adapter.interrupt_turn("t1", "u1")
+        assert (await adapter.list_threads("c1")).next_cursor == "next"
+
+        assert calls == [
+            (
+                "thread/start",
+                {
+                    "approvalPolicy": "never",
+                    "sandbox": "readOnly",
+                    "cwd": "/tmp",
+                    "model": "o4-mini",
+                },
+            ),
+            (
+                "turn/start",
+                {
+                    "threadId": "t1",
+                    "input": [{"type": "text", "text": "hello"}],
+                    "effort": "high",
+                },
+            ),
+            ("thread/read", {"threadId": "t1", "includeTurns": True}),
+            ("thread/resume", {"threadId": "t1"}),
+            (
+                "turn/steer",
+                {
+                    "threadId": "t1",
+                    "input": [{"type": "text", "text": "more"}],
+                    "expectedTurnId": "u1",
+                },
+            ),
+            ("turn/interrupt", {"threadId": "t1", "turnId": "u1"}),
+            ("thread/list", {"limit": 100, "cursor": "c1"}),
+        ]
+        assert not hasattr(adapter, "request")
 
 
 class TestProjectItem:
