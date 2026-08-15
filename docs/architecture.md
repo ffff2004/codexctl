@@ -62,10 +62,12 @@ Selector parsing is pure and follows Python semantics exactly
 `CodexCtl` owns all lifecycle behavior. Key internal decisions:
 
 - **Races resolve at the authoritative RPC.** `resume` reads thread state
-  first for fast, clear errors, but the `turn/start` result is
-  authoritative; a lost race maps to `THREAD_BUSY`. `steer` sends
-  `expectedTurnId` observed from a preceding read; mismatches map to
-  `NO_ACTIVE_TURN`.
+  first as an optimization, but the `turn/start` result is authoritative.
+  `steer` sends the `expectedTurnId` observed from a preceding read, keeping
+  each operation attached to the turn it inspected. See
+  [reference.md — resume](reference.md#resume) and
+  [reference.md — steer](reference.md#steer) for the public lifecycle
+  semantics.
 - **Streaming is pull-based with a terminal future.** `EventStreamOutcome`
   pairs an async iterator of `ProjectedEvent` with a future resolving to
   `TurnTerminal`. The iterator owns dedup, token-usage capture, and the
@@ -74,25 +76,25 @@ Selector parsing is pure and follows Python semantics exactly
   `APP_SERVER_PROTOCOL_ERROR` path when the stream dies first. Losing the
   stream never triggers a turn interrupt.
 - **follow frontier.** `follow` resumes for subscription, replays a
-  continuous suffix of the reconstructed snapshot (marked
-  `source="replay"`), then continues live. Both phases record dedup keys
-  in one shared set keyed by `(event type, turn id, item id)`,
-  so events visible in replay and live are emitted exactly once. Replay
-  only registers keys of events it actually emits, so a suppressed
-  replay event (an in-progress turn's `item/started`) is still
-  delivered live. The
-  stream exits only when the followed turn itself reaches a terminal
-  state; `turn/completed` notifications for other turns never end it.
+  continuous suffix of the reconstructed snapshot, then continues live.
+  Both phases record dedup keys in one shared set keyed by
+  `(event type, turn id, item id)`, so events visible in replay and live are
+  emitted exactly once. Replay only registers keys of events it actually
+  emits, so a suppressed replay event is still delivered live. The public
+  replay and termination semantics are defined in
+  [reference.md — follow](reference.md#follow).
 - **interrupt waits, never retries.** After `turn/interrupt` succeeds,
   `core.py` polls the thread until the targeted turn is terminal (bounded
-  wait, `INTERRUPT_WAIT_SECONDS` / `INTERRUPT_POLL_INTERVAL`). A rejected
-  interrupt is mapped directly (`_map_interrupt_error`) instead of running
-  the keyword heuristics, so it always stays a domain error.
-- **Error mapping is keyword-heuristic plus code checks** (`_map_rpc_error`
-  and friends): `-32601` → `INCOMPATIBLE_CODEX`, "not found" markers →
-  `THREAD_NOT_FOUND`, active-turn markers → `THREAD_BUSY`,
-  `codexErrorInfo: ActiveTurnNotSteerable` → `TURN_NOT_STEERABLE`.
-  Recovery failure never falls back to creating a new thread.
+  wait, `INTERRUPT_WAIT_SECONDS` / `INTERRUPT_POLL_INTERVAL`). Rejected
+  interrupts are handled by `_map_interrupt_error` before general RPC
+  heuristics. The public interrupt contract is defined in
+  [reference.md — interrupt](reference.md#interrupt).
+- **Error translation is centralized.** `_map_rpc_error` and its specialized
+  helpers combine RPC codes with provider markers. Recovery failure never
+  falls back to creating a new thread. Stable error meanings and recovery
+  behavior are defined in
+  [reference.md — Error codes](reference.md#error-codes) and
+  [reference.md — resume](reference.md#resume).
 - **Doctor** reuses the same seams: endpoint resolution, connect +
   initialize handshake, the `codex --version` probe exposed as
   `EndpointPort.probe_cli_version()` (managed mode; external endpoints
@@ -188,7 +190,7 @@ becomes executable.
 ## Compatibility stance
 
 `codexctl` does not gate on version numbers. Compatibility is discovered
-at runtime: missing methods (`-32601`) and missing daemon lifecycle JSON
-map to `INCOMPATIBLE_CODEX` (see
-[reference.md — Error codes](reference.md#error-codes)); projection drops
-unknown wire variants so newer Codex releases degrade additively.
+at runtime through endpoint initialization and capability probes. Projection
+drops unknown wire variants so newer Codex releases degrade additively. The
+public compatibility verdict and error meanings are defined in
+[reference.md — Error codes](reference.md#error-codes).
