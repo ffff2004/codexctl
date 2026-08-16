@@ -86,18 +86,6 @@ terminal state, following the shared
 The exit code reflects the turn's terminal status, see
 [Exit codes](#exit-codes).
 
-In text streaming mode, a command execution is rendered as:
-
-```text
-$ <command>
-started
-$ <command>
-exit <code>
-```
-
-If the command completion has no exit code, the completion emits `no exit
-code` instead of an `exit <code>` line.
-
 ### resume
 
 ```sh
