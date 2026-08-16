@@ -28,6 +28,8 @@ It stores nothing locally; threads live in the shared runtime.
   as an alternative source for current architecture or behavior.
 - Do not copy full types, schemas, test logs, or
   ADR rationale into prose. Link to the owning source.
+- Reference repository files and directories with Markdown links, not inline
+  code paths.
 
 ## Commit messages
 
