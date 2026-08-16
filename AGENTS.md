@@ -45,6 +45,7 @@ Dependencies are managed with `uv`:
 ```sh
 uv sync          # create .venv, install project + dev dependencies
 uv run pre-commit install --hook-type pre-commit --hook-type pre-push --install-hooks  # install commit and push hooks
+uv run pre-commit run --all-files  # run all hook checks (format, lint, type-check) without committing
 uv run pytest    # run the test suite (no sockets needed)
 uv run codexctl  # run the CLI
 uv build         # build dist/ artifacts
