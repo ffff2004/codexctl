@@ -24,17 +24,17 @@ Consulted for the websocket-over-unix-socket transport, the default control
 socket path, and the common WebSocket handshake behavior used by external TCP
 endpoints.
 
-- `codex-rs/app-server/README.md` — transport list: the unix socket
+- [codex-rs/app-server/README.md](../vendor/codex/codex-rs/app-server/README.md) — transport list: the unix socket
   endpoint serves websocket connections (standard HTTP Upgrade
   handshake) at `$CODEX_HOME/app-server-control/app-server-control.sock`.
-- `codex-rs/app-server-transport/src/transport/mod.rs` — socket
+- [codex-rs/app-server-transport/src/transport/mod.rs](../vendor/codex/codex-rs/app-server-transport/src/transport/mod.rs) — socket
   directory/file name constants confirming the default path layout.
-- `codex-rs/app-server-transport/src/transport/unix_socket.rs` — control
+- [codex-rs/app-server-transport/src/transport/unix_socket.rs](../vendor/codex/codex-rs/app-server-transport/src/transport/unix_socket.rs) — control
   socket acceptor implementation and its `tokio_tungstenite::accept_async`
   upgrade error path.
-- `codex-rs/app-server-transport/src/transport/unix_socket_tests.rs` —
+- [codex-rs/app-server-transport/src/transport/unix_socket_tests.rs](../vendor/codex/codex-rs/app-server-transport/src/transport/unix_socket_tests.rs) —
   upstream Unix socket handshake test using `tokio_tungstenite`.
-- `codex-rs/app-server-transport/src/transport/websocket.rs` — WebSocket
+- [codex-rs/app-server-transport/src/transport/websocket.rs](../vendor/codex/codex-rs/app-server-transport/src/transport/websocket.rs) — WebSocket
   transport handshake and request-header handling consulted for TCP endpoint
   compatibility.
 
@@ -42,12 +42,12 @@ endpoints.
 
 Consulted for method names, parameter shapes, and handshake order.
 
-- `codex-rs/app-server-protocol/src/protocol/v2/thread.rs` —
+- [codex-rs/app-server-protocol/src/protocol/v2/thread.rs](../vendor/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs) —
   `thread/start`, `turn/start`, `turn/steer` (`expectedTurnId`),
   `turn/interrupt`, `thread/read`, `thread/unsubscribe`; camelCase
   field names; `approvalPolicy` / `sandbox` values.
-- `codex-rs/app-server-protocol/src/protocol/v1.rs` and
-  `codex-rs/app-server-protocol/src/rpc.rs` — wire format detail
+- [codex-rs/app-server-protocol/src/protocol/v1.rs](../vendor/codex/codex-rs/app-server-protocol/src/protocol/v1.rs) and
+  [codex-rs/app-server-protocol/src/rpc.rs](../vendor/codex/codex-rs/app-server-protocol/src/rpc.rs) — wire format detail
   (omitted `"jsonrpc":"2.0"` header), `initialize` request
   (`clientInfo` + `capabilities`) followed by `initialized`
   notification.
@@ -56,7 +56,7 @@ Consulted for method names, parameter shapes, and handshake order.
 
 Consulted for the projected status vocabulary.
 
-- `codex-rs/app-server-protocol/src/protocol/v2/*` — `ThreadStatus`
+- [codex-rs/app-server-protocol/src/protocol/v2/*](../vendor/codex/codex-rs/app-server-protocol/src/protocol/v2/) — `ThreadStatus`
   tagged union (`notLoaded` / `idle` / `systemError` / `active` with
   `activeFlags`) and `TurnStatus` (`completed` / `interrupted` /
   `failed` / `inProgress`).
@@ -65,10 +65,10 @@ Consulted for the projected status vocabulary.
 
 Consulted for `codex app-server daemon start` semantics.
 
-- `codex-rs/app-server-daemon/src/lib.rs` — idempotent start; JSON
+- [codex-rs/app-server-daemon/src/lib.rs](../vendor/codex/codex-rs/app-server-daemon/src/lib.rs) — idempotent start; JSON
   status on stdout (`alreadyRunning` / `bootstrapped`, `socketPath`,
   version fields).
-- `codex-rs/app-server-daemon/src/client.rs` — daemon-side control socket
+- [codex-rs/app-server-daemon/src/client.rs](../vendor/codex/codex-rs/app-server-daemon/src/client.rs) — daemon-side control socket
   probe using `tokio_tungstenite::client_async` and the `ws://localhost/`
   handshake URI.
 
@@ -76,7 +76,7 @@ Consulted for `codex app-server daemon start` semantics.
 
 Consulted for rollout location and token-usage records.
 
-- `codex-rs/rollout/` (writer and metadata modules) — file layout
+- [codex-rs/rollout/](../vendor/codex/codex-rs/rollout/) (writer and metadata modules) — file layout
   `sessions/YYYY/MM/DD/rollout-<timestamp>-<session_id>.jsonl` and the
   `event_msg` / `token_count` records carrying token usage.
 
@@ -85,14 +85,14 @@ Consulted for rollout location and token-usage records.
 The upstream TUI context percentage and its baseline normalization were read
 from:
 
-- `codex-rs/tui/src/token_usage.rs` — baseline and remaining-percentage
+- [codex-rs/tui/src/token_usage.rs](../vendor/codex/codex-rs/tui/src/token_usage.rs) — baseline and remaining-percentage
   calculation.
-- `codex-rs/tui/src/chatwidget/status_controls.rs` — conversion from
+- [codex-rs/tui/src/chatwidget/status_controls.rs](../vendor/codex/codex-rs/tui/src/chatwidget/status_controls.rs) — conversion from
   remaining percentage to displayed usage percentage.
 
 ### Cross-checked only
 
-- `docs/config.md` — `CODEX_HOME` semantics; not an implementation
+- [docs/config.md](../vendor/codex/docs/config.md) — `CODEX_HOME` semantics; not an implementation
   source.
 - TUI/CLI interaction flows — read for approval/elicitation request
   shapes only; the unattended decline policy is codexctl's own

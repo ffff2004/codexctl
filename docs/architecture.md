@@ -34,13 +34,13 @@ side of it:
 
 | Module | Responsibility |
 |---|---|
-| `cli.py` | argv parsing, output-mode validation, signals, exit codes |
-| `model.py` | The closed vocabulary: commands, outcomes, projected events, selectors, error codes |
-| `core.py` | `CodexCtl`: command dispatch, orchestration, race handling, follow frontier, error mapping |
-| `endpoint.py` | Endpoint resolution: managed daemon, external endpoint, and stdio process target |
-| `appserver.py` | Transport framing, JSON-RPC routing, initialize handshake, unattended interaction policy, projection |
-| `rollout.py` | Read-only, narrow, best-effort reader of Codex rollout files |
-| `render.py` | text/json/jsonl renderers; single source of structured JSON documents |
+| [cli.py](../src/codexctl/cli.py) | argv parsing, output-mode validation, signals, exit codes |
+| [model.py](../src/codexctl/model.py) | The closed vocabulary: commands, outcomes, projected events, selectors, error codes |
+| [core.py](../src/codexctl/core.py) | `CodexCtl`: command dispatch, orchestration, race handling, follow frontier, error mapping |
+| [endpoint.py](../src/codexctl/endpoint.py) | Endpoint resolution: managed daemon, external endpoint, and stdio process target |
+| [appserver.py](../src/codexctl/appserver.py) | Transport framing, JSON-RPC routing, initialize handshake, unattended interaction policy, projection |
+| [rollout.py](../src/codexctl/rollout.py) | Read-only, narrow, best-effort reader of Codex rollout files |
+| [render.py](../src/codexctl/render.py) | text/json/jsonl renderers; single source of structured JSON documents |
 
 ### model.py — the closed vocabulary
 
@@ -197,7 +197,7 @@ with captured streams.
 ## Testing strategy
 
 Tests drive `CodexCtl` through a scripted `FakeAppServer` implementing
-the `AppServerPort` shape (see `tests/conftest.py`); no sockets are
+the `AppServerPort` shape (see [tests/conftest.py](../tests/conftest.py)); no sockets are
 opened. This covers all lifecycle behaviors pinned down above: start and
 resume contracts, busy detection, steer with `expectedTurnId`, interrupt
 waiting, read-only status, selector semantics, follow replay/live dedup

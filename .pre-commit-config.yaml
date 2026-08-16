@@ -23,6 +23,15 @@ repos:
         always_run: true
         stages: [pre-commit]
 
+      - id: check-md-links
+        name: check markdown links
+        entry: uv run --locked python scripts/check_md_links.py
+        language: system
+        types: [markdown]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
       - id: pytest
         name: pytest
         entry: uv run --locked pytest

@@ -8,12 +8,12 @@ It stores nothing locally; threads live in the shared runtime.
 
 ## Documentation
 
-- `docs/reference.md` — public contract (commands, output modes, JSON
+- [docs/reference.md](docs/reference.md) — public contract (commands, output modes, JSON
   shapes, error codes, exit codes). Single source of truth for anything
   observable.
-- `docs/architecture.md` — internal modules, seams, protocol adaptation.
+- [docs/architecture.md](docs/architecture.md) — internal modules, seams, protocol adaptation.
   Links to reference.md instead of repeating public facts.
-- `docs/codex-reference.md` — record of which upstream Codex source files
+- [docs/codex-reference.md](docs/codex-reference.md) — record of which upstream Codex source files
   each protocol fact was read from, pinned to a Codex stable-release tag.
 
 ### Documentation rules
@@ -53,16 +53,16 @@ uv build         # build dist/ artifacts
 
 ## Code layout
 
-- `model.py` — closed vocabulary crossing `CodexCtl.run`: commands,
+- [model.py](src/codexctl/model.py) — closed vocabulary crossing `CodexCtl.run`: commands,
   outcomes, projected events, selectors, error codes. No wire types here.
-- `core.py` — `CodexCtl`: dispatch, orchestration, race handling, follow
+- [core.py](src/codexctl/core.py) — `CodexCtl`: dispatch, orchestration, race handling, follow
   replay/live frontier, error mapping.
-- `endpoint.py` — managed daemon lifecycle vs external `--endpoint`.
-- `appserver.py` — JSON-RPC over websocket transports, initialize
+- [endpoint.py](src/codexctl/endpoint.py) — managed daemon lifecycle vs external `--endpoint`.
+- [appserver.py](src/codexctl/appserver.py) — JSON-RPC over websocket transports, initialize
   handshake, unattended interaction policy, projection (compatibility
   firewall; raw Codex wire types never leave this module).
-- `rollout.py` — best-effort read-only rollout reader; never raises.
-- `render.py` / `cli.py` — outside the seam; output formats never
+- [rollout.py](src/codexctl/rollout.py) — best-effort read-only rollout reader; never raises.
+- [render.py](src/codexctl/render.py) / [cli.py](src/codexctl/cli.py) — outside the seam; output formats never
   influence execution behavior.
 
 ## Invariants to preserve when changing code
@@ -74,12 +74,12 @@ uv build         # build dist/ artifacts
 - Unattended: never block on human input (decline approvals, surface
   `UNSUPPORTED_INTERACTION`).
 - Follow emits each event once across replay/live, keyed on stable
-  Codex identities (see `docs/architecture.md` for the dedup key).
+  Codex identities (see [docs/architecture.md](docs/architecture.md) for the dedup key).
 - Error mapping: `-32601` → `INCOMPATIBLE_CODEX`; rejected interrupt is
   always a domain error (`NO_ACTIVE_TURN`).
 - Core behaviors are pinned by tests in `tests/` driven through
-  `FakeAppServer` (see `tests/conftest.py`); update them together with
-  behavior changes, and keep `docs/reference.md` in sync.
+  `FakeAppServer` (see [tests/conftest.py](tests/conftest.py)); update them together with
+  behavior changes, and keep [docs/reference.md](docs/reference.md) in sync.
 
 ## Agent skills
 
