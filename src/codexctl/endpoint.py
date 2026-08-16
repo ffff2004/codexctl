@@ -1,11 +1,13 @@
 """Runtime endpoint resolution.
 
-Two real production behaviors justify this seam:
+Three real production behaviors justify this seam:
 
 - ``ManagedDaemonAdapter`` may start the experimental Codex daemon lifecycle
   to make a compatible shared app-server available.
 - ``ExternalEndpointAdapter`` honors ``--endpoint`` and performs no lifecycle
   mutation at all.
+- ``StdioEndpointAdapter`` records one caller-supplied process invocation;
+  process ownership begins when the app-server transport connects.
 
 Core execution only ever sees an :class:`AppServerEndpoint`.
 """
@@ -30,7 +32,7 @@ class AppServerEndpoint:
     """A resolved app-server location, opaque outside transport code."""
 
     display: str
-    target: "UnixTarget | TcpTarget" = field(repr=False)
+    target: "UnixTarget | TcpTarget | StdioTarget" = field(repr=False)
     runtime_pid: int | None = None
     runtime_version: str | None = None
 
@@ -44,6 +46,13 @@ class UnixTarget:
 class TcpTarget:
     url: str
     token_file: Path | None
+
+
+@dataclass(frozen=True)
+class StdioTarget:
+    """Exact argv for a one-shot stdio app-server process."""
+
+    argv: tuple[str, ...]
 
 
 # Endpoint URLs are locations, never credential carriers. Keep this closed
@@ -222,6 +231,24 @@ class ExternalEndpointAdapter:
 
     def probe_cli_version(self) -> str | None:
         # External endpoints own no codex binary lifecycle.
+        return None
+
+
+class StdioEndpointAdapter:
+    """Resolves a caller-configured, one-shot stdio app-server process."""
+
+    mode = "stdio"
+
+    def __init__(self, executable: str, args: tuple[str, ...] = ()) -> None:
+        self._target = StdioTarget((executable, *args))
+
+    async def resolve(self) -> AppServerEndpoint:
+        # Resolution is deliberately side-effect free. The connection adapter
+        # owns spawning and cleanup so every operation gets one fresh process.
+        return AppServerEndpoint(display="stdio", target=self._target)
+
+    def probe_cli_version(self) -> str | None:
+        # Stdio mode does not expose or probe a separate Codex CLI lifecycle.
         return None
 
 

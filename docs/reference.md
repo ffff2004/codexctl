@@ -49,6 +49,18 @@ Every command accepts:
 | `--jsonl` | Shorthand for `-o jsonl` |
 | `--endpoint <uri>` | Use an externally managed app-server endpoint; `codexctl` performs no daemon lifecycle actions in this mode |
 | `--endpoint-token-file <path>` | Read a Bearer token from this file immediately before connecting to a `ws://` endpoint |
+| `--stdio-exec <executable>` | Run one caller-selected app-server process with newline-delimited JSON on stdin/stdout |
+| `--stdio-arg <arg>` | Repeatable; append this exact argument, in order, to `--stdio-exec` |
+
+`--stdio-exec` and `--stdio-arg` select `stdio` mode. Stdio mode is mutually
+exclusive with `--endpoint` and `--endpoint-token-file`; `--stdio-arg`
+requires `--stdio-exec`. The executable and arguments are passed directly as
+one argv vector: there is no shell parsing, pipeline, redirection, glob
+expansion, or environment interpolation. The child inherits codexctl's
+environment and working directory, receives protocol input on stdin, writes
+protocol output on stdout, and has stderr forwarded to codexctl's stderr.
+Dash-prefixed values are accepted; use the attached spelling
+`--stdio-arg=--` when passing a literal `--` before the prompt delimiter.
 
 ### start
 
@@ -306,7 +318,7 @@ non-empty.
 ```json
 {
   "codexctlVersion": "0.1.0",
-  "endpointMode": "managed|external",
+  "endpointMode": "managed|external|stdio",
   "codexCliVersion": "codex-cli 0.101.0",
   "appServerVersion": "0.101.0",
   "compatible": true,
@@ -355,6 +367,25 @@ External endpoints use one of these forms:
 
 Malformed endpoint configuration is a `USAGE_ERROR`. An unavailable endpoint,
 or a missing, unreadable, or empty token file, is `APP_SERVER_UNAVAILABLE`.
+
+Stdio mode starts a fresh child for each command invocation. It uses
+newline-delimited JSON: blank lines are ignored, LF and CRLF are accepted,
+and a final valid line need not end with a newline. Each line must contain
+exactly one JSON object. WebSocket frames follow the same strict object rule;
+binary frames, malformed JSON, non-object values, and any later framing
+failure are `APP_SERVER_PROTOCOL_ERROR` failures with no resynchronization.
+The initialize/startup deadline is 15 seconds. Executable failures,
+permission failures, pre-initialize child exits, and startup timeouts are
+`APP_SERVER_UNAVAILABLE`; unexpected runtime exits are
+`APP_SERVER_PROTOCOL_ERROR`. The child is not reconnected or restarted.
+
+On normal cleanup codexctl closes stdin, waits briefly, terminates the child
+process group, and uses a final kill fallback when necessary. Cleanup status
+does not replace a successful command result. `doctor` reports only
+`endpointMode: "stdio"`; it does not expose the executable or argument list.
+As with other modes, local Ctrl+C returns 130 and sends no turn interrupt;
+with stdio, the caller must not assume a detached or interrupted command's
+active turn survives termination of the child process.
 
 Environment variables:
 

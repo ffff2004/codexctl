@@ -9,8 +9,11 @@ only see request results, :class:`~codexctl.model.ProjectedEvent` values, and
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -18,6 +21,7 @@ from typing import (
     Any,
     AsyncIterator,
     Literal,
+    NoReturn,
     Protocol,
     TypeAlias,
     runtime_checkable,
@@ -41,6 +45,7 @@ CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
 DEFAULT_APPROVAL_POLICY = "never"
 THREAD_LIST_PAGE_SIZE = 100
+_STDIO_STREAM_LIMIT = 64 * 1024
 
 # Synthetic notification method used to surface server-initiated interaction
 # requests that v1 cannot broker. Internal to codexctl; never on the wire.
@@ -253,16 +258,195 @@ class AppServerPort(Protocol):
     async def close(self) -> None: ...
 
 
-class WebSocketAppServerAdapter:
-    """Production adapter: JSON-RPC over an initialized websocket session.
+Frame: TypeAlias = str | bytes
+
+
+class _FrameTransport(Protocol):
+    """Raw message transport below JSON decoding."""
+
+    async def send_text(self, payload: str) -> None: ...
+
+    def frames(self) -> AsyncIterator[Frame]: ...
+
+    async def close(self) -> None: ...
+
+
+class _WebSocketConnection(Protocol):
+    async def send(self, message: str) -> None: ...
+
+    def __aiter__(self) -> AsyncIterator[Frame]: ...
+
+    async def close(self) -> None: ...
+
+
+class _StdioLaunchState:
+    """Keep the child handle reachable while subprocess setup is pending."""
+
+    def __init__(self) -> None:
+        self.transport: StdioFrameTransport | None = None
+
+    def capture(
+        self,
+        raw_transport: asyncio.BaseTransport,
+        protocol: asyncio.SubprocessProtocol,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        process = asyncio.subprocess.Process(raw_transport, protocol, loop)
+        self.transport = StdioFrameTransport(process)
+
+
+class _CapturingSubprocessStreamProtocol(asyncio.subprocess.SubprocessStreamProtocol):
+    """Capture the process before low-level subprocess setup returns."""
+
+    def __init__(self, state: _StdioLaunchState, loop: asyncio.AbstractEventLoop):
+        super().__init__(limit=_STDIO_STREAM_LIMIT, loop=loop)
+        self._launch_state = state
+        self._launch_loop = loop
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        super().connection_made(transport)
+        self._launch_state.capture(transport, self, self._launch_loop)
+
+
+class WebSocketFrameTransport:
+    """Adapt a websockets connection to the raw frame transport seam."""
+
+    def __init__(self, conn: _WebSocketConnection) -> None:
+        self._conn = conn
+
+    async def send_text(self, payload: str) -> None:
+        await self._conn.send(payload)
+
+    async def _frames(self) -> AsyncIterator[Frame]:
+        async for frame in self._conn:
+            yield frame
+
+    def frames(self) -> AsyncIterator[Frame]:
+        return self._frames()
+
+    async def close(self) -> None:
+        await self._conn.close()
+
+
+class StdioFrameTransport:
+    """Newline-delimited JSON transport backed by one child process."""
+
+    _GRACEFUL_WAIT_SECONDS = 1.0
+    _TERMINATE_WAIT_SECONDS = 1.0
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+        self._closed = False
+
+    @classmethod
+    async def launch(
+        cls, argv: tuple[str, ...], state: _StdioLaunchState | None = None
+    ) -> "StdioFrameTransport":
+        launch_state = state or _StdioLaunchState()
+        loop = asyncio.get_running_loop()
+
+        def protocol_factory() -> _CapturingSubprocessStreamProtocol:
+            return _CapturingSubprocessStreamProtocol(launch_state, loop)
+
+        try:
+            await loop.subprocess_exec(
+                protocol_factory,
+                argv[0],
+                *argv[1:],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                # The child protocol is stdout-only. Inherit stderr so child
+                # diagnostics remain visible on codexctl's stderr.
+                stderr=None,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            raise CodexCtlError(
+                ErrorCode.APP_SERVER_UNAVAILABLE,
+                "cannot start stdio app-server process",
+                cause=exc,
+            ) from exc
+        transport = launch_state.transport
+        if transport is None:  # pragma: no cover - loop contract fallback
+            raise RuntimeError("stdio subprocess setup returned without a process")
+        return transport
+
+    async def send_text(self, payload: str) -> None:
+        stdin = self._process.stdin
+        if stdin is None:
+            raise RuntimeError("stdio app-server stdin is unavailable")
+        stdin.write(payload.encode("utf-8") + b"\n")
+        await stdin.drain()
+
+    async def _frames(self) -> AsyncIterator[Frame]:
+        stdout = self._process.stdout
+        if stdout is None:
+            raise RuntimeError("stdio app-server stdout is unavailable")
+        async for line in stdout:
+            line = line.rstrip(b"\r\n")
+            if not line.strip():
+                continue
+            # Keep decoding below the framing seam: the shared decoder rejects
+            # malformed UTF-8 as a protocol error without resynchronizing.
+            yield line.decode("utf-8")
+
+    def frames(self) -> AsyncIterator[Frame]:
+        return self._frames()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        stdin = self._process.stdin
+        if stdin is not None:
+            with contextlib.suppress(Exception):
+                stdin.close()
+                await stdin.wait_closed()
+
+        await self._wait(self._GRACEFUL_WAIT_SECONDS)
+        # The parent may already have exited while a descendant still holds
+        # the protocol pipes open. Always clean the dedicated process group,
+        # then use SIGKILL only when the group remains alive.
+        self._signal_group(signal.SIGTERM)
+        await self._wait(self._TERMINATE_WAIT_SECONDS)
+        if self._group_exists():
+            self._signal_group(signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            await self._process.wait()
+
+    async def _wait(self, timeout: float) -> bool:
+        if self._process.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(self._process.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    def _signal_group(self, signum: int) -> None:
+        try:
+            os.killpg(self._process.pid, signum)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def _group_exists(self) -> bool:
+        try:
+            os.killpg(self._process.pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        return True
+
+
+class JsonRpcAppServerSession:
+    """Shared JSON-RPC session over a transport-specific frame stream.
 
     Transport setup is intentionally outside this session implementation so
     Unix and TCP endpoints share reader routing, projection, and the
     unattended interaction policy.
     """
 
-    def __init__(self, conn: Any, display: str) -> None:
-        self._conn = conn
+    def __init__(self, transport: _FrameTransport | None, display: str) -> None:
+        self._transport = transport
         self._display = display
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
@@ -273,6 +457,7 @@ class WebSocketAppServerAdapter:
         self.app_server_version: str | None = None
         self.server_codex_home: str | None = None
         self.interaction_count = 0
+        self._initialized = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -293,6 +478,7 @@ class WebSocketAppServerAdapter:
         self.server_codex_home = result.codex_home
         self.app_server_version = parse_user_agent_version(self.user_agent)
         await self._notify("initialized")
+        self._initialized = True
 
     async def close(self) -> None:
         if self._closed:
@@ -300,10 +486,12 @@ class WebSocketAppServerAdapter:
         self._closed = True
         if self._reader_task is not None:
             self._reader_task.cancel()
-        try:
-            await self._conn.close()
-        except Exception:  # noqa: BLE001 - closing is best-effort
-            pass
+            if self._reader_task is not asyncio.current_task():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._reader_task
+        if self._transport is not None:
+            with contextlib.suppress(Exception):
+                await self._transport.close()
 
     async def unsubscribe(self, thread_id: str) -> None:
         """Best-effort unsubscribe; never raises."""
@@ -317,7 +505,18 @@ class WebSocketAppServerAdapter:
     # -- transport -----------------------------------------------------------
 
     async def _send(self, message: dict) -> None:
-        await self._conn.send(json.dumps(message))
+        if self._transport is None:
+            raise _transport_failure(
+                self._display,
+                self._initialized,
+                RuntimeError("app-server transport is unavailable"),
+            )
+        try:
+            await self._transport.send_text(json.dumps(message))
+        except CodexCtlError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transport failure
+            raise _transport_failure(self._display, self._initialized, exc) from exc
 
     async def _notify(self, method: str, params: dict | None = None) -> None:
         message: dict[str, Any] = {"method": method}
@@ -422,7 +621,11 @@ class WebSocketAppServerAdapter:
         self, method: str, params: dict | None = None
     ) -> AppServerResponse:
         if self._closed:
-            raise _unavailable(self._display, RuntimeError("connection closed"))
+            raise _transport_failure(
+                self._display,
+                self._initialized,
+                RuntimeError("connection closed"),
+            )
         request_id = next(self._ids)
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
@@ -448,14 +651,13 @@ class WebSocketAppServerAdapter:
                 yield event
 
     async def _reader(self) -> None:
+        failure: CodexCtlError | None = None
+        cancelled = False
         try:
-            async for frame in self._conn:
-                try:
-                    message = json.loads(frame)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not isinstance(message, dict):
-                    continue
+            if self._transport is None:
+                raise RuntimeError("app-server transport is unavailable")
+            async for frame in self._transport.frames():
+                message = _decode_frame(frame)
                 if "method" in message:
                     if "id" in message:
                         await self._handle_server_request(message)
@@ -476,15 +678,32 @@ class WebSocketAppServerAdapter:
                         else:
                             future.set_result(message.get("result") or {})
         except asyncio.CancelledError:
-            return
-        except Exception:  # noqa: BLE001 - any transport loss ends the stream
-            pass
+            cancelled = True
+        except UnicodeDecodeError as exc:
+            failure = CodexCtlError(
+                ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+                "app-server protocol error: invalid UTF-8 frame",
+                cause=exc,
+            )
+        except CodexCtlError as exc:
+            failure = exc
+        except Exception as exc:  # noqa: BLE001 - any transport loss ends the stream
+            failure = _transport_failure(self._display, self._initialized, exc)
         finally:
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(
-                        JsonRpcError(-32000, "app-server connection closed")
-                    )
+            if not cancelled and failure is None and not self._closed:
+                failure = _transport_failure(
+                    self._display,
+                    self._initialized,
+                    RuntimeError("connection closed"),
+                )
+            if failure is not None:
+                self._closed = True
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_exception(failure)
+                if self._transport is not None:
+                    with contextlib.suppress(Exception):
+                        await self._transport.close()
             self._pending.clear()
             await self._queue.put(None)
 
@@ -534,49 +753,160 @@ async def connect_endpoint(
     """Connect one resolved endpoint without exposing transport to callers."""
     # Delayed import avoids an endpoint -> appserver import cycle during
     # managed-runtime probing.
-    from .endpoint import TcpTarget, UnixTarget
+    from .endpoint import StdioTarget, TcpTarget, UnixTarget
 
     target = endpoint.target
+    adapter: JsonRpcAppServerSession | None = None
     try:
-        if isinstance(target, UnixTarget):
-            from websockets.asyncio.client import unix_connect
+        async with asyncio.timeout(timeout):
+            if isinstance(target, UnixTarget):
+                from websockets.asyncio.client import unix_connect
 
-            # Codex's Unix transport rejects the client's default
-            # permessage-deflate offer.
-            conn = await asyncio.wait_for(
-                unix_connect(str(target.path), max_size=None, compression=None), timeout
-            )
-        elif isinstance(target, TcpTarget):
-            from websockets.asyncio.client import connect
+                # Codex's Unix transport rejects the client's default
+                # permessage-deflate offer.
+                conn = await unix_connect(
+                    str(target.path), max_size=None, compression=None
+                )
+                transport: _FrameTransport = WebSocketFrameTransport(conn)
+            elif isinstance(target, TcpTarget):
+                from websockets.asyncio.client import connect
 
-            headers: dict[str, str] | None = None
-            if target.token_file is not None:
-                token = _read_endpoint_token(target.token_file)
-                headers = {"Authorization": f"Bearer {token}"}
-            conn = await asyncio.wait_for(
-                connect(
+                headers: dict[str, str] | None = None
+                if target.token_file is not None:
+                    token = _read_endpoint_token(target.token_file)
+                    headers = {"Authorization": f"Bearer {token}"}
+                conn = await connect(
                     target.url,
                     additional_headers=headers,
                     max_size=None,
                     compression=None,
-                ),
-                timeout,
-            )
-        else:  # pragma: no cover - targets are a closed endpoint vocabulary
-            raise RuntimeError("unknown app-server endpoint target")
+                )
+                transport = WebSocketFrameTransport(conn)
+            elif isinstance(target, StdioTarget):
+                transport = await _launch_stdio_transport(target.argv)
+            else:  # pragma: no cover - targets are a closed endpoint vocabulary
+                raise RuntimeError("unknown app-server endpoint target")
+
+            adapter = JsonRpcAppServerSession(transport, endpoint.display)
+            adapter._reader_task = asyncio.create_task(adapter._reader())
+            await adapter._initialize()
+    except asyncio.CancelledError:
+        if adapter is not None:
+            await adapter.close()
+        raise
+    except asyncio.TimeoutError as exc:
+        if adapter is not None:
+            await adapter.close()
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_UNAVAILABLE,
+            f"app-server startup or initialize timed out after {timeout:g}s",
+            cause=exc,
+        ) from exc
     except CodexCtlError:
+        if adapter is not None:
+            await adapter.close()
         raise
     except Exception as exc:  # noqa: BLE001 - mapped to application error
+        if adapter is not None:
+            await adapter.close()
         raise _unavailable(endpoint.display, exc) from exc
-
-    adapter = WebSocketAppServerAdapter(conn, endpoint.display)
-    adapter._reader_task = asyncio.create_task(adapter._reader())
-    try:
-        await adapter._initialize()
-    except Exception:
-        await adapter.close()
-        raise
+    assert adapter is not None
     return adapter
+
+
+async def _launch_stdio_transport(argv: tuple[str, ...]) -> StdioFrameTransport:
+    """Launch stdio without making cancellation wait for process creation."""
+    state = _StdioLaunchState()
+    launch_task = asyncio.create_task(StdioFrameTransport.launch(argv, state))
+    try:
+        return await asyncio.shield(launch_task)
+    except BaseException:
+        # A cancelled launch may still finish after subprocess setup has
+        # published its process handle. Drain it briefly when possible, but do
+        # not let stalled process setup extend the startup deadline.
+        launch_task.cancel()
+        try:
+            transport = await asyncio.wait_for(
+                asyncio.shield(launch_task), _STDIO_LAUNCH_DRAIN_SECONDS
+            )
+        except asyncio.TimeoutError:
+            launch_task.add_done_callback(
+                lambda task: _cleanup_stdio_launch(task, state)
+            )
+        except BaseException:
+            await _close_stdio_launch(state)
+        else:
+            await _close_stdio_transport(transport)
+        raise
+
+
+_STDIO_LAUNCH_DRAIN_SECONDS = 0.1
+
+
+async def _close_stdio_transport(transport: StdioFrameTransport) -> None:
+    """Close a transport from a cancelled launch without leaking exceptions."""
+    with contextlib.suppress(BaseException):
+        await transport.close()
+
+
+async def _close_stdio_launch(state: _StdioLaunchState) -> None:
+    """Close a child captured before its transport wrapper was returned."""
+    if state.transport is not None:
+        await _close_stdio_transport(state.transport)
+
+
+def _cleanup_stdio_launch(
+    launch_task: asyncio.Task[StdioFrameTransport], state: _StdioLaunchState
+) -> None:
+    """Finish cleanup if a cancelled launch eventually captures a process."""
+    with contextlib.suppress(BaseException):
+        launch_task.result()
+    cleanup_task = asyncio.create_task(_close_stdio_launch(state))
+    cleanup_task.add_done_callback(_consume_task)
+
+
+def _consume_task(task: asyncio.Task[object]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _decode_frame(frame: Frame) -> dict:
+    """Decode exactly one text frame/line into one JSON object."""
+    if isinstance(frame, bytes):
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+            "app-server protocol error: binary frame is not allowed",
+        )
+    try:
+        message = json.loads(frame, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError) as exc:
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+            "app-server protocol error: malformed JSON frame",
+            cause=exc,
+        ) from exc
+    if not isinstance(message, dict):
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+            "app-server protocol error: frame must contain a JSON object",
+        )
+    return message
+
+
+def _transport_failure(
+    endpoint: str, initialized: bool, cause: Exception
+) -> CodexCtlError:
+    if initialized:
+        return CodexCtlError(
+            ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+            f"app-server connection failed at {endpoint}: {cause}",
+            cause=cause,
+        )
+    return _unavailable(endpoint, cause)
 
 
 def _read_endpoint_token(token_file: Path) -> str:
@@ -690,7 +1020,7 @@ def _project_codex_error_info(data: Any) -> str | None:
     return str(value) if value is not None else None
 
 
-def _unavailable(endpoint: str, cause: Exception) -> Exception:
+def _unavailable(endpoint: str, cause: Exception) -> CodexCtlError:
     return CodexCtlError(
         ErrorCode.APP_SERVER_UNAVAILABLE,
         f"cannot reach app-server at {endpoint}: {cause}",

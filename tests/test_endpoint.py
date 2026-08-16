@@ -10,6 +10,8 @@ import pytest
 from codexctl.endpoint import (
     ExternalEndpointAdapter,
     ManagedDaemonAdapter,
+    StdioEndpointAdapter,
+    StdioTarget,
     TcpTarget,
     UnixTarget,
     _last_json_object,
@@ -212,6 +214,19 @@ class TestExternalEndpointAdapter:
         with pytest.raises(CodexCtlError) as excinfo:
             ExternalEndpointAdapter("unix:///tmp/app-server.sock", tmp_path / "token")
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+
+class TestStdioEndpointAdapter:
+    async def test_resolves_exact_argv_without_starting_a_process(self):
+        adapter = StdioEndpointAdapter("app-server", ("--flag", "--", "value"))
+
+        endpoint = await adapter.resolve()
+
+        assert endpoint.display == "stdio"
+        assert endpoint.target == StdioTarget(("app-server", "--flag", "--", "value"))
+        assert endpoint.runtime_pid is None
+        assert adapter.mode == "stdio"
+        assert adapter.probe_cli_version() is None
 
 
 class TestDefaultControlSocketPath:

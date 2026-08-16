@@ -5,10 +5,17 @@ All paths tested here return before any runtime connection is attempted.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
+from codexctl.appserver import StdioFrameTransport
 from codexctl.cli import (
     _OUTPUT_MATRIX,
     EXIT_DOMAIN,
@@ -17,12 +24,181 @@ from codexctl.cli import (
     EXIT_TURN,
     EXIT_USAGE,
     _build_command,
+    _execute,
+    _select_endpoint,
     _split_prompt,
     build_parser,
     exit_code_for,
     main,
 )
-from codexctl.model import CodexCtlError, ErrorCode, ListThreads, SandboxPolicy, Start
+from codexctl.core import CodexCtl
+from codexctl.endpoint import StdioEndpointAdapter, StdioTarget
+from codexctl.model import (
+    CodexCtlError,
+    ErrorCode,
+    ListThreads,
+    SandboxPolicy,
+    Start,
+)
+
+_SUCCESSFUL_STDIO_SERVER = """\
+import json
+import sys
+
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        send({"id": message["id"], "result": {"userAgent": "stdio/1.0"}})
+    elif method == "initialized":
+        send({"method": "future/notification", "params": {}})
+        send({"jsonrpc": "2.0", "futureField": True})
+    elif method == "thread/start":
+        send({"id": message["id"], "result": {"thread": {"id": "t1"}}})
+    elif method == "turn/start":
+        send({"id": message["id"], "result": {"turn": {"id": "u1"}}})
+        send({
+            "method": "item/completed",
+            "params": {
+                "threadId": "t1",
+                "turnId": "u1",
+                "item": {"type": "agentMessage", "id": "i1", "text": "done"},
+            },
+        })
+        send({
+            "method": "turn/completed",
+            "params": {"threadId": "t1", "turn": {"id": "u1", "status": "completed"}},
+        })
+    elif method == "thread/unsubscribe":
+        send({"id": message["id"], "result": {}})
+"""
+
+
+class TestStdioExecution:
+    async def test_start_preserves_text_rendering(self, stdio_adapter, capsys):
+        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="render.py")
+
+        code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
+
+        assert code == 0
+        output = capsys.readouterr().out
+        assert output.startswith("Thread: t1\nTurn:   u1\n")
+        assert "[agent]\ndone\n" in output
+        assert "Turn completed\n" in output
+
+    async def test_detach_returns_the_existing_json_document(
+        self, stdio_adapter, capsys
+    ):
+        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="detach.py")
+
+        code = await _execute(
+            CodexCtl(endpoint), Start(prompt="hello", detach=True), "json"
+        )
+
+        assert code == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "threadId": "t1",
+            "turnId": "u1",
+            "detached": True,
+        }
+
+    async def test_cleanup_failure_does_not_replace_successful_result(
+        self, stdio_adapter, capsys, monkeypatch
+    ):
+        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="cleanup.py")
+        original_close = StdioFrameTransport.close
+
+        async def close_then_fail(transport):
+            await original_close(transport)
+            raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(StdioFrameTransport, "close", close_then_fail)
+
+        code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
+
+        assert code == 0
+        assert "Turn completed" in capsys.readouterr().out
+
+    async def test_live_ctrl_c_returns_130_without_turn_interrupt(self, tmp_path):
+        server = tmp_path / "ctrl-c-server.py"
+        marker = tmp_path / "messages.txt"
+        server.write_text(
+            "import json, pathlib, sys\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "def send(value):\n"
+            "    print(json.dumps(value), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    method = message.get('method')\n"
+            "    if method == 'initialize':\n"
+            "        send({'id': message['id'], 'result': {'userAgent': 'stdio/1.0'}})\n"
+            "    elif method == 'thread/start':\n"
+            "        send({'id': message['id'], 'result': {'thread': {'id': 't1'}}})\n"
+            "    elif method == 'turn/start':\n"
+            "        marker.write_text('turn-start', encoding='utf-8')\n"
+            "        send({'id': message['id'], 'result': {'turn': {'id': 'u1'}}})\n"
+            "    elif method == 'thread/unsubscribe':\n"
+            "        marker.write_text(marker.read_text() + '\\nunsubscribe', encoding='utf-8')\n"
+            "        send({'id': message['id'], 'result': {}})\n"
+            "    elif method == 'turn/interrupt':\n"
+            "        marker.write_text(marker.read_text() + '\\ninterrupt', encoding='utf-8')\n"
+            "        send({'id': message['id'], 'result': {}})\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        source_root = str(Path(__file__).parents[1] / "src")
+        environment["PYTHONPATH"] = (
+            source_root + os.pathsep + environment.get("PYTHONPATH", "")
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from codexctl.cli import main; raise SystemExit(main())",
+                "start",
+                "--stdio-exec",
+                sys.executable,
+                "--stdio-arg",
+                str(server),
+                "--stdio-arg",
+                str(marker),
+                "--",
+                "hello",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            for _ in range(200):
+                if marker.exists():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                process.kill()
+                stdout, stderr = await asyncio.to_thread(process.communicate)
+                pytest.fail(
+                    "stdio command did not start its turn: "
+                    f"returncode={process.returncode}, stdout={stdout!r}, "
+                    f"stderr={stderr!r}"
+                )
+
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = await asyncio.to_thread(process.communicate, timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            await asyncio.to_thread(process.communicate)
+            raise
+
+        assert process.returncode == 130, (stdout, stderr)
+        assert "interrupt" not in marker.read_text(encoding="utf-8")
 
 
 class TestOutputMatrixContract:
@@ -134,6 +310,68 @@ class TestUsageErrors:
         assert main(["list", "--endpoint-token-file", "/tmp/token"]) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
 
+    def test_stdio_arg_accepts_dash_prefixed_values_and_preserves_order(self):
+        args = build_parser().parse_args(
+            [
+                "list",
+                "--stdio-exec",
+                "app-server",
+                "--stdio-arg",
+                "--child-flag",
+                "--stdio-arg",
+                "value",
+            ]
+        )
+
+        endpoint = _select_endpoint(args)
+
+        assert isinstance(endpoint, StdioEndpointAdapter)
+        assert endpoint.mode == "stdio"
+        assert endpoint._target == StdioTarget(("app-server", "--child-flag", "value"))
+
+    def test_stdio_literal_double_dash_can_precede_prompt_delimiter(self):
+        args = build_parser().parse_args(
+            ["start", "--stdio-exec", "app", "--stdio-arg=--"]
+        )
+        endpoint = _select_endpoint(args)
+        assert endpoint._target == StdioTarget(("app", "--"))
+
+        argv, prompt = _split_prompt(
+            ["start", "--stdio-exec", "app", "--stdio-arg=--", "--", "run"]
+        )
+        assert argv[-1] == "--stdio-arg=--"
+        assert prompt == "run"
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["list", "--stdio-arg", "value"],
+            ["list", "--stdio-exec", "app", "--endpoint", "unix:///tmp/x"],
+            ["list", "--stdio-exec", "app", "--endpoint-token-file", "/tmp/t"],
+        ],
+    )
+    def test_stdio_selection_errors_are_usage_errors(self, argv, capsys):
+        assert main(argv) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_stdio_options_are_available_on_every_command(self):
+        command_argv = [
+            ["start", "--stdio-exec", "app"],
+            ["resume", "t1", "--stdio-exec", "app"],
+            ["status", "t1", "--stdio-exec", "app"],
+            ["history", "t1", "--stdio-exec", "app"],
+            ["follow", "t1", "--stdio-exec", "app"],
+            ["steer", "t1", "--stdio-exec", "app"],
+            ["interrupt", "t1", "--stdio-exec", "app"],
+            ["list", "--stdio-exec", "app"],
+            ["doctor", "--stdio-exec", "app"],
+        ]
+
+        for argv in command_argv:
+            args = build_parser().parse_args(argv)
+            assert args.stdio_exec == "app"
+            assert args.stdio_args == []
+
     def test_legacy_socket_option_is_removed(self):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["list", "--socket", "/tmp/app.sock"])
@@ -177,6 +415,22 @@ class TestSplitPrompt:
         argv, prompt = _split_prompt(["start", "--", "run", "--verbose"])
         assert argv == ["start"]
         assert prompt == "run --verbose"
+
+    def test_stdio_dash_value_does_not_become_prompt_delimiter(self):
+        argv, prompt = _split_prompt(
+            ["start", "--stdio-arg", "--child-flag", "--", "run"]
+        )
+        assert argv == ["start", "--stdio-arg", "--child-flag"]
+        assert prompt == "run"
+
+    def test_keyboard_interrupt_returns_130(self, monkeypatch):
+        def interrupt(coroutine):
+            coroutine.close()
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("codexctl.cli.asyncio.run", interrupt)
+
+        assert main(["list", "--stdio-exec", "app"]) == 130
 
 
 class TestExitCodeMapping:

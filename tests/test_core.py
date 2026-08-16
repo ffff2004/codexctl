@@ -37,6 +37,7 @@ from codexctl.model import (
     Steer,
     parse_turn_selector,
 )
+from codexctl.render import snapshot_document
 
 # ---------------------------------------------------------------------------
 # Wire-shape builders
@@ -922,3 +923,12 @@ class TestDoctor:
         assert snapshot.endpoint_mode == "external"
         assert snapshot.codex_cli_version is None
         assert all(c.name != "codex cli version" for c in snapshot.checks)
+
+    async def test_stdio_mode_exposes_only_mode_in_doctor_document(self):
+        endpoint = FakeEndpoint(mode="stdio")
+        snapshot = await make_ctl(FakeAppServer(), endpoint).run(Doctor())
+
+        document = snapshot_document(snapshot)
+        assert document["endpointMode"] == "stdio"
+        assert "executable" not in document
+        assert "arguments" not in document

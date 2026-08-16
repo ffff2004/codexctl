@@ -11,11 +11,15 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, cast
 
 from .appserver import CLIENT_VERSION
 from .core import CodexCtl, history_to_events
-from .endpoint import ExternalEndpointAdapter, ManagedDaemonAdapter
+from .endpoint import (
+    ExternalEndpointAdapter,
+    ManagedDaemonAdapter,
+    StdioEndpointAdapter,
+)
 from .model import (
     CodexCtlError,
     Doctor,
@@ -90,6 +94,43 @@ class _CliUsageError(Exception):
     pass
 
 
+def _protect_stdio_args(argv: list[str]) -> list[str]:
+    """Make repeatable stdio values safe for argparse.
+
+    ``argparse`` treats a value beginning with ``-`` as another option. The
+    attached form preserves the exact value while leaving the first bare
+    ``--`` available as the existing prompt delimiter. A literal ``--`` used
+    as a stdio value can be written as ``--stdio-arg=--`` when a prompt also
+    follows the options.
+    """
+    protected: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        protected.append(token)
+        if token == "--":
+            protected.extend(argv[index + 1 :])
+            break
+        if token == "--stdio-arg" and index + 1 < len(argv):
+            protected[-1] = f"--stdio-arg={argv[index + 1]}"
+            index += 1
+        index += 1
+    return protected
+
+
+class _CodexArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that accepts dash-prefixed ``--stdio-arg`` values."""
+
+    def parse_args(  # type: ignore[override]
+        self,
+        args: Iterable[str] | None = None,
+        namespace: Any = None,
+    ) -> argparse.Namespace:
+        if args is not None:
+            args = _protect_stdio_args(list(args))
+        return cast(argparse.Namespace, super().parse_args(args, namespace))
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-o", "--output", choices=("text", "json", "jsonl"), default="text"
@@ -109,10 +150,24 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="Bearer token file for a ws:// endpoint",
     )
+    parser.add_argument(
+        "--stdio-exec",
+        default=None,
+        metavar="EXECUTABLE",
+        help="run a one-shot app-server over stdin/stdout",
+    )
+    parser.add_argument(
+        "--stdio-arg",
+        dest="stdio_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="append one exact argument to --stdio-exec",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="codexctl")
+    parser = _CodexArgumentParser(prog="codexctl")
     parser.add_argument(
         "--version", action="version", version=f"codexctl {CLIENT_VERSION}"
     )
@@ -174,10 +229,37 @@ def _resolve_output_mode(args: argparse.Namespace) -> str:
 
 def _split_prompt(argv: list[str]) -> tuple[list[str], str | None]:
     """Split argv at a bare ``--``; everything after it is the prompt."""
-    if "--" in argv:
-        index = argv.index("--")
-        return argv[:index], " ".join(argv[index + 1 :])
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[:index], " ".join(argv[index + 1 :])
+        if token == "--stdio-arg":
+            index += 2
+            continue
+        index += 1
     return argv, None
+
+
+def _select_endpoint(args: argparse.Namespace) -> Any:
+    """Apply the mutually exclusive endpoint-mode contract in one place."""
+    stdio_args = tuple(args.stdio_args)
+    has_stdio = args.stdio_exec is not None or bool(stdio_args)
+    has_external = args.endpoint is not None or args.endpoint_token_file is not None
+    if has_stdio and has_external:
+        raise UsageError(
+            "stdio options are mutually exclusive with --endpoint and "
+            "--endpoint-token-file"
+        )
+    if stdio_args and args.stdio_exec is None:
+        raise UsageError("--stdio-arg requires --stdio-exec")
+    if args.stdio_exec is not None:
+        return StdioEndpointAdapter(args.stdio_exec, stdio_args)
+    if args.endpoint is not None:
+        return ExternalEndpointAdapter(args.endpoint, args.endpoint_token_file)
+    if args.endpoint_token_file is not None:
+        raise UsageError("--endpoint-token-file requires --endpoint")
+    return ManagedDaemonAdapter()
 
 
 def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
@@ -265,6 +347,7 @@ async def _execute(ctl: CodexCtl, command: Any, mode: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    argv = _protect_stdio_args(argv)
     argv, prompt = _split_prompt(argv)
     parser = build_parser()
     try:
@@ -295,14 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        if args.endpoint is not None:
-            endpoint: Any = ExternalEndpointAdapter(
-                args.endpoint, args.endpoint_token_file
-            )
-        elif args.endpoint_token_file is not None:
-            raise UsageError("--endpoint-token-file requires --endpoint")
-        else:
-            endpoint = ManagedDaemonAdapter()
+        endpoint = _select_endpoint(args)
     except UsageError as exc:
         _emit_error(exc, mode)
         return EXIT_USAGE

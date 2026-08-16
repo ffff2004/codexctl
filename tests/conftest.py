@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
@@ -21,7 +22,12 @@ from codexctl.appserver import (
     project_notification,
     project_response,
 )
-from codexctl.endpoint import AppServerEndpoint, UnixTarget
+from codexctl.endpoint import (
+    AppServerEndpoint,
+    StdioEndpointAdapter,
+    StdioTarget,
+    UnixTarget,
+)
 from codexctl.model import ProjectedEvent, StartConfig
 
 
@@ -245,3 +251,39 @@ def isolated_codex_home(tmp_path, monkeypatch) -> Path:
     home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(home))
     return home
+
+
+@pytest.fixture
+def stdio_endpoint(tmp_path):
+    """Write a temporary stdio server and return its endpoint factory."""
+
+    def make_endpoint(
+        source: str,
+        *args: str,
+        filename: str = "stdio-server.py",
+    ) -> AppServerEndpoint:
+        script = tmp_path / filename
+        script.write_text(source, encoding="utf-8")
+        return AppServerEndpoint(
+            "stdio",
+            StdioTarget((sys.executable, str(script), *args)),
+        )
+
+    return make_endpoint
+
+
+@pytest.fixture
+def stdio_adapter(stdio_endpoint):
+    """Build the endpoint port for a temporary stdio server."""
+
+    def make_adapter(
+        source: str,
+        *args: str,
+        filename: str = "stdio-server.py",
+    ) -> StdioEndpointAdapter:
+        endpoint = stdio_endpoint(source, *args, filename=filename)
+        target = endpoint.target
+        assert isinstance(target, StdioTarget)
+        return StdioEndpointAdapter(target.argv[0], target.argv[1:])
+
+    return make_adapter

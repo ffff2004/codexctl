@@ -451,7 +451,7 @@ class DoctorCheck:
 @dataclass(frozen=True)
 class DoctorSnapshot:
     codexctl_version: str
-    endpoint_mode: str  # managed | external
+    endpoint_mode: str  # managed | external | stdio
     checks: list[DoctorCheck] = field(default_factory=list)
     codex_cli_version: str | None = None
     app_server_version: str | None = None
