@@ -84,7 +84,7 @@ Selector parsing is pure and follows Python semantics exactly
   replay and termination semantics are defined in
   [reference.md — follow](reference.md#follow).
 - **interrupt waits, never retries.** After `turn/interrupt` succeeds,
-  `core.py` polls the thread until the targeted turn is terminal (bounded
+  [core.py](../src/codexctl/core.py) polls the thread until the targeted turn is terminal (bounded
   wait, `INTERRUPT_WAIT_SECONDS` / `INTERRUPT_POLL_INTERVAL`). Rejected
   interrupts are handled by `_map_interrupt_error` before general RPC
   heuristics. The public interrupt contract is defined in
@@ -107,7 +107,7 @@ Selector parsing is pure and follows Python semantics exactly
 
 `EndpointPort.resolve() -> AppServerEndpoint(display, target, runtime_pid,
 runtime_version)` has three implementations. `target` is a closed transport
-detail and is opaque to `core.py`:
+detail and is opaque to [core.py](../src/codexctl/core.py):
 
 - `ManagedDaemonAdapter` contains all daemon lifecycle knowledge: probe
   the default control socket first (connecting + initializing to verify
@@ -181,7 +181,7 @@ of raising on any drift. It is never a primary history source.
 
 ### cli.py and render.py — outside the seam
 
-`cli.py` maps argv to commands and outcomes to exit codes. The
+[cli.py](../src/codexctl/cli.py) maps argv to commands and outcomes to exit codes. The
 output-mode matrix and the error-code → exit-code mapping implement the
 contracts specified in [reference.md — Output modes](reference.md#output-modes)
 and [reference.md — Exit codes](reference.md#exit-codes). SIGINT returns

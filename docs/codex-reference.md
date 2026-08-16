@@ -12,7 +12,7 @@ as an alternative source for current architecture or behavior.
 ## Codex repository baseline
 
 - Repository: [`openai/codex`](https://github.com/openai/codex)
-- Submodule path: `vendor/codex`
+- Submodule path: [vendor/codex](../vendor/codex)
 - Git tag: `rust-v0.147.0`
 - Commit: `be6e8eac029b183056b7e4402879f15d2c85f61b` (2026-08-06)
 

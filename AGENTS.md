@@ -77,7 +77,7 @@ uv build         # build dist/ artifacts
   Codex identities (see [docs/architecture.md](docs/architecture.md) for the dedup key).
 - Error mapping: `-32601` → `INCOMPATIBLE_CODEX`; rejected interrupt is
   always a domain error (`NO_ACTIVE_TURN`).
-- Core behaviors are pinned by tests in `tests/` driven through
+- Core behaviors are pinned by tests in [tests/](tests/) driven through
   `FakeAppServer` (see [tests/conftest.py](tests/conftest.py)); update them together with
   behavior changes, and keep [docs/reference.md](docs/reference.md) in sync.
 
@@ -85,8 +85,8 @@ uv build         # build dist/ artifacts
 
 ### Issue tracker
 
-Issues and specs live in GitHub Issues; use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues and specs live in GitHub Issues; use the `gh` CLI. See [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
 
 ### Triage labels
 
-Use the default canonical triage labels. See `docs/agents/triage-labels.md`.
+Use the default canonical triage labels. See [docs/agents/triage-labels.md](docs/agents/triage-labels.md).
