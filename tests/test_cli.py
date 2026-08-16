@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import FakeAppServer, make_ctl
 
 from codexctl.appserver import StdioFrameTransport
 from codexctl.cli import (
@@ -36,7 +37,9 @@ from codexctl.endpoint import StdioEndpointAdapter, StdioTarget
 from codexctl.model import (
     CodexCtlError,
     ErrorCode,
+    Follow,
     ListThreads,
+    ReplayActiveTurn,
     SandboxPolicy,
     Start,
 )
@@ -87,7 +90,9 @@ class TestStdioExecution:
 
         assert code == 0
         output = capsys.readouterr().out
-        assert output.startswith("Thread: t1\nTurn:   u1\n")
+        # Unified header: only the Thread line; the Turn marker is emitted
+        # from the turn/started event (the first event for start/resume).
+        assert output.startswith("Thread: t1\n\nTurn: u1\n")
         assert "[agent]\ndone\n" in output
         assert "Turn completed\n" in output
 
@@ -199,6 +204,43 @@ class TestStdioExecution:
 
         assert process.returncode == 130, (stdout, stderr)
         assert "interrupt" not in marker.read_text(encoding="utf-8")
+
+
+class TestPersistFollowExecution:
+    def test_persist_flag_builds_follow_command(self):
+        args = build_parser().parse_args(["follow", "t1", "--persist"])
+
+        command = _build_command(args, None)
+
+        assert command == Follow(
+            thread_id="t1", replay=ReplayActiveTurn(), persist=True
+        )
+
+    def test_default_follow_is_not_persistent(self):
+        args = build_parser().parse_args(["follow", "t1"])
+
+        command = _build_command(args, None)
+
+        assert command == Follow(thread_id="t1", replay=ReplayActiveTurn())
+
+    async def test_connection_loss_maps_to_protocol_error_exit_path(self):
+        # Persist exits 5 on connection loss: _execute re-raises the
+        # APP_SERVER_PROTOCOL_ERROR carried by the outcome result.
+        server = FakeAppServer()
+        server.result(
+            "thread/resume",
+            {"thread": {"id": "t1", "status": {"type": "idle"}, "turns": []}},
+        )
+        server.end_stream()
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await _execute(
+                make_ctl(server), Follow(thread_id="t1", persist=True), "text"
+            )
+
+        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+        assert exit_code_for(excinfo.value) == EXIT_RUNTIME
+        assert "turn/interrupt" not in server.methods_requested
 
 
 class TestOutputMatrixContract:

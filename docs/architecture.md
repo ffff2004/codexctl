@@ -70,19 +70,24 @@ Selector parsing is pure and follows Python semantics exactly
   semantics.
 - **Streaming is pull-based with a terminal future.** `EventStreamOutcome`
   pairs an async iterator of `ProjectedEvent` with a future resolving to
-  `TurnTerminal`. The iterator owns dedup, token-usage capture, and the
+  `TurnTerminal | None`. The iterator owns dedup, token-usage capture, and
   terminal detection; its `finally` block unsubscribes, closes, and
-  resolves the future — including the deterministic
-  `APP_SERVER_PROTOCOL_ERROR` path when the stream dies first. Losing the
-  stream never triggers a turn interrupt.
-- **follow frontier.** `follow` resumes for subscription, replays a
-  continuous suffix of the reconstructed snapshot, then continues live.
-  Both phases record dedup keys in one shared set keyed by
-  `(event type, turn id, item id)`, so events visible in replay and live are
-  emitted exactly once. Replay only registers keys of events it actually
-  emits, so a suppressed replay event is still delivered live. The public
-  replay and termination semantics are defined in
-  [reference.md — follow](reference.md#follow).
+  resolves the future — including a deterministic connection-loss error
+  path. Losing the stream never triggers a turn interrupt. When a stream
+  or session ends and what the future resolves to are defined in
+  [reference.md — follow](reference.md#follow) and
+  [reference.md — Exit codes](reference.md#exit-codes).
+- **follow frontier.** `follow` resumes for subscription, then one prelude
+  yields the replayed continuous suffix of the reconstructed snapshot and,
+  when a turn is active at attach time, its synthesized `turn/started`
+  (the real start notification predates subscription), after which the
+  live phase runs. Both phases record dedup keys in one shared set keyed
+  by `(event type, turn id, item id)`, so events visible in replay and
+  live are emitted exactly once. Replay only registers keys of events it
+  actually emits, so a suppressed replay event is still delivered live.
+  The public replay, persist, termination, and turn-marker semantics are
+  defined in [reference.md — follow](reference.md#follow) and
+  [reference.md — Streaming text output](reference.md#streaming-text-output).
 - **interrupt waits, never retries.** After `turn/interrupt` succeeds,
   [core.py](../src/codexctl/core.py) polls the thread until the targeted turn is terminal (bounded
   wait, `INTERRUPT_WAIT_SECONDS` / `INTERRUPT_POLL_INTERVAL`). Rejected

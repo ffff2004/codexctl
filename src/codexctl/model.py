@@ -142,6 +142,7 @@ class History:
 class Follow:
     thread_id: str
     replay: ReplaySelector = field(default_factory=lambda: ReplayActiveTurn())
+    persist: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,12 +193,20 @@ TurnSelector = Union[SingleIndex, SliceSelector]
 
 @dataclass(frozen=True)
 class ReplayActiveTurn:
-    """``-1``: replay only the active turn's known history."""
+    """``-1``: replay only the anchor turn's known history.
+
+    The anchor is the active turn when one exists, otherwise the last
+    turn in history.
+    """
 
 
 @dataclass(frozen=True)
 class ReplayTail:
-    """``-N:``: replay the latest N turns including the active turn."""
+    """``-N:``: replay the latest N turns including the anchor turn.
+
+    The anchor is the active turn when one exists, otherwise the end of
+    history.
+    """
 
     count: int
 
@@ -362,6 +371,23 @@ class ContextUsage:
     source: str
 
 
+def usage_to_context(usage: dict[str, Any] | None) -> ContextUsage | None:
+    """Project a streamed ``thread/tokenUsage/updated`` usage into context.
+
+    ``usage`` is the stable projected usage shape carried by token-usage
+    events (``usedTokens`` / ``windowTokens`` / ``ratio``); it is ``None``
+    or empty when the runtime provided no usable usage.
+    """
+    if not usage:
+        return None
+    return ContextUsage(
+        used_tokens=usage.get("usedTokens", 0),
+        window_tokens=usage.get("windowTokens", 0),
+        ratio=usage.get("ratio", 0.0),
+        source="live",
+    )
+
+
 @dataclass(frozen=True)
 class TurnTerminal:
     """Terminal observation of the followed turn."""
@@ -378,12 +404,16 @@ class EventStreamOutcome:
     """Streaming outcome: projected events plus the terminal turn state.
 
     ``result`` resolves once the followed turn reaches a terminal state.
+    With ``Follow(persist=True)`` the session spans turns, so ``turn_id``
+    is ``None`` when no turn is active at attach time and ``result``
+    resolves only at session end, to the last observed terminal turn or
+    ``None`` when no turn completed during the session.
     """
 
     thread_id: str
-    turn_id: str
+    turn_id: str | None
     events: AsyncIterator[ProjectedEvent]
-    result: asyncio.Future[TurnTerminal]
+    result: asyncio.Future[TurnTerminal | None]
 
 
 @dataclass(frozen=True)

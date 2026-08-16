@@ -8,6 +8,7 @@ stable error mapping, and the unattended interaction policy.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from codexctl.model import (
     HistoryTurn,
     Interrupt,
     ListThreads,
+    ReplayActiveTurn,
     ReplayAll,
     ReplayTail,
     Resume,
@@ -585,6 +587,7 @@ class TestFollow:
 
         assert [(e.type, e.source, (e.item or {}).get("id")) for e in events] == [
             ("item/completed", "replay", "i1"),  # replayed active-turn history
+            ("turn/started", "live", None),  # synthesized replay/live boundary
             ("item/completed", "live", "i2"),  # i1 live duplicate dropped
             ("thread/tokenUsage/updated", "live", None),
             ("turn/completed", "live", None),
@@ -609,10 +612,49 @@ class TestFollow:
 
         assert [(e.type, e.source, (e.item or {}).get("id")) for e in events] == [
             ("item/completed", "replay", "i1"),  # snapshot fact, replayed
+            ("turn/started", "live", None),  # synthesized replay/live boundary
             ("item/started", "live", "i1"),  # not lost to replay suppression
             ("turn/completed", "live", None),
         ]
         assert terminal.status == "completed"
+
+    async def test_busy_follow_turn_marker_lands_between_replay_and_live(self):
+        # The attached turn started before subscription, so its turn/started
+        # is synthesized at the replay/live boundary: after the replay block,
+        # before any live event.
+        server = _follow_server(
+            [turn_doc("u1", status="inProgress", items=[agent_message("i1")])]
+        )
+        server.emit(
+            "item/completed",
+            {"threadId": "t1", "turnId": "u1", "item": agent_message("i2")},
+        )
+        emit_completed(server, "t1", "u1")
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1"))
+        events, terminal = await collect(outcome)
+
+        assert [(e.type, e.source, e.turn_id) for e in events] == [
+            ("item/completed", "replay", "u1"),
+            ("turn/started", "live", "u1"),  # boundary marker, emitted once
+            ("item/completed", "live", "u1"),
+            ("turn/completed", "live", "u1"),
+        ]
+        assert terminal.status == "completed"
+
+    async def test_busy_follow_marker_is_not_duplicated_by_live_redelivery(self):
+        # Even if the live stream redelivers the attached turn's
+        # turn/started, the synthesized boundary marker occupies its dedup
+        # key: the marker is emitted exactly once.
+        server = _follow_server([turn_doc("u1", status="inProgress", items=[])])
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u1"}})
+        emit_completed(server, "t1", "u1")
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1"))
+        events, _ = await collect(outcome)
+
+        markers = [e for e in events if e.type == "turn/started"]
+        assert [(e.turn_id, e.source) for e in markers] == [("u1", "live")]
 
     async def test_replay_all_includes_finished_turns_with_turn_completed(self):
         server = _follow_server(
@@ -628,6 +670,7 @@ class TestFollow:
             ("item/started", "u0", "replay", 0),
             ("item/completed", "u0", "replay", 0),
             ("turn/completed", "u0", "replay", 0),
+            ("turn/started", "u1", "live", None),
             ("turn/completed", "u1", "live", None),
         ]
 
@@ -674,6 +717,213 @@ class TestFollow:
         with pytest.raises(CodexCtlError):
             await outcome.result
         assert "turn/interrupt" not in server.methods_requested
+
+
+class TestFollowPersist:
+    async def test_idle_attach_waits_silently_then_streams_next_turn(self):
+        server = _follow_server(
+            [turn_doc("u0", status="completed", items=[agent_message("i0")])]
+        )
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u1"}})
+        server.emit(
+            "item/completed",
+            {"threadId": "t1", "turnId": "u1", "item": agent_message("i1")},
+        )
+        emit_completed(server, "t1", "u1")
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        assert outcome.turn_id is None
+        events = [e async for e in outcome.events]
+
+        # No NO_ACTIVE_TURN, no synthetic idle events: the default replay
+        # anchors on the last completed turn, then live events follow.
+        assert [(e.type, e.source, e.turn_id) for e in events] == [
+            ("item/started", "replay", "u0"),
+            ("item/completed", "replay", "u0"),
+            ("turn/completed", "replay", "u0"),
+            ("turn/started", "live", "u1"),
+            ("item/completed", "live", "u1"),
+            ("turn/completed", "live", "u1"),
+            ("error", "live", None),
+        ]
+        assert "t1" in server.unsubscribed
+        assert server.closed
+
+    async def test_busy_attach_streams_active_turn_then_keeps_streaming(self):
+        server = _follow_server([turn_doc("u1", status="inProgress", items=[])])
+        emit_completed(server, "t1", "u1")
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u2"}})
+        server.emit(
+            "item/completed",
+            {"threadId": "t1", "turnId": "u2", "item": agent_message("i2")},
+        )
+        emit_completed(server, "t1", "u2")
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        assert outcome.turn_id == "u1"
+        events = [e async for e in outcome.events]
+
+        turn_events = [
+            (e.type, e.turn_id)
+            for e in events
+            if e.type in ("turn/started", "turn/completed")
+        ]
+        assert turn_events == [
+            ("turn/started", "u1"),  # synthesized replay/live boundary
+            ("turn/completed", "u1"),
+            ("turn/started", "u2"),
+            ("turn/completed", "u2"),
+        ]
+
+    async def test_busy_attach_turn_marker_lands_between_replay_and_live(self):
+        # Persist busy attach: the synthesized boundary marker lands after
+        # the replay block and before any live event, and the session keeps
+        # streaming past the attached turn's end until connection loss.
+        server = _follow_server(
+            [turn_doc("u1", status="inProgress", items=[agent_message("i1")])]
+        )
+        server.emit(
+            "item/completed",
+            {"threadId": "t1", "turnId": "u1", "item": agent_message("i2")},
+        )
+        emit_completed(server, "t1", "u1")
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        events = [e async for e in outcome.events]
+
+        assert [(e.type, e.source, e.turn_id) for e in events] == [
+            ("item/completed", "replay", "u1"),
+            ("turn/started", "live", "u1"),  # boundary marker, emitted once
+            ("item/completed", "live", "u1"),
+            ("turn/completed", "live", "u1"),
+            ("error", "live", "u1"),  # connection loss ends the session
+        ]
+
+    async def test_failed_turn_does_not_end_the_session(self):
+        server = _follow_server([turn_doc("u1", status="inProgress", items=[])])
+        emit_completed(server, "t1", "u1", status="failed", error="model exploded")
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u2"}})
+        emit_completed(server, "t1", "u2", status="interrupted")
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        events = [e async for e in outcome.events]
+
+        completed = [e for e in events if e.type == "turn/completed"]
+        assert [(e.turn_id, e.extra.get("status")) for e in completed] == [
+            ("u1", "failed"),
+            ("u2", "interrupted"),
+        ]
+        # Only connection loss ends the session: the stream's final event
+        # is the deterministic protocol error, not a turn terminal.
+        assert events[-1].type == "error"
+        assert (
+            events[-1].extra["error"]["code"]
+            == ErrorCode.APP_SERVER_PROTOCOL_ERROR.value
+        )
+        with pytest.raises(CodexCtlError) as excinfo:
+            await outcome.result
+        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+
+    async def test_idle_connection_loss_never_interrupts(self):
+        server = _follow_server([])
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        events = [e async for e in outcome.events]
+
+        assert events[-1].type == "error"
+        assert (
+            events[-1].extra["error"]["code"]
+            == ErrorCode.APP_SERVER_PROTOCOL_ERROR.value
+        )
+        with pytest.raises(CodexCtlError) as excinfo:
+            await outcome.result
+        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+        assert "turn/interrupt" not in server.methods_requested
+        assert "t1" in server.unsubscribed
+        assert server.closed
+
+    async def test_cancellation_resolves_result_to_last_terminal(self):
+        server = _follow_server([])
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u1"}})
+        emit_completed(server, "t1", "u1", status="interrupted")
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        collected: list = []
+        saw_completed = asyncio.Event()
+
+        async def drain() -> None:
+            async for event in outcome.events:
+                collected.append(event)
+                if event.type == "turn/completed":
+                    saw_completed.set()
+
+        task = asyncio.create_task(drain())
+        await saw_completed.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        terminal = await outcome.result
+        assert terminal is not None
+        assert terminal.turn_id == "u1"
+        assert terminal.status == "interrupted"
+        # Cancellation ends the session cleanly: no connection-loss error
+        # event, and never a turn interrupt.
+        assert all(e.type != "error" for e in collected)
+        assert "turn/interrupt" not in server.methods_requested
+
+    async def test_cancellation_without_any_completed_turn_resolves_none(self):
+        server = _follow_server([])
+        server.emit("turn/started", {"threadId": "t1", "turn": {"id": "u1"}})
+
+        outcome = await make_ctl(server).run(Follow(thread_id="t1", persist=True))
+        saw_started = asyncio.Event()
+
+        async def drain() -> None:
+            async for event in outcome.events:
+                if event.type == "turn/started":
+                    saw_started.set()
+
+        task = asyncio.create_task(drain())
+        await saw_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert await outcome.result is None
+
+    @pytest.mark.parametrize(
+        ("selector", "expected_replayed"),
+        [
+            (ReplayActiveTurn(), {"u2"}),
+            (ReplayTail(2), {"u1", "u2"}),
+            (ReplayAll(), {"u0", "u1", "u2"}),
+        ],
+    )
+    async def test_replay_anchors_on_end_of_history_when_idle(
+        self, selector, expected_replayed
+    ):
+        server = _follow_server(
+            [
+                turn_doc("u0", status="completed", items=[]),
+                turn_doc("u1", status="failed", items=[]),
+                turn_doc("u2", status="completed", items=[]),
+            ]
+        )
+        server.end_stream()
+
+        outcome = await make_ctl(server).run(
+            Follow(thread_id="t1", replay=selector, persist=True)
+        )
+        events = [e async for e in outcome.events]
+
+        replayed = {e.turn_id for e in events if e.source == "replay"}
+        assert replayed == expected_replayed
 
 
 # ---------------------------------------------------------------------------

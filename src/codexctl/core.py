@@ -25,7 +25,6 @@ from .endpoint import AppServerEndpoint, EndpointPort
 from .model import (
     CodexCtlError,
     Command,
-    ContextUsage,
     DetachedTurnStarted,
     Doctor,
     DoctorCheck,
@@ -51,6 +50,7 @@ from .model import (
     TurnTerminal,
     apply_turn_selector,
     select_replay_turns,
+    usage_to_context,
 )
 
 INTERRUPT_WAIT_SECONDS = 120.0
@@ -216,25 +216,35 @@ class CodexCtl:
         self,
         adapter: AppServerPort,
         thread_id: str,
-        turn_id: str,
+        turn_id: str | None,
         prelude: Callable[[set[tuple]], AsyncIterator[ProjectedEvent]] | None = None,
+        persist: bool = False,
     ) -> EventStreamOutcome:
-        """Stream one turn: optional prelude, then live notifications.
+        """Stream one turn, or a whole thread session when ``persist``.
 
         Shared live phase for start/resume and follow. The optional
         ``prelude`` yields its events first and registers their dedup keys in
-        the shared ``seen`` set. Ends on the target turn's ``turn/completed``;
-        a stream lost before that yields a deterministic error event and never
-        interrupts. Always unsubscribes and closes, resolving ``result`` once.
+        the shared ``seen`` set.
+
+        Non-persist ends on the target turn's ``turn/completed``. Persist
+        spans turns: each ``turn/completed`` merely closes one turn's segment
+        (recorded as the latest terminal observation), and the session ends
+        only on connection loss or local cancellation. A stream lost before
+        session end yields a deterministic error event and never interrupts.
+        Always unsubscribes and closes, resolving ``result`` once: to the
+        terminal turn (non-persist) or the last observed terminal turn /
+        ``None`` on cancellation (persist).
         """
         loop = asyncio.get_running_loop()
-        result: asyncio.Future[TurnTerminal] = loop.create_future()
+        result: asyncio.Future[TurnTerminal | None] = loop.create_future()
 
         async def events() -> AsyncIterator[ProjectedEvent]:
             seen: set[tuple] = set()
             usage: dict | None = None
             terminal_status: str | None = None
             terminal_error: str | None = None
+            last_terminal: TurnTerminal | None = None
+            cancelled = False
             try:
                 if prelude is not None:
                     async for ev in prelude(seen):
@@ -251,12 +261,26 @@ class CodexCtl:
                             continue
                         seen.add(ev.dedup_key())
                     yield ev
-                    if ev.type == "turn/completed" and ev.turn_id == turn_id:
-                        terminal_status = str(ev.extra.get("status") or "")
-                        terminal_error = (ev.extra.get("error") or {}).get("message")
-                        break
-                if terminal_status is None:
-                    # Stream ended before turn completion: deterministic error path.
+                    if ev.type == "turn/completed":
+                        status = str(ev.extra.get("status") or "")
+                        error = (ev.extra.get("error") or {}).get("message")
+                        if persist:
+                            # One turn's segment closes; the session continues
+                            # regardless of the turn's outcome.
+                            last_terminal = TurnTerminal(
+                                thread_id=thread_id,
+                                turn_id=ev.turn_id or "",
+                                status=status,
+                                error=error,
+                                context=usage_to_context(usage),
+                            )
+                            continue
+                        if ev.turn_id == turn_id:
+                            terminal_status = status
+                            terminal_error = error
+                            break
+                # The notification stream ended before session end.
+                if persist or terminal_status is None:
                     yield ProjectedEvent(
                         "error",
                         thread_id=thread_id,
@@ -265,34 +289,56 @@ class CodexCtl:
                         extra={
                             "error": {
                                 "code": ErrorCode.APP_SERVER_PROTOCOL_ERROR.value,
-                                "message": "connection closed before turn completion",
+                                "message": (
+                                    "connection lost while following the thread"
+                                    if persist
+                                    else "connection closed before turn completion"
+                                ),
                             }
                         },
                     )
+            except asyncio.CancelledError:
+                # Local cancellation ends a persist session cleanly; it never
+                # emits a connection-loss error event and never interrupts.
+                cancelled = True
+                raise
             finally:
                 await adapter.unsubscribe(thread_id)
                 await adapter.close()
-                context = _usage_to_context(usage)
-                if terminal_status is None:
-                    if not result.done():
-                        result.set_exception(
-                            CodexCtlError(
-                                ErrorCode.APP_SERVER_PROTOCOL_ERROR,
-                                "connection closed before turn completion",
-                                thread_id=thread_id,
-                                turn_id=turn_id,
+                if not result.done():
+                    if persist:
+                        if cancelled:
+                            result.set_result(last_terminal)
+                        else:
+                            result.set_exception(
+                                CodexCtlError(
+                                    ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+                                    "connection lost while following the thread",
+                                    thread_id=thread_id,
+                                    turn_id=turn_id,
+                                )
                             )
-                        )
-                elif not result.done():
-                    result.set_result(
-                        TurnTerminal(
-                            thread_id=thread_id,
-                            turn_id=turn_id,
-                            status=terminal_status,
-                            error=terminal_error,
-                            context=context,
-                        )
-                    )
+                    else:
+                        context = usage_to_context(usage)
+                        if terminal_status is None:
+                            result.set_exception(
+                                CodexCtlError(
+                                    ErrorCode.APP_SERVER_PROTOCOL_ERROR,
+                                    "connection closed before turn completion",
+                                    thread_id=thread_id,
+                                    turn_id=turn_id,
+                                )
+                            )
+                        else:
+                            result.set_result(
+                                TurnTerminal(
+                                    thread_id=thread_id,
+                                    turn_id=turn_id or "",
+                                    status=terminal_status,
+                                    error=terminal_error,
+                                    context=context,
+                                )
+                            )
 
         return EventStreamOutcome(
             thread_id=thread_id, turn_id=turn_id, events=events(), result=result
@@ -364,7 +410,7 @@ class CodexCtl:
             await adapter.close()
             raise
         active = self._find_active_turn(thread)
-        if active is None:
+        if active is None and not command.persist:
             await adapter.unsubscribe(command.thread_id)
             await adapter.close()
             raise CodexCtlError(
@@ -372,8 +418,10 @@ class CodexCtl:
                 "thread has no active turn to follow",
                 thread_id=command.thread_id,
             )
-        active_turn_id = active.id
+        active_turn_id = active.id if active is not None else None
         turns = thread.turns
+        # The replay anchor is the active turn when one exists, otherwise the
+        # end of history (reachable only with persist).
         replay_pairs = select_replay_turns(turns, command.replay)
 
         async def replay(seen: set[tuple]) -> AsyncIterator[ProjectedEvent]:
@@ -413,8 +461,26 @@ class CodexCtl:
                     if completed.dedup_key() not in seen:
                         seen.add(completed.dedup_key())
                         yield completed
+            if active_turn_id is not None:
+                # The attached turn started before subscription, so its
+                # turn/started notification predates the live stream and is
+                # never delivered. Synthesize it at the replay/live boundary
+                # so the attached turn's marker is emitted exactly once;
+                # occupying ``seen`` deduplicates any repeated live delivery
+                # of the same start event.
+                started = ProjectedEvent(
+                    "turn/started",
+                    thread_id=command.thread_id,
+                    turn_id=active_turn_id,
+                    source="live",
+                )
+                if started.dedup_key() not in seen:
+                    seen.add(started.dedup_key())
+                    yield started
 
-        return self._stream_turn(adapter, command.thread_id, active_turn_id, replay)
+        return self._stream_turn(
+            adapter, command.thread_id, active_turn_id, replay, persist=command.persist
+        )
 
     # -- steer ------------------------------------------------------------------
 
@@ -603,17 +669,6 @@ class CodexCtl:
 
 async def _default_connect(endpoint: AppServerEndpoint) -> AppServerPort:
     return await connect_endpoint(endpoint)
-
-
-def _usage_to_context(usage: dict | None) -> ContextUsage | None:
-    if not usage:
-        return None
-    return ContextUsage(
-        used_tokens=usage.get("usedTokens", 0),
-        window_tokens=usage.get("windowTokens", 0),
-        ratio=usage.get("ratio", 0.0),
-        source="live",
-    )
 
 
 # Lowercase message markers that identify a missing thread. Shared by the

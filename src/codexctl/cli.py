@@ -199,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.add_argument("thread_id")
     p.add_argument("--replay-turns", default="-1")
+    p.add_argument(
+        "--persist",
+        action="store_true",
+        help="attach to the thread itself and keep streaming across turns",
+    )
 
     p = sub.add_parser("steer", help="add steering input to the active turn")
     _add_common(p)
@@ -299,7 +304,7 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
             replay = parse_replay_selector(args.replay_turns)
         except ValueError as exc:
             raise _CliUsageError(f"invalid --replay-turns selector: {exc}") from exc
-        return Follow(thread_id=args.thread_id, replay=replay)
+        return Follow(thread_id=args.thread_id, replay=replay, persist=args.persist)
     if args.command == "steer":
         if not prompt:
             raise _CliUsageError("steer requires input after --")
@@ -323,7 +328,9 @@ async def _execute(ctl: CodexCtl, command: Any, mode: str) -> int:
             renderer.event(event)
         terminal = await outcome.result  # may raise CodexCtlError
         renderer.stream_footer(terminal)
-        if terminal.status == "completed":
+        # A persist follow session can resolve with no terminal turn; exit
+        # codes 0 and 4 are otherwise unreachable in persist mode.
+        if terminal is None or terminal.status == "completed":
             return EXIT_OK
         raise CodexCtlError(
             ErrorCode.TURN_FAILED

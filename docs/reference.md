@@ -32,7 +32,7 @@ Lifecycle invariants visible to callers:
 | `resume <thread-id>` | Start a new turn on an existing thread | yes (unless `--detach`) |
 | `status <thread-id>` | Read the current state of a thread | no |
 | `history <thread-id>` | Read a finite snapshot of thread history | no |
-| `follow <thread-id>` | Attach to the thread's current active turn | yes |
+| `follow <thread-id>` | Attach to the thread's current active turn (`--persist`: attach to the thread itself) | yes |
 | `steer <thread-id>` | Add steering input to the active turn | no |
 | `interrupt <thread-id>` | Interrupt the active turn and wait for it to end | no |
 | `list` | List stored threads | no |
@@ -80,9 +80,11 @@ after the bare `--` is prompt text (flags included).
 - `--detach` returns as soon as the turn has started and disconnects; the
   turn keeps running in the shared runtime.
 
-Foreground output begins with a `Thread:` / `Turn:` header (text mode),
-streams projected events, and ends with the terminal turn state. The exit
-code reflects the turn's terminal status, see [Exit codes](#exit-codes).
+Foreground output streams projected events until the turn reaches a
+terminal state, following the shared
+[streaming text output](#streaming-text-output) contract in text mode.
+The exit code reflects the turn's terminal status, see
+[Exit codes](#exit-codes).
 
 In text streaming mode, a command execution is rendered as:
 
@@ -148,24 +150,45 @@ indexing and slicing semantics exactly:
 ### follow
 
 ```sh
-codexctl follow <thread-id> [--replay-turns SELECTOR]
+codexctl follow <thread-id> [--replay-turns SELECTOR] [--persist]
 ```
 
-Attaches to the thread's current active turn. Fails with `NO_ACTIVE_TURN`
-if there is none. Before streaming live events, `codexctl` replays a
-continuous suffix of the reconstructed history; events visible in both
-phases are emitted once.
+Attaches to the thread's current active turn. Without `--persist`, fails
+with `NO_ACTIVE_TURN` if there is none. Before streaming live events,
+`codexctl` replays a continuous suffix of the reconstructed history; events
+visible in both phases are emitted once.
 
-`--replay-turns` accepts exactly three forms:
+`--replay-turns` accepts exactly three forms. The anchor is the active turn
+when one exists, otherwise the end of history (reachable only with
+`--persist`):
 
 | Selector | Meaning |
 |---|---|
-| `-1` (default) | Replay only the active turn's known history |
-| `-N:` | Replay the latest N turns including the active turn |
+| `-1` (default) | Replay only the anchor turn's known history |
+| `-N:` | Replay the latest N turns including the anchor turn |
 | `:` | Replay the entire available history |
 
-`follow` exits when the followed turn reaches a terminal state, with the
-corresponding [exit code](#exit-codes).
+Without `--persist`, `follow` exits when the followed turn reaches a
+terminal state, with the corresponding [exit code](#exit-codes).
+
+With `--persist`, `follow` attaches to the **thread** rather than to a
+single turn:
+
+- With no active turn, it does not fail with `NO_ACTIVE_TURN`; it
+  subscribes silently and waits for the next turn to start. No synthetic
+  events (waiting/idle markers) are ever emitted.
+- It keeps streaming across turn boundaries, covering every turn of the
+  thread regardless of origin (another `codexctl` process, the Codex UI,
+  and so on).
+- A turn ending `failed` or `interrupted` does not end the session; each
+  `turn/completed` event carries that turn's `status`.
+- There are exactly two exits: local Ctrl+C (exit code 130, sending no turn
+  interrupt) and connection loss (an `APP_SERVER_PROTOCOL_ERROR` error
+  event in the stream, exit code 5). Exit codes 0 and 4 are unreachable in
+  persist mode.
+- There is no thread-existence polling or detection: if the thread
+  disappears while idle, the stream stays silent until the user exits or
+  the connection is lost.
 
 ### steer
 
@@ -273,6 +296,23 @@ Streaming commands in jsonl mode emit projected events, one per line:
 turn: `turn/started`, one `item/completed` per item, `turn/completed` —
 omitted for a turn still in progress, which yields no `turn/completed`
 record (same as `follow` replay).
+
+### Streaming text output
+
+Streaming commands in text mode share one rendering contract, in both
+`follow` modes:
+
+- The header prints only the `Thread:` line.
+- Every `turn/started` event emits a turn marker line: `Turn: <turn-id>`.
+  For `start`/`resume` the `turn/started` prelude is the first event, so
+  the marker opens the stream. For `follow`, the replay block precedes it,
+  so the marker lands after the replay block, marking the replay/live
+  boundary.
+- Projected items are rendered as they arrive.
+- The per-turn context usage line is event-stream-driven: after each
+  `turn/completed` event, the latest `thread/tokenUsage/updated` usage seen
+  in the stream is printed (`Context: 83k / 200k (38%)`); nothing is
+  printed when no usage data was seen.
 
 ### Snapshot documents (json)
 
@@ -412,7 +452,7 @@ Stable, codexctl-owned codes carried in all structured errors:
 |---|---|---|
 | `THREAD_NOT_FOUND` | The thread does not exist | 3 |
 | `THREAD_BUSY` | The thread already has an active turn | 3 |
-| `NO_ACTIVE_TURN` | No active turn for follow/steer/interrupt | 3 |
+| `NO_ACTIVE_TURN` | No active turn for follow (without `--persist`), steer, or interrupt | 3 |
 | `TURN_NOT_STEERABLE` | The active turn does not accept steering | 3 |
 | `TURN_FAILED` | The followed turn ended in failure | 4 |
 | `TURN_INTERRUPTED` | The followed turn ended interrupted | 4 |
@@ -428,9 +468,12 @@ Stable, codexctl-owned codes carried in all structured errors:
 
 | Code | Meaning |
 |---|---|
-| 0 | Success (streaming commands: the turn completed) |
+| 0 | Success (streaming commands: the turn completed; unreachable for `follow --persist`) |
 | 2 | Usage error (argument/output-mode/selector problems) |
 | 3 | Domain conflict (see error-code table) |
-| 4 | The followed turn failed or was interrupted |
+| 4 | The followed turn failed or was interrupted (unreachable for `follow --persist`) |
 | 5 | Runtime/protocol error |
 | 130 | Local interruption (Ctrl+C). Never sends a turn interrupt. |
+
+`follow --persist` exits only 130 (local interruption) or 5 (connection
+loss).

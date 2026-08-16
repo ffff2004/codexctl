@@ -23,6 +23,7 @@ from .model import (
     SteerAcknowledged,
     ThreadListSnapshot,
     TurnTerminal,
+    usage_to_context,
 )
 
 # ---------------------------------------------------------------------------
@@ -166,16 +167,21 @@ class TextRenderer:
         self._out = out if out is not None else sys.stdout
         self._err = err if err is not None else sys.stderr
         self._started_items: set[str] = set()
+        self._latest_usage: dict[str, Any] | None = None
 
     def _write(self, text: str) -> None:
         self._out.write(text)
         self._out.flush()
 
-    def stream_header(self, thread_id: str, turn_id: str) -> None:
-        self._write(f"Thread: {thread_id}\nTurn:   {turn_id}\n\n")
+    def stream_header(self, thread_id: str, turn_id: str | None = None) -> None:
+        # Unified across all streaming commands: the turn marker comes from
+        # the stream's turn/started events, not from the header.
+        self._write(f"Thread: {thread_id}\n\n")
 
     def event(self, event: ProjectedEvent) -> None:
-        if event.type == "item/completed" and event.item is not None:
+        if event.type == "turn/started":
+            self._write(f"Turn: {event.turn_id}\n")
+        elif event.type == "item/completed" and event.item is not None:
             self._render_item(event.item)
         elif event.type == "item/started" and event.item is not None:
             item = event.item
@@ -186,12 +192,19 @@ class TextRenderer:
                     self._started_items.add(item_id)
                     self._write(f"$ {command}\n")
                     self._write("started\n")
+        elif event.type == "thread/tokenUsage/updated":
+            self._latest_usage = event.extra.get("usage")
         elif event.type == "turn/completed":
             status = event.extra.get("status")
             label = {"completed": "Turn completed"}.get(
                 str(status), f"Turn ended: {status}"
             )
             self._write(f"\n{label}\n")
+            # Per-turn context usage is event-stream-driven: print the latest
+            # usage seen in the stream; nothing when no usage data was seen.
+            line = format_context_line(usage_to_context(self._latest_usage))
+            if line:
+                self._write(f"{line}\n")
         elif event.type == "error":
             error = event.extra.get("error") or {}
             self._err.write(f"codexctl: {error.get('code')}: {error.get('message')}\n")
@@ -224,15 +237,15 @@ class TextRenderer:
         elif description.kind == "contextCompaction":
             self._write("[context compacted]\n")
 
-    def stream_footer(self, terminal: TurnTerminal) -> None:
-        line = format_context_line(terminal.context)
-        if line:
-            self._write(f"{line}\n")
+    def stream_footer(self, terminal: TurnTerminal | None) -> None:
+        # The per-turn context usage line is event-stream-driven (printed
+        # after each turn/completed), so no footer remains at stream end.
+        pass
 
     def snapshot(self, outcome: Any) -> None:
         if isinstance(outcome, DetachedTurnStarted):
             self._write(
-                f"Thread: {outcome.thread_id}\nTurn:   {outcome.turn_id}\nDetached\n"
+                f"Thread: {outcome.thread_id}\nTurn: {outcome.turn_id}\nDetached\n"
             )
         elif isinstance(outcome, SteerAcknowledged):
             self._write(
@@ -328,14 +341,14 @@ class JsonlRenderer:
         self._out = out if out is not None else sys.stdout
         self._err = err if err is not None else sys.stderr
 
-    def stream_header(self, thread_id: str, turn_id: str) -> None:
+    def stream_header(self, thread_id: str, turn_id: str | None = None) -> None:
         pass
 
     def event(self, event: ProjectedEvent) -> None:
         self._out.write(json.dumps(event_document(event)) + "\n")
         self._out.flush()
 
-    def stream_footer(self, terminal: TurnTerminal) -> None:
+    def stream_footer(self, terminal: TurnTerminal | None) -> None:
         pass
 
     def snapshot_records(self, events: list[ProjectedEvent]) -> None:
