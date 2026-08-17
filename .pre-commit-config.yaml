@@ -39,3 +39,11 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+
+      - id: uv-build
+        name: uv build
+        entry: uv build
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
