@@ -171,6 +171,15 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_stdin_prompt(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "_stdin_prompt",
+        nargs="?",
+        choices=("-",),
+        help=argparse.SUPPRESS,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _CodexArgumentParser(prog="codexctl")
     parser.add_argument(
@@ -191,11 +200,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="let the runtime auto-review approval requests instead of declining them",
     )
+    _add_stdin_prompt(p)
 
     p = sub.add_parser("resume", help="continue an existing thread with a new turn")
     _add_common(p)
     p.add_argument("thread_id")
     p.add_argument("--detach", action="store_true")
+    _add_stdin_prompt(p)
 
     p = sub.add_parser("status", help="read the current state of a thread")
     _add_common(p)
@@ -219,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("steer", help="add steering input to the active turn")
     _add_common(p)
     p.add_argument("thread_id")
+    _add_stdin_prompt(p)
 
     p = sub.add_parser("interrupt", help="interrupt the active turn")
     _add_common(p)
@@ -278,10 +290,20 @@ def _select_endpoint(args: argparse.Namespace) -> Any:
     return ManagedDaemonAdapter()
 
 
+def _require_prompt(prompt: str | None, message: str) -> str:
+    if not prompt:
+        raise _CliUsageError(message)
+    return prompt
+
+
 def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
+    if prompt is None and getattr(args, "_stdin_prompt", None) == "-":
+        prompt = sys.stdin.read()
+
     if args.command == "start":
-        if not prompt:
-            raise _CliUsageError("start requires a prompt after --")
+        prompt = _require_prompt(
+            prompt, "start requires prompt input after -- or from stdin"
+        )
         if args.approve_for_me:
             approval_policy = ApprovalPolicy.onRequest
             approvals_reviewer = ApprovalsReviewer.autoReview
@@ -305,8 +327,9 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
             detach=args.detach,
         )
     if args.command == "resume":
-        if not prompt:
-            raise _CliUsageError("resume requires a prompt after --")
+        prompt = _require_prompt(
+            prompt, "resume requires prompt input after -- or from stdin"
+        )
         return Resume(thread_id=args.thread_id, prompt=prompt, detach=args.detach)
     if args.command == "status":
         return Status(thread_id=args.thread_id)
@@ -325,8 +348,7 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
             raise _CliUsageError(f"invalid --replay-turns selector: {exc}") from exc
         return Follow(thread_id=args.thread_id, replay=replay, persist=args.persist)
     if args.command == "steer":
-        if not prompt:
-            raise _CliUsageError("steer requires input after --")
+        prompt = _require_prompt(prompt, "steer requires input after -- or from stdin")
         return Steer(thread_id=args.thread_id, input=prompt)
     if args.command == "interrupt":
         return Interrupt(thread_id=args.thread_id)

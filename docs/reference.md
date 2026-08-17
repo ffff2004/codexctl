@@ -70,11 +70,12 @@ Dash-prefixed values are accepted; use the attached spelling
 ```sh
 codexctl start [--detach] [--cwd DIR] [--model MODEL] [--effort EFFORT]
                [--sandbox {read-only,workspace-write,danger-full-access}]
-               [--approve-for-me] -- PROMPT...
+               [--approve-for-me] (-- PROMPT... | -)
 ```
 
 Creates a new thread and starts its first turn with the prompt. Everything
-after the bare `--` is prompt text (flags included).
+after the bare `--` is prompt text (flags included). A positional `-` reads
+the complete prompt from standard input.
 
 - By default the approval policy is `never` (unattended): approval requests
   are declined automatically and no reviewer is configured.
@@ -96,10 +97,11 @@ The exit code reflects the turn's terminal status, see
 ### resume
 
 ```sh
-codexctl resume <thread-id> [--detach] -- PROMPT...
+codexctl resume <thread-id> [--detach] (-- PROMPT... | -)
 ```
 
-Recovers the thread in the shared runtime and starts one new turn. Fails
+Recovers the thread in the shared runtime and starts one new turn. A
+positional `-` reads the complete prompt from standard input. Fails
 with `THREAD_BUSY` if the thread already has an active turn,
 `THREAD_NOT_FOUND` if the thread does not exist, and
 `THREAD_RECOVERY_FAILED` if recovery itself fails.
@@ -188,10 +190,14 @@ single turn:
 ### steer
 
 ```sh
-codexctl steer <thread-id> -- INPUT...
+codexctl steer <thread-id> (-- INPUT... | -)
 ```
 
-Adds steering input to the active turn. The request carries the turn id
+Adds steering input to the active turn. A positional `-` reads the complete
+input from standard input. For all three prompt-bearing commands, stdin input
+preserves internal, leading, and trailing newlines exactly; zero-length stdin
+is a `USAGE_ERROR` (exit code 2). The `-` form is not accepted by other
+commands. The request carries the turn id
 observed immediately before sending; if the turn changed or ended in the
 meantime, the command fails with `NO_ACTIVE_TURN`. If the active turn does
 not accept steering, it fails with `TURN_NOT_STEERABLE`. `steer`

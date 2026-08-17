@@ -6,6 +6,7 @@ All paths tested here return before any runtime connection is attempted.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import signal
@@ -42,8 +43,10 @@ from codexctl.model import (
     Follow,
     ListThreads,
     ReplayActiveTurn,
+    Resume,
     SandboxPolicy,
     Start,
+    Steer,
 )
 
 _SUCCESSFUL_STDIO_SERVER = """\
@@ -420,6 +423,54 @@ class TestUsageErrors:
         with pytest.raises(SystemExit):
             build_parser().parse_args(["list", "--socket", "/tmp/app.sock"])
 
+    @pytest.mark.parametrize(
+        ("argv", "command_type", "input_field"),
+        [
+            (["start", "-"], Start, "prompt"),
+            (["resume", "t1", "-"], Resume, "prompt"),
+            (["steer", "t1", "-"], Steer, "input"),
+        ],
+    )
+    def test_dash_reads_complete_stdin_prompt(
+        self, argv, command_type, input_field, monkeypatch
+    ):
+        stdin = "\n leading line\ninternal line\n\n"
+        monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+
+        args = build_parser().parse_args(argv)
+        command = _build_command(args, None)
+
+        assert isinstance(command, command_type)
+        assert getattr(command, input_field) == stdin
+
+    @pytest.mark.parametrize(
+        "argv", [["start", "-"], ["resume", "t1", "-"], ["steer", "t1", "-"]]
+    )
+    def test_empty_stdin_is_usage_error_before_endpoint_selection(
+        self, argv, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+        def endpoint_must_not_be_selected(_args):
+            pytest.fail("empty stdin attempted to connect to the app-server")
+
+        monkeypatch.setattr(
+            "codexctl.cli._select_endpoint", endpoint_must_not_be_selected
+        )
+
+        assert main(argv) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_dash_is_not_stdin_input_for_non_prompt_commands(self, capsys, monkeypatch):
+        class StdinMustNotBeRead:
+            def read(self):
+                pytest.fail("non-prompt command attempted to read stdin")
+
+        monkeypatch.setattr(sys, "stdin", StdinMustNotBeRead())
+
+        assert main(["status", "t1", "-"]) == EXIT_USAGE
+        assert "usage:" in capsys.readouterr().err
+
 
 class TestSandboxPolicy:
     @pytest.mark.parametrize(
@@ -479,6 +530,11 @@ class TestSplitPrompt:
         argv, prompt = _split_prompt(["start", "--", "run", "--verbose"])
         assert argv == ["start"]
         assert prompt == "run --verbose"
+
+    def test_dash_after_double_dash_remains_prompt_content(self):
+        argv, prompt = _split_prompt(["start", "--", "-"])
+        assert argv == ["start"]
+        assert prompt == "-"
 
     def test_stdio_dash_value_does_not_become_prompt_delimiter(self):
         argv, prompt = _split_prompt(
