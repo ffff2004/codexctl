@@ -49,7 +49,7 @@ Every command accepts:
 | `--jsonl` | Shorthand for `-o jsonl` |
 | `--endpoint <uri>` | Use an externally managed app-server endpoint; `codexctl` performs no daemon lifecycle actions in this mode |
 | `--endpoint-token-file <path>` | Read a Bearer token from this file immediately before connecting to a `ws://` endpoint |
-| `--stdio-exec <executable>` | Run one caller-selected app-server process with newline-delimited JSON on stdin/stdout |
+| `--stdio-exec <executable>` | Run one caller-selected app-server process; its stdin/stdout carry newline-delimited JSON |
 | `--stdio-arg <arg>` | Repeatable; append this exact argument, in order, to `--stdio-exec` |
 
 `--stdio-exec` and `--stdio-arg` select `stdio` mode. Stdio mode is mutually
@@ -57,8 +57,11 @@ exclusive with `--endpoint` and `--endpoint-token-file`; `--stdio-arg`
 requires `--stdio-exec`. The executable and arguments are passed directly as
 one argv vector: there is no shell parsing, pipeline, redirection, glob
 expansion, or environment interpolation. The child inherits codexctl's
-environment and working directory, receives protocol input on stdin, writes
-protocol output on stdout, and has stderr forwarded to codexctl's stderr.
+environment and working directory. Its stdin/stdout are private pipes owned
+by codexctl: the child receives protocol input on its stdin and writes
+protocol output on its stdout. These pipes do not consume or replace
+codexctl's own stdin/stdout; the child's stderr is forwarded to codexctl's
+stderr.
 Dash-prefixed values are accepted; use the attached spelling
 `--stdio-arg=--` when passing a literal `--` before the prompt delimiter.
 

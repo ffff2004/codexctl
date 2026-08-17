@@ -156,7 +156,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--stdio-exec",
         default=None,
         metavar="EXECUTABLE",
-        help="run a one-shot app-server over stdin/stdout",
+        help=(
+            "run a one-shot app-server using the child process's "
+            "stdin/stdout for newline-delimited JSON"
+        ),
     )
     parser.add_argument(
         "--stdio-arg",

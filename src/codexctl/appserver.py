@@ -367,8 +367,9 @@ class StdioFrameTransport:
                 *argv[1:],
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                # The child protocol is stdout-only. Inherit stderr so child
-                # diagnostics remain visible on codexctl's stderr.
+                # The child protocol uses its stdin/stdout pipes. Inherit
+                # stderr so child diagnostics remain visible on codexctl's
+                # stderr.
                 stderr=None,
                 start_new_session=True,
             )
