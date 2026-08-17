@@ -38,7 +38,14 @@ from codexctl.appserver import (
     project_thread_status,
 )
 from codexctl.endpoint import AppServerEndpoint, StdioTarget, TcpTarget, UnixTarget
-from codexctl.model import CodexCtlError, ErrorCode, SandboxPolicy, StartConfig
+from codexctl.model import (
+    ApprovalPolicy,
+    ApprovalsReviewer,
+    CodexCtlError,
+    ErrorCode,
+    SandboxPolicy,
+    StartConfig,
+)
 
 
 class TestProjectThreadStatus:
@@ -151,6 +158,60 @@ class TestTypedOperations:
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
         assert "unsupported sandbox policy 'not-a-policy'" in excinfo.value.message
         assert calls == []
+
+    async def test_start_thread_serializes_approval_policy_and_reviewer(
+        self, monkeypatch
+    ):
+        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, {"thread": {"id": "t1"}})
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        # Default unattended start: never, reviewer omitted.
+        await adapter.start_thread(StartConfig())
+        assert calls[-1] == (
+            "thread/start",
+            {"approvalPolicy": "never", "sandbox": "workspace-write"},
+        )
+        assert "approvalsReviewer" not in calls[-1][1]
+
+        # Auto review: on-request + auto_review reviewer.
+        await adapter.start_thread(
+            StartConfig(
+                approval_policy=ApprovalPolicy.onRequest,
+                approvals_reviewer=ApprovalsReviewer.autoReview,
+            )
+        )
+        assert calls[-1] == (
+            "thread/start",
+            {
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "sandbox": "workspace-write",
+            },
+        )
+
+    async def test_start_thread_serializes_each_approval_policy(self, monkeypatch):
+        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return project_response(method, {"thread": {"id": "t1"}})
+
+        monkeypatch.setattr(adapter, "_request", request)
+
+        for policy, wire_value in (
+            (ApprovalPolicy.untrusted, "untrusted"),
+            (ApprovalPolicy.onRequest, "on-request"),
+            (ApprovalPolicy.never, "never"),
+        ):
+            await adapter.start_thread(StartConfig(approval_policy=policy))
+            assert calls[-1][1]["approvalPolicy"] == wire_value
 
     async def test_operations_keep_wire_requests_inside_the_adapter(self, monkeypatch):
         adapter = JsonRpcAppServerSession(None, "/fake.sock")

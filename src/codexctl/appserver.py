@@ -29,6 +29,8 @@ from typing import (
 
 from .model import (
     DEFAULT_SANDBOX_POLICY,
+    ApprovalPolicy,
+    ApprovalsReviewer,
     CodexCtlError,
     ErrorCode,
     ProjectedEvent,
@@ -43,7 +45,6 @@ if TYPE_CHECKING:
 
 CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
-DEFAULT_APPROVAL_POLICY = "never"
 THREAD_LIST_PAGE_SIZE = 100
 _STDIO_STREAM_LIMIT = 64 * 1024
 
@@ -57,6 +58,17 @@ _SANDBOX_POLICY_TO_WIRE: dict[SandboxPolicy, str] = {
     SandboxPolicy.readOnly: "read-only",
     SandboxPolicy.workspaceWrite: "workspace-write",
     SandboxPolicy.dangerFullAccess: "danger-full-access",
+}
+
+_APPROVAL_POLICY_TO_WIRE: dict[ApprovalPolicy, str] = {
+    ApprovalPolicy.untrusted: "untrusted",
+    ApprovalPolicy.onRequest: "on-request",
+    ApprovalPolicy.never: "never",
+}
+
+_APPROVALS_REVIEWER_TO_WIRE: dict[ApprovalsReviewer, str] = {
+    ApprovalsReviewer.user: "user",
+    ApprovalsReviewer.autoReview: "auto_review",
 }
 
 
@@ -535,9 +547,13 @@ class JsonRpcAppServerSession:
 
     async def start_thread(self, config: StartConfig) -> AppServerThread | None:
         params: dict[str, Any] = {
-            "approvalPolicy": DEFAULT_APPROVAL_POLICY,
+            "approvalPolicy": _APPROVAL_POLICY_TO_WIRE[config.approval_policy],
             "sandbox": _serialize_sandbox_policy(config.sandbox),
         }
+        if config.approvals_reviewer is not None:
+            params["approvalsReviewer"] = _APPROVALS_REVIEWER_TO_WIRE[
+                config.approvals_reviewer
+            ]
         if config.cwd:
             params["cwd"] = config.cwd
         if config.model:

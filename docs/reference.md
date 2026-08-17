@@ -66,14 +66,18 @@ Dash-prefixed values are accepted; use the attached spelling
 
 ```sh
 codexctl start [--detach] [--cwd DIR] [--model MODEL] [--effort EFFORT]
-               [--sandbox {read-only,workspace-write,danger-full-access}] -- PROMPT...
+               [--sandbox {read-only,workspace-write,danger-full-access}]
+               [--approve-for-me] -- PROMPT...
 ```
 
 Creates a new thread and starts its first turn with the prompt. Everything
 after the bare `--` is prompt text (flags included).
 
-- The approval policy is fixed to unattended execution; it is not
-  caller-configurable.
+- By default the approval policy is `never` (unattended): approval requests
+  are declined automatically and no reviewer is configured.
+- `--approve-for-me` switches the thread to auto review: the approval policy
+  becomes `on-request` and the runtime's auto reviewer resolves approval
+  requests, so `codexctl` still never blocks on human input.
 - The sandbox defaults to `workspace-write` when `--sandbox` is omitted.
 - When `--cwd` is omitted, `codexctl` passes its current directory explicitly
   as the new thread's cwd.
@@ -426,7 +430,10 @@ Environment variables:
 
 `codexctl` never blocks on human input:
 
-- Command approval requests are declined automatically.
+- Command approval requests are declined automatically. With
+  `start --approve-for-me`, approval decisions are instead resolved by the
+  runtime's auto reviewer server-side; `codexctl` still brokers no
+  interactive approval itself.
 - Elicitations (user input requests) are declined automatically.
 - Any other server-initiated interaction is rejected and surfaced as an
   `UNSUPPORTED_INTERACTION` error event in the stream; the turn continues

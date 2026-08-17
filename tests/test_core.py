@@ -17,6 +17,8 @@ from conftest import FakeAppServer, FakeEndpoint, collect, make_ctl
 import codexctl.core as core
 from codexctl.appserver import UNSUPPORTED_INTERACTION_METHOD
 from codexctl.model import (
+    ApprovalPolicy,
+    ApprovalsReviewer,
     CodexCtlError,
     DetachedTurnStarted,
     Doctor,
@@ -219,6 +221,28 @@ class TestStart:
             "model": "gpt-5",
         }
         assert server.params_of("turn/start")["effort"] == "low"
+
+    async def test_approve_for_me_reaches_the_wire(self):
+        server = FakeAppServer()
+        self._script(server)
+        emit_completed(server, "t1", "u1")
+        outcome = await make_ctl(server).run(
+            Start(
+                prompt="hi",
+                config=StartConfig(
+                    cwd="/work",
+                    approval_policy=ApprovalPolicy.onRequest,
+                    approvals_reviewer=ApprovalsReviewer.autoReview,
+                ),
+            )
+        )
+        await collect(outcome)
+        assert server.params_of("thread/start") == {
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+            "sandbox": "workspace-write",
+            "cwd": "/work",
+        }
 
     async def test_detach_returns_ids_and_disconnects_without_interrupting(self):
         server = FakeAppServer()

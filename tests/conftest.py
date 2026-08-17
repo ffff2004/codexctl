@@ -10,6 +10,8 @@ from typing import Any, AsyncIterator, Callable
 import pytest
 
 from codexctl.appserver import (
+    _APPROVAL_POLICY_TO_WIRE,
+    _APPROVALS_REVIEWER_TO_WIRE,
     REQUIRED_LIFECYCLE_OPERATIONS,
     AppServerResponse,
     AppServerThread,
@@ -107,9 +109,13 @@ class FakeAppServer:
 
     async def start_thread(self, config: StartConfig) -> AppServerThread | None:
         params: dict[str, Any] = {
-            "approvalPolicy": "never",
+            "approvalPolicy": _APPROVAL_POLICY_TO_WIRE[config.approval_policy],
             "sandbox": _serialize_sandbox_policy(config.sandbox),
         }
+        if config.approvals_reviewer is not None:
+            params["approvalsReviewer"] = _APPROVALS_REVIEWER_TO_WIRE[
+                config.approvals_reviewer
+            ]
         if config.cwd:
             params["cwd"] = config.cwd
         if config.model:

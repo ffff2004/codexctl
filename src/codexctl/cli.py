@@ -21,6 +21,8 @@ from .endpoint import (
     StdioEndpointAdapter,
 )
 from .model import (
+    ApprovalPolicy,
+    ApprovalsReviewer,
     CodexCtlError,
     Doctor,
     ErrorCode,
@@ -180,6 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
     p.add_argument("--sandbox", choices=_SANDBOX_POLICY_BY_ARGUMENT, default=None)
+    p.add_argument(
+        "--approve-for-me",
+        dest="approve_for_me",
+        action="store_true",
+        help="let the runtime auto-review approval requests instead of declining them",
+    )
 
     p = sub.add_parser("resume", help="continue an existing thread with a new turn")
     _add_common(p)
@@ -271,6 +279,12 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
     if args.command == "start":
         if not prompt:
             raise _CliUsageError("start requires a prompt after --")
+        if args.approve_for_me:
+            approval_policy = ApprovalPolicy.onRequest
+            approvals_reviewer = ApprovalsReviewer.autoReview
+        else:
+            approval_policy = ApprovalPolicy.never
+            approvals_reviewer = None
         return Start(
             prompt=prompt,
             config=StartConfig(
@@ -282,6 +296,8 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
                     if args.sandbox is not None
                     else None
                 ),
+                approval_policy=approval_policy,
+                approvals_reviewer=approvals_reviewer,
             ),
             detach=args.detach,
         )

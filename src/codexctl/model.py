@@ -94,6 +94,32 @@ class SandboxPolicy(Enum):
 DEFAULT_SANDBOX_POLICY = SandboxPolicy.workspaceWrite
 
 
+class ApprovalPolicy(Enum):
+    """Domain approval policy accepted by ``start``.
+
+    These values are deliberately independent of the app-server wire enum;
+    serialization belongs to the app-server adapter.
+    """
+
+    untrusted = auto()
+    onRequest = auto()
+    never = auto()
+
+
+class ApprovalsReviewer(Enum):
+    """Domain reviewer that resolves escalated approval requests.
+
+    Independent of the app-server wire enum; serialization belongs to the
+    app-server adapter.
+    """
+
+    user = auto()
+    autoReview = auto()
+
+
+DEFAULT_APPROVAL_POLICY = ApprovalPolicy.never
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -103,14 +129,17 @@ DEFAULT_SANDBOX_POLICY = SandboxPolicy.workspaceWrite
 class StartConfig:
     """Deliberately limited start-time configuration.
 
-    ``sandbox`` uses the public Codex sandbox presets. Approval policy is
-    fixed to unattended execution and is not caller-configurable in v1.
+    ``sandbox`` uses the public Codex sandbox presets. ``approval_policy``
+    and ``approvals_reviewer`` select the approval behavior; the defaults
+    keep unattended execution (``never``, no reviewer).
     """
 
     cwd: str | None = None
     model: str | None = None
     effort: str | None = None
     sandbox: SandboxPolicy | None = None
+    approval_policy: ApprovalPolicy = DEFAULT_APPROVAL_POLICY
+    approvals_reviewer: ApprovalsReviewer | None = None
 
 
 @dataclass(frozen=True)

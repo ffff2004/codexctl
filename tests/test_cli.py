@@ -35,6 +35,8 @@ from codexctl.cli import (
 from codexctl.core import CodexCtl
 from codexctl.endpoint import StdioEndpointAdapter, StdioTarget
 from codexctl.model import (
+    ApprovalPolicy,
+    ApprovalsReviewer,
     CodexCtlError,
     ErrorCode,
     Follow,
@@ -439,6 +441,26 @@ class TestSandboxPolicy:
     def test_parser_rejects_legacy_camel_case_policy(self):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["start", "--sandbox", "readOnly"])
+
+
+class TestApproveForMe:
+    def test_flag_enables_auto_review(self):
+        args = build_parser().parse_args(["start", "--approve-for-me"])
+
+        command = _build_command(args, "hello")
+
+        assert isinstance(command, Start)
+        assert command.config.approval_policy is ApprovalPolicy.onRequest
+        assert command.config.approvals_reviewer is ApprovalsReviewer.autoReview
+
+    def test_default_stays_unattended(self):
+        args = build_parser().parse_args(["start"])
+
+        command = _build_command(args, "hello")
+
+        assert isinstance(command, Start)
+        assert command.config.approval_policy is ApprovalPolicy.never
+        assert command.config.approvals_reviewer is None
 
 
 class TestSplitPrompt:
