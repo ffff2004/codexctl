@@ -1,7 +1,5 @@
 """Text rendering of projected items."""
 
-from __future__ import annotations
-
 from io import StringIO
 
 from codexctl.model import (

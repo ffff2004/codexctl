@@ -5,8 +5,6 @@ Execution behavior lives in :mod:`codexctl.core`; rendering lives in
 two modules.
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import sys

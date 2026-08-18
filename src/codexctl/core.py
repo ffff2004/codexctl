@@ -5,8 +5,6 @@ the follow replay/live frontier, history selection, and stable error mapping.
 It never exposes transport or protocol types through ``run``.
 """
 
-from __future__ import annotations
-
 import asyncio
 import time
 from dataclasses import replace

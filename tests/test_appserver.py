@@ -1,7 +1,5 @@
 """Projection: the compatibility firewall between Codex wire shapes and ours."""
 
-from __future__ import annotations
-
 import asyncio
 import base64
 import contextlib

@@ -1,7 +1,5 @@
 """Rollout reader: best-effort, narrow parsing, never raises."""
 
-from __future__ import annotations
-
 import json
 import os
 from pathlib import Path

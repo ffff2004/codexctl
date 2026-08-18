@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Validate repository-internal Markdown links."""
 
-from __future__ import annotations
-
 import re
 import sys
 from pathlib import Path

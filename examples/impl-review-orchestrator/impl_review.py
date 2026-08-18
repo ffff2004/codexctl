@@ -7,8 +7,6 @@ workflow without starting Codex or GitHub.  The production adapters use only
 the Python standard library and the documented codexctl JSONL interface.
 """
 
-from __future__ import annotations
-
 import argparse
 import concurrent.futures
 import hashlib
@@ -1930,7 +1928,7 @@ def _find_run_dir(state_dir: Path, run_id: str, cwd: Path | None, git: GitPort) 
         for state_path in root.glob("*/*/state.json"):
             try:
                 data = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except OSError, json.JSONDecodeError:
                 continue
             if str(data.get("run_id")) == run_id:
                 matches.append(state_path.parent)

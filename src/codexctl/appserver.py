@@ -6,8 +6,6 @@ only see request results, :class:`~codexctl.model.ProjectedEvent` values, and
 :class:`JsonRpcError` failures.
 """
 
-from __future__ import annotations
-
 import asyncio
 import contextlib
 import itertools
@@ -23,7 +21,6 @@ from typing import (
     Literal,
     NoReturn,
     Protocol,
-    TypeAlias,
     runtime_checkable,
 )
 
@@ -220,7 +217,7 @@ class EmptyResponse:
     pass
 
 
-AppServerResponse: TypeAlias = (
+type AppServerResponse = (
     ThreadResponse
     | TurnResponse
     | InitializeResponse
@@ -270,7 +267,7 @@ class AppServerPort(Protocol):
     async def close(self) -> None: ...
 
 
-Frame: TypeAlias = str | bytes
+type Frame = str | bytes
 
 
 class _FrameTransport(Protocol):
@@ -439,13 +436,13 @@ class StdioFrameTransport:
     def _signal_group(self, signum: int) -> None:
         try:
             os.killpg(self._process.pid, signum)
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError, PermissionError, OSError:
             pass
 
     def _group_exists(self) -> bool:
         try:
             os.killpg(self._process.pid, 0)
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError, PermissionError, OSError:
             return False
         return True
 
@@ -462,7 +459,7 @@ class JsonRpcAppServerSession:
         self._transport = transport
         self._display = display
         self._pending: dict[int, asyncio.Future[dict]] = {}
-        self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._ids = itertools.count(1)
         self._reader_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -660,8 +657,9 @@ class JsonRpcAppServerSession:
 
     async def _iter_notifications(self) -> AsyncIterator[ProjectedEvent]:
         while True:
-            message = await self._queue.get()
-            if message is None:
+            try:
+                message = await self._queue.get()
+            except asyncio.QueueShutDown:
                 return
             event = project_notification(message)
             if event is not None:
@@ -722,7 +720,7 @@ class JsonRpcAppServerSession:
                     with contextlib.suppress(Exception):
                         await self._transport.close()
             self._pending.clear()
-            await self._queue.put(None)
+            self._queue.shutdown()
 
     # -- server-initiated requests (unattended policy) ------------------------
 
@@ -1130,7 +1128,7 @@ def _project_usage(token_usage: Any) -> dict | None:
         return None
     try:
         used = int(last["totalTokens"])
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
     return {
         "usedTokens": used,

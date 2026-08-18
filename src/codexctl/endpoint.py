@@ -12,8 +12,6 @@ Three real production behaviors justify this seam:
 Core execution only ever sees an :class:`AppServerEndpoint`.
 """
 
-from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -91,7 +89,7 @@ def _pid_from_pidfile(home: Path | None = None) -> int | None:
         record = json.loads(pidfile.read_text(encoding="utf-8"))
         pid = record.get("pid") if isinstance(record, dict) else None
         return int(pid) if pid is not None else None
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except OSError, ValueError, TypeError, json.JSONDecodeError:
         return None
 
 
@@ -190,7 +188,7 @@ class ManagedDaemonAdapter:
                 timeout=10,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             return None
         if proc.returncode != 0:
             return None

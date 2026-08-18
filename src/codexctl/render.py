@@ -4,8 +4,6 @@ Rendering is outside ``CodexCtl``. Renderers consume outcomes and projected
 events; they never influence execution behavior.
 """
 
-from __future__ import annotations
-
 import json
 import sys
 from dataclasses import dataclass

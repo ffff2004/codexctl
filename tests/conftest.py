@@ -1,7 +1,5 @@
 """Shared test doubles: scripted fake app-server and fake endpoint."""
 
-from __future__ import annotations
-
 import asyncio
 import sys
 from pathlib import Path
@@ -44,7 +42,7 @@ class FakeAppServer:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict | None]] = []
         self.handlers: dict[str, Callable[[dict | None], dict]] = {}
-        self._queue: asyncio.Queue[ProjectedEvent | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[ProjectedEvent] = asyncio.Queue()
         self.closed = False
         self.unsubscribed: list[str] = []
         self.missing_lifecycle_operations: set[str] = set()
@@ -86,7 +84,7 @@ class FakeAppServer:
             self._queue.put_nowait(event)
 
     def end_stream(self) -> None:
-        self._queue.put_nowait(None)
+        self._queue.shutdown()
 
     @property
     def methods_requested(self) -> list[str]:
@@ -195,10 +193,10 @@ class FakeAppServer:
 
     async def _iter(self) -> AsyncIterator[ProjectedEvent]:
         while True:
-            message = await self._queue.get()
-            if message is None:
+            try:
+                yield await self._queue.get()
+            except asyncio.QueueShutDown:
                 return
-            yield message
 
     async def unsubscribe(self, thread_id: str) -> None:
         self.unsubscribed.append(thread_id)

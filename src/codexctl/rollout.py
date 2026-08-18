@@ -6,8 +6,6 @@ as a primary history source. The reader parses narrowly, ignores unknown
 records, and returns ``None`` instead of raising on any format drift.
 """
 
-from __future__ import annotations
-
 import json
 import os
 from pathlib import Path
@@ -47,7 +45,7 @@ def find_rollout(thread_id: str, home: Path | None = None) -> Path | None:
 def _context_tokens(last: dict) -> int | None:
     try:
         return int(last["total_tokens"])
-    except (KeyError, TypeError, ValueError):
+    except KeyError, TypeError, ValueError:
         return None
 
 

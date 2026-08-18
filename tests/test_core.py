@@ -6,8 +6,6 @@ expectedTurnId, interrupt waiting, read-only status, history selection,
 stable error mapping, and the unattended interaction policy.
 """
 
-from __future__ import annotations
-
 import asyncio
 from pathlib import Path
 

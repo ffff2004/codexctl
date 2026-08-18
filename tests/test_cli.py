@@ -3,8 +3,6 @@
 All paths tested here return before any runtime connection is attempted.
 """
 
-from __future__ import annotations
-
 import asyncio
 import io
 import json

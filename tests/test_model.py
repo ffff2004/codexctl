@@ -1,7 +1,5 @@
 """Selector parsing and application: exact Python indexing semantics."""
 
-from __future__ import annotations
-
 import pytest
 
 from codexctl.model import (

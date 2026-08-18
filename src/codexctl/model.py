@@ -5,12 +5,10 @@ This module defines the closed vocabulary exchanged across the external
 sockets, or the Codex protocol wire format.
 """
 
-from __future__ import annotations
-
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, AsyncIterator, Literal, Union
+from typing import Any, AsyncIterator, Literal
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -195,9 +193,17 @@ class Doctor:
     pass
 
 
-Command = Union[
-    Start, Resume, Status, History, Follow, Steer, Interrupt, ListThreads, Doctor
-]
+type Command = (
+    Start
+    | Resume
+    | Status
+    | History
+    | Follow
+    | Steer
+    | Interrupt
+    | ListThreads
+    | Doctor
+)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +223,7 @@ class SliceSelector:
     step: int | None
 
 
-TurnSelector = Union[SingleIndex, SliceSelector]
+type TurnSelector = SingleIndex | SliceSelector
 
 
 @dataclass(frozen=True)
@@ -245,7 +251,7 @@ class ReplayAll:
     """``:``: replay the entire available history."""
 
 
-ReplaySelector = Union[ReplayActiveTurn, ReplayTail, ReplayAll]
+type ReplaySelector = ReplayActiveTurn | ReplayTail | ReplayAll
 
 
 def _parse_bound(text: str) -> int | None:

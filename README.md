@@ -9,7 +9,8 @@ and it never queues, forks, or silently replaces threads.
 
 ## Quick start
 
-Requires a local `codex` CLI with app-server support (managed mode starts
+Requires Python 3.14+ and a local `codex` CLI with app-server support
+(managed mode starts
 the shared daemon automatically), or an externally managed endpoint via
 `--endpoint`.
 
