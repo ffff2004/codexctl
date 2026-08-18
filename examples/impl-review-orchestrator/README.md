@@ -7,7 +7,6 @@ deliberately one Python file and uses only the standard library.
 Run it from this directory, with any clean Git checkout as `--cwd`:
 
 ```sh
-cd examples/impl-review-orchestrator
 python impl_review.py \
   --cwd /path/to/checkout \
   --spec /path/to/spec.md \
@@ -38,7 +37,7 @@ opt-in and requires `--issue`.
 A paused run is resumed without reading stdin:
 
 ```sh
-python examples/impl-review-orchestrator/impl_review.py resume \
+python impl_review.py resume \
   --run-id RUN_ID --decision retry
 ```
 
@@ -48,7 +47,7 @@ has review findings, and `acknowledge-drift` after inspecting a changed
 checkout. For example, after the second repair round still fails review:
 
 ```sh
-python examples/impl-review-orchestrator/impl_review.py resume \
+python impl_review.py resume \
   --run-id RUN_ID --decision start-next-round
 ```
 
