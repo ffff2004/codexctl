@@ -33,7 +33,7 @@ It stores nothing locally; threads live in the shared runtime.
 
 ## Commit messages
 
-- Use Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`,
+- Use Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `build:`,
   `chore:`, ...).
 - If a commit closes an issue, add a `Closes #N` line to the
   commit message.
