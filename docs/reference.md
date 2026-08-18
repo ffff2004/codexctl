@@ -227,6 +227,11 @@ newest activity first. `--all` lists threads across all workspaces:
 <thread-id>  idle  <preview>
 ```
 
+In text mode, preview newlines are rendered as the two characters `\n`, and
+the preview is truncated to the remaining terminal width after the thread ID,
+status, and separators. If the terminal width cannot be determined, `128` is
+used. JSON mode returns the original preview without this text formatting.
+
 ### doctor
 
 ```sh

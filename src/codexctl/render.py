@@ -5,6 +5,7 @@ events; they never influence execution behavior.
 """
 
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from typing import Any, TextIO
@@ -23,6 +24,8 @@ from .model import (
     TurnTerminal,
     usage_to_context,
 )
+
+_DEFAULT_LIST_WIDTH = 128
 
 # ---------------------------------------------------------------------------
 # JSON documents (single source for structured shapes)
@@ -127,6 +130,28 @@ def format_context_line(context: ContextUsage | None) -> str | None:
         f"Context: {_format_tokens(context.used_tokens)} / "
         f"{_format_tokens(context.window_tokens)} ({percent}%)"
     )
+
+
+def _list_terminal_width() -> int:
+    try:
+        width = shutil.get_terminal_size(fallback=(_DEFAULT_LIST_WIDTH, 24)).columns
+    except OSError:
+        return _DEFAULT_LIST_WIDTH
+    return width if width > 0 else _DEFAULT_LIST_WIDTH
+
+
+def _format_list_preview(
+    thread_id: str, status: str, preview: str | None, terminal_width: int
+) -> str:
+    prefix = f"{thread_id}  {status}"
+    if not preview:
+        return prefix
+
+    preview = preview.replace("\r\n", "\n").replace("\r", "\n").replace("\n", r"\n")
+    preview_width = max(terminal_width - len(prefix) - 2, 0)
+    if preview_width == 0:
+        return prefix
+    return f"{prefix}  {preview[:preview_width]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,9 +292,17 @@ class TextRenderer:
                 for item in turn.items:
                     self._write(_summarize_item(item, indent="  "))
         elif isinstance(outcome, ThreadListSnapshot):
+            terminal_width = _list_terminal_width()
             for record in outcome.threads:
-                preview = f"  {record.preview}" if record.preview else ""
-                self._write(f"{record.thread_id}  {record.status}{preview}\n")
+                self._write(
+                    _format_list_preview(
+                        record.thread_id,
+                        record.status,
+                        record.preview,
+                        terminal_width,
+                    )
+                    + "\n"
+                )
         elif isinstance(outcome, DoctorSnapshot):
             self._write(f"codexctl version: {outcome.codexctl_version}\n")
             if outcome.codex_cli_version:

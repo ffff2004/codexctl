@@ -1,12 +1,15 @@
 """Text rendering of projected items."""
 
 from io import StringIO
+from types import SimpleNamespace
 
 from codexctl.model import (
     ContextUsage,
     HistorySnapshot,
     HistoryTurn,
     ProjectedEvent,
+    ThreadListSnapshot,
+    ThreadRecord,
     TurnTerminal,
 )
 from codexctl.render import TextRenderer, format_context_line
@@ -122,6 +125,47 @@ def test_context_line_uses_effective_context_usage_ratio():
         )
         == "Context: 83k / 200k (38%)"
     )
+
+
+def test_list_text_escapes_newlines_and_fits_preview_to_terminal_width(monkeypatch):
+    monkeypatch.setattr(
+        "codexctl.render.shutil.get_terminal_size",
+        lambda **kwargs: SimpleNamespace(columns=26),
+    )
+    out = StringIO()
+
+    TextRenderer(out=out).snapshot(
+        ThreadListSnapshot(
+            threads=[
+                ThreadRecord(
+                    thread_id="thread-1",
+                    status="idle",
+                    preview="first\nsecond line",
+                )
+            ]
+        )
+    )
+
+    assert out.getvalue() == "thread-1  idle  first\\nsec\n"
+
+
+def test_list_text_uses_default_width_when_terminal_width_is_unavailable(monkeypatch):
+    def fail_to_get_terminal_size(**kwargs):
+        raise OSError
+
+    monkeypatch.setattr(
+        "codexctl.render.shutil.get_terminal_size", fail_to_get_terminal_size
+    )
+    out = StringIO()
+    preview = "x" * 200
+
+    TextRenderer(out=out).snapshot(
+        ThreadListSnapshot(
+            threads=[ThreadRecord(thread_id="t", status="idle", preview=preview)]
+        )
+    )
+
+    assert out.getvalue() == f"t  idle  {'x' * 119}\n"
 
 
 USAGE = {"usedTokens": 83000, "windowTokens": 200000, "ratio": 0.38}
