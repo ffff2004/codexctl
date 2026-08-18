@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Command-line interface for starting, resuming, observing, steering, and interrupting Codex threads through a shared Codex runtime."
 readme = "README.md"
 requires-python = ">=3.14"
-license = { text = "MIT" }
+license = "Apache-2.0"
 dependencies = [
     "websockets>=13.0",
 ]
