@@ -15,7 +15,4 @@ Review this unstaged diff as part of the checkout:
 
 {{unstaged_diff}}
 
-Do not edit the checkout. End with exactly one terminal marker:
-VERDICT: PASS
-or
-VERDICT: FAIL
+Do not edit the checkout.

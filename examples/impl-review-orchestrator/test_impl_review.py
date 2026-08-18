@@ -470,9 +470,6 @@ def test_example_prompt_templates_use_supported_placeholders() -> None:
     assert "{{gates}}" in repair
     assert "{{unstaged_diff}}" in standards
     assert "{{unstaged_diff}}" in spec
-    for template in (standards, spec):
-        assert "VERDICT: PASS" in template
-        assert "VERDICT: FAIL" in template
 
 
 def test_jsonl_extracts_only_final_completed_agent_message() -> None:
