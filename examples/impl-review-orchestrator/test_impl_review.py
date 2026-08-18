@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import threading
@@ -244,6 +245,7 @@ def _workflow(
     git: FakeGit | None = None,
     publisher: FakePublisher | None = None,
     gate_runner: object | None = None,
+    progress: list[str] | None = None,
 ) -> tuple[Workflow, FakeCodex, FakeGit, FakeGates]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -288,6 +290,7 @@ def _workflow(
         codexctl=fake_codex,
         gates=fake_gates,
         publisher=publisher,
+        progress=progress.append if progress is not None else None,
     )
     return workflow, fake_codex, fake_git, fake_gates
 
@@ -378,6 +381,22 @@ def test_rendering_rejects_unknowns_and_references_large_content(
             cwd="/checkout",
             round=1,
         )
+
+
+def test_renderers_include_state_file_path(tmp_path: Path) -> None:
+    workflow, _, _, _ = _workflow(tmp_path)
+    result = workflow.execute()
+    state_path = str(workflow.store.run_dir / "state.json")
+
+    assert result["statePath"] == state_path
+
+    text_output = io.StringIO()
+    orchestrator._render_text(result, out=text_output)
+    assert f"State file: {state_path}" in text_output.getvalue()
+
+    json_output = io.StringIO()
+    orchestrator._render_json(result, out=json_output)
+    assert json.loads(json_output.getvalue())["statePath"] == state_path
 
 
 def test_issue_uri_parsing_rejects_non_github_issue_values() -> None:
@@ -594,6 +613,74 @@ def test_reviewer_adapter_uses_read_only_sandbox(
     assert "--sandbox" in argv
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert result.final_text == "review\nVERDICT: PASS"
+
+
+def test_worker_adapter_streams_text_renderer_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text_chunks = [
+        b"Thread: worker-thread\n\n",
+        b"Turn: turn-1\n",
+        b"\n[agent]\nworker final\n",
+        b"\nTurn completed\n",
+    ]
+    rendered: list[str] = []
+
+    class Pipe:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = iter(chunks)
+
+        def readline(self) -> bytes:
+            return next(self.chunks, b"")
+
+        def read(self, size: int = -1) -> bytes:
+            del size
+            return b"".join(self.chunks)
+
+    class Process:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = Pipe(text_chunks)
+            self.stderr = Pipe([b"worker warning\n"])
+
+        def wait(self) -> int:
+            return self.returncode
+
+    captured: dict[str, object] = {}
+
+    def fake_popen(argv: list[str], **kwargs: object) -> Process:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return Process()
+
+    monkeypatch.setattr(orchestrator.subprocess, "Popen", fake_popen)
+    result = CodexctlAdapter("codexctl", output=rendered.append).invoke(
+        role="worker",
+        prompt="implement",
+        cwd=tmp_path,
+        thread_id=None,
+        round=1,
+    )
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[argv.index("--output") + 1] == "text"
+    assert "".join(rendered) == b"".join(text_chunks).decode()
+    assert result.thread_id == "worker-thread"
+    assert result.final_text == "worker final"
+    assert result.stderr == b"worker warning\n"
+
+
+def test_reviewer_completion_reports_last_agent_message(tmp_path: Path) -> None:
+    progress: list[str] = []
+    workflow, _, _, _ = _workflow(tmp_path, progress=progress)
+
+    result = workflow.execute()
+
+    assert result["state"] == "READY_FOR_HANDOFF"
+    assert "reviewer standards completed:\nfinding\nVERDICT: PASS" in progress
+    assert "reviewer spec completed:\nfinding\nVERDICT: PASS" in progress
 
 
 def test_reviewer_git_mutation_pauses_before_repair_or_gates(

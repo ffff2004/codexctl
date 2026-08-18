@@ -546,6 +546,51 @@ def parse_codex_jsonl(raw: str | bytes) -> AgentRun:
     )
 
 
+def parse_codex_text(raw: str | bytes) -> AgentRun:
+    """Parse the final agent message and thread ID from text renderer output."""
+
+    data = raw.encode("utf-8") if isinstance(raw, str) else raw
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return AgentRun(0, data, b"", parse_error=f"text is not UTF-8: {exc}")
+
+    thread_match = re.search(r"^Thread: ([^\r\n]+)$", text, re.MULTILINE)
+    agent_markers = list(re.finditer(r"^\[agent\]\r?\n", text, re.MULTILINE))
+    if not agent_markers:
+        return AgentRun(
+            0,
+            data,
+            b"",
+            thread_id=thread_match.group(1) if thread_match else None,
+            parse_error="text output did not contain a completed agentMessage",
+        )
+
+    final_text = text[agent_markers[-1].end() :]
+    terminal_marker = re.search(
+        r"\r?\n(?:Turn completed|Turn ended: [^\r\n]*)(?:\r?\n|$)",
+        final_text,
+    )
+    if terminal_marker:
+        final_text = final_text[: terminal_marker.start()]
+    final_text = final_text.rstrip()
+    if not final_text:
+        return AgentRun(
+            0,
+            data,
+            b"",
+            thread_id=thread_match.group(1) if thread_match else None,
+            parse_error="text output contained an empty agentMessage",
+        )
+    return AgentRun(
+        0,
+        data,
+        b"",
+        thread_id=thread_match.group(1) if thread_match else None,
+        final_text=final_text,
+    )
+
+
 def extract_final_agent_message(raw: str | bytes) -> str | None:
     """Return only the final completed ``agentMessage`` text, if present."""
 
@@ -580,8 +625,40 @@ class CodexctlPort(Protocol):
 
 
 class CodexctlAdapter:
-    def __init__(self, executable: str = "codexctl") -> None:
+    def __init__(
+        self,
+        executable: str = "codexctl",
+        *,
+        output: Callable[[str], None] | None = None,
+    ) -> None:
         self.executable = executable
+        self.output = output
+
+    def _communicate_text(
+        self, process: subprocess.Popen[bytes]
+    ) -> tuple[bytes, bytes]:
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+
+        def drain_stderr() -> None:
+            while True:
+                chunk = process.stderr.read(4096)
+                if not chunk:
+                    return
+                stderr_chunks.append(chunk)
+
+        stderr_thread = threading.Thread(target=drain_stderr)
+        stderr_thread.start()
+        while True:
+            chunk = process.stdout.readline()
+            if not chunk:
+                break
+            stdout_chunks.append(chunk)
+            if self.output is not None:
+                self.output(chunk.decode("utf-8", "replace"))
+        process.wait()
+        stderr_thread.join()
+        return b"".join(stdout_chunks), b"".join(stderr_chunks)
 
     def invoke(
         self,
@@ -594,13 +671,14 @@ class CodexctlAdapter:
     ) -> AgentRun:
         del round
         sandbox = "read-only" if role.startswith("reviewer") else "workspace-write"
+        output_mode = "text" if role == "worker" else "jsonl"
         if thread_id:
             argv = [
                 self.executable,
                 "resume",
                 thread_id,
                 "--output",
-                "jsonl",
+                output_mode,
                 "--",
                 prompt,
             ]
@@ -609,7 +687,7 @@ class CodexctlAdapter:
                 self.executable,
                 "start",
                 "--output",
-                "jsonl",
+                output_mode,
                 "--cwd",
                 str(cwd),
                 "--sandbox",
@@ -625,7 +703,10 @@ class CodexctlAdapter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            stdout, stderr = process.communicate()
+            if role == "worker":
+                stdout, stderr = self._communicate_text(process)
+            else:
+                stdout, stderr = process.communicate()
         except (OSError, subprocess.SubprocessError) as exc:
             return AgentRun(
                 returncode=127,
@@ -633,7 +714,9 @@ class CodexctlAdapter:
                 stderr=str(exc).encode("utf-8", "replace"),
                 parse_error=f"could not invoke codexctl: {exc}",
             )
-        parsed = parse_codex_jsonl(stdout)
+        parsed = (
+            parse_codex_text(stdout) if role == "worker" else parse_codex_jsonl(stdout)
+        )
         parsed.returncode = process.returncode
         parsed.stderr = stderr
         return parsed
@@ -826,13 +909,16 @@ class Workflow:
         gates: GatePort | None = None,
         publisher: PublisherPort | None = None,
         progress: Callable[[str], None] | None = None,
+        agent_output: Callable[[str], None] | None = None,
         cwd_override: Path | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.state = state
         self.git = git or GitAdapter()
-        self.codexctl = codexctl or CodexctlAdapter(config.codexctl)
+        self.codexctl = codexctl or CodexctlAdapter(
+            config.codexctl, output=agent_output
+        )
         self.gates = gates or GateAdapter()
         self.publisher = publisher or GitHubPublisher()
         self.progress = progress or (lambda _message: None)
@@ -849,6 +935,7 @@ class Workflow:
         gates: GatePort | None = None,
         publisher: PublisherPort | None = None,
         progress: Callable[[str], None] | None = None,
+        agent_output: Callable[[str], None] | None = None,
     ) -> "Workflow":
         git_adapter = git or GitAdapter()
         cwd = config.cwd.resolve()
@@ -963,7 +1050,7 @@ class Workflow:
             store=store,
             state=state,
             git=git_adapter,
-            codexctl=codexctl or CodexctlAdapter(config.codexctl),
+            codexctl=codexctl or CodexctlAdapter(config.codexctl, output=agent_output),
             gates=gates,
             publisher=publisher,
             progress=progress,
@@ -983,6 +1070,7 @@ class Workflow:
         git: GitPort | None = None,
         codex_runner: CodexctlPort | None = None,
         gate_runner: GatePort | None = None,
+        agent_output: Callable[[str], None] | None = None,
     ) -> "Workflow":
         state = store.read_state()
         config_data = state.get("config", {})
@@ -1014,7 +1102,8 @@ class Workflow:
             store=store,
             state=state,
             git=git or GitAdapter(),
-            codexctl=codex_runner or CodexctlAdapter(config.codexctl),
+            codexctl=codex_runner
+            or CodexctlAdapter(config.codexctl, output=agent_output),
             gates=gate_runner or GateAdapter(),
             publisher=publisher,
             progress=progress,
@@ -1049,6 +1138,7 @@ class Workflow:
         reviews = self.state.get("review_verdicts", {})
         return {
             "runId": self.state["run_id"],
+            "statePath": str(self.store.run_dir / "state.json"),
             "state": self.state["state"],
             "artifacts": list(self.state.get("artifacts", [])),
             "reviewVerdicts": reviews,
@@ -1080,9 +1170,12 @@ class Workflow:
         round_number: int,
         stem: str,
         result: AgentRun,
+        raw_suffix: str = "jsonl",
     ) -> dict[str, str]:
         artifacts = {
-            "raw": self._artifact(f"rounds/{round_number}/{stem}.jsonl", result.stdout),
+            "raw": self._artifact(
+                f"rounds/{round_number}/{stem}.{raw_suffix}", result.stdout
+            ),
             "stderr": self._artifact(
                 f"rounds/{round_number}/{stem}.stderr", result.stderr
             ),
@@ -1192,7 +1285,10 @@ class Workflow:
         round_state["worker_checkout_after"] = worker_after.to_dict()
         self._save()
         artifacts = self._record_agent_artifacts(
-            round_number=round_number, stem="worker", result=result
+            round_number=round_number,
+            stem="worker",
+            result=result,
+            raw_suffix="txt",
         )
         worker_record = {
             "thread_id": result.thread_id,
@@ -1360,14 +1456,18 @@ class Workflow:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, len(pending_names))
         ) as executor:
-            futures = {name: executor.submit(invoke, name) for name in pending_names}
-            for name in pending_names:
+            futures = {executor.submit(invoke, name): name for name in pending_names}
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
                 try:
-                    results[name] = futures[name].result()
+                    result = future.result()
                 except BaseException as exc:
-                    results[name] = AgentRun(
+                    result = AgentRun(
                         127, b"", str(exc).encode("utf-8"), parse_error=str(exc)
                     )
+                results[name] = result
+                if result.final_text is not None:
+                    self._report(f"reviewer {name} completed:\n{result.final_text}")
 
         reviewer_after = self.git.snapshot(self.config.cwd)
         round_state["reviewer_checkout_after"] = reviewer_after.to_dict()
@@ -1899,7 +1999,11 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
 
 
 def _render_text(result: dict[str, Any], *, out: Any = sys.stdout) -> None:
-    out.write(f"Run: {result['runId']}\nState: {result['state']}\n")
+    out.write(
+        f"Run: {result['runId']}\n"
+        f"State: {result['state']}\n"
+        f"State file: {result['statePath']}\n"
+    )
     verdicts = result.get("reviewVerdicts", {})
     if verdicts:
         out.write(f"Reviews: {json.dumps(verdicts, sort_keys=True)}\n")
@@ -1917,6 +2021,11 @@ def _render_text(result: dict[str, Any], *, out: Any = sys.stdout) -> None:
             f"{result['pending'].get('decision', 'retry')}\n"
         )
     out.flush()
+
+
+def _stream_text(value: str) -> None:
+    sys.stdout.write(value)
+    sys.stdout.flush()
 
 
 def _render_json(result: dict[str, Any], *, out: Any = sys.stdout) -> None:
@@ -1952,6 +2061,7 @@ def main(argv: list[str] | None = None) -> int:
                 progress=(lambda message: print(message, flush=True))
                 if not json_mode
                 else None,
+                agent_output=_stream_text if not json_mode else None,
             )
             result = workflow.execute()
         elif args.command == "resume":
@@ -1968,6 +2078,7 @@ def main(argv: list[str] | None = None) -> int:
                 progress=(lambda message: print(message, flush=True))
                 if not json_mode
                 else None,
+                agent_output=_stream_text if not json_mode else None,
             )
             result = workflow.execute(decision=args.decision)
         else:

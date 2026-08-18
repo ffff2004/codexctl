@@ -66,3 +66,7 @@ new worker runs. It never commits, merges, creates worktrees, or cleans up.
 
 Use `--output json` (or `--json`) for one machine-readable result containing
 the run ID, artifacts, review verdicts, gate results, and handoff status.
+In text mode, the worker's `codexctl` text-renderer output is streamed as it
+arrives. Reviewer intermediate output is not streamed; each reviewer's final
+agent message is printed when that reviewer completes. JSON mode suppresses
+live agent output.
