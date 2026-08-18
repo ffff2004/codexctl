@@ -28,6 +28,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/codexctl"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/vendor/codex",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "examples/impl-review-orchestrator"]
