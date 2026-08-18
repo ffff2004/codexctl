@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small, deliberately boring implementation-review workflow demo.
+"""A deliberately boring implementation-review workflow demo.
 
 The example is intentionally a single file.  It has a deep ``Workflow``
 interface and four small adapters so tests can exercise the observable

@@ -10,8 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import main as orchestrator  # noqa: E402
-from main import (  # noqa: E402
+import impl_review as orchestrator  # noqa: E402
+from impl_review import (  # noqa: E402
     AgentRun,
     CheckoutSnapshot,
     CodexctlAdapter,
