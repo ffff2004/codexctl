@@ -4,6 +4,9 @@ This is a self-contained demo of a worker/reviewer/gates workflow built on
 the documented [`codexctl` JSONL contract](../../docs/reference.md). It is
 deliberately one Python file and uses only the standard library.
 
+See [`SKILL.md`](SKILL.md) for the corresponding implementation-review
+workflow.
+
 Run it from this directory, with any clean Git checkout as `--cwd`:
 
 ```sh

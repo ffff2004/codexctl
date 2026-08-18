@@ -30,6 +30,7 @@ codexctl doctor
   shapes, error codes, and exit codes (public contract).
 - [Architecture](docs/architecture.md): internal module layout, seams, and
   protocol adaptation.
+- [Examples](examples/): example integrations and workflows.
 
 ## Development
 
