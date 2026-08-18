@@ -639,10 +639,14 @@ class CodexctlAdapter:
     ) -> tuple[bytes, bytes]:
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
+        stdout = process.stdout
+        stderr = process.stderr
+        if stdout is None or stderr is None:
+            raise RuntimeError("codexctl pipes were not configured")
 
         def drain_stderr() -> None:
             while True:
-                chunk = process.stderr.read(4096)
+                chunk = stderr.read(4096)
                 if not chunk:
                     return
                 stderr_chunks.append(chunk)
@@ -650,7 +654,7 @@ class CodexctlAdapter:
         stderr_thread = threading.Thread(target=drain_stderr)
         stderr_thread.start()
         while True:
-            chunk = process.stdout.readline()
+            chunk = stdout.readline()
             if not chunk:
                 break
             stdout_chunks.append(chunk)
@@ -1766,6 +1770,7 @@ class Workflow:
                     "REVIEW_DECISION",
                     "GATES",
                 }:
+                    pending_kind = pending.get("kind")
                     resume_phase = {
                         "agent": (
                             "WORKER"
@@ -1775,7 +1780,10 @@ class Workflow:
                         "gates": "GATES",
                         "review": "REVIEW_DECISION",
                         "publication": "REVIEW_DECISION",
-                    }.get(pending.get("kind"), "WORKER")
+                    }.get(
+                        str(pending_kind) if pending_kind is not None else "",
+                        "WORKER",
+                    )
                 return self._waiting(
                     reason="checkout-drift",
                     pending={

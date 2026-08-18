@@ -45,7 +45,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "examples/impl-review-orchestrator"]
 exclude = ["vendor", ".venv", "dist", "tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"

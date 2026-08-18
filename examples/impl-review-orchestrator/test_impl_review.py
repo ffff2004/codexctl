@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import TypeVar
 
 import pytest
 
@@ -28,6 +29,9 @@ from impl_review import (  # noqa: E402
     render_prompt,
     validate_template,
 )
+
+GitT = TypeVar("GitT", bound=orchestrator.GitPort)
+GateT = TypeVar("GateT", bound=orchestrator.GatePort)
 
 
 def _agent_result(thread_id: str, text: str, *, returncode: int = 0) -> AgentRun:
@@ -242,11 +246,11 @@ def _workflow(
     tmp_path: Path,
     *,
     codex: FakeCodex | None = None,
-    git: FakeGit | None = None,
+    git: GitT | None = None,
     publisher: FakePublisher | None = None,
-    gate_runner: object | None = None,
+    gate_runner: GateT | None = None,
     progress: list[str] | None = None,
-) -> tuple[Workflow, FakeCodex, FakeGit, FakeGates]:
+) -> tuple[Workflow, FakeCodex, GitT | FakeGit, GateT | FakeGates]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     spec = tmp_path / "spec.md"
