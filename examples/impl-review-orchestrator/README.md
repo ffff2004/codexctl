@@ -13,12 +13,14 @@ Run it from this directory, with any clean Git checkout as `--cwd`:
 python impl_review.py \
   --cwd /path/to/checkout \
   --spec /path/to/spec.md \
-  --issue https://github.com/owner/repo/issues/19 \
+  [--issue https://github.com/owner/repo/issues/19] \
   --worker-prompt prompts/worker.md \
   --repair-prompt prompts/repair.md \
   --reviewer standards=prompts/reviewers/standards.md \
   --reviewer spec=prompts/reviewers/spec.md \
-  --gate 'uv run pytest'
+  [--publish-review-findings] \
+  --gate 'uv run pytest' \
+  --gate 'uv run pre-commit run --all-files'
 ```
 
 `--worker-prompt`, `--repair-prompt`, and every `--reviewer NAME=PATH` prompt

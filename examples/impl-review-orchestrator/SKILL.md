@@ -16,19 +16,21 @@ Orchestrate the following workflow:
    python impl_review.py \
      --cwd <checkout-root> \
      --spec <spec-file> \
+     [--issue <github-issue-uri>] \
      --worker-prompt prompts/worker.md \
      --repair-prompt prompts/repair.md \
      --reviewer standards=prompts/reviewers/standards.md \
      --reviewer spec=prompts/reviewers/spec.md \
-     --gate '<gate-command>'
+     [--publish-review-findings] \
+     --gate '<gate-command>' \
      --gate '<another-gate-command>'
    ```
 
-   Add one `--gate` argument for each project gate. Add `--issue` when the task has a GitHub issue that should be rendered into prompts or used for publishing findings. The example prompts may be copied and customized when the task needs different worker or reviewer instructions.
+   The `--issue` and `--publish-review-findings` arguments are optional; the latter requires the former. Add `--issue` and `--publish-review-findings` when the task has a related GitHub issue. Add one `--gate` argument for each project gate. The example prompts may be copied and customized when the task needs different worker or reviewer instructions.
 
    For each implementation or repair round, `impl_review.py` will:
 
-   1. Start a new worker thread. The worker should run gates as appropriate and explain any gate it did not run or that failed. The worker must leave changes unstaged and must not commit, merge, create a worktree, or clean up files. The script verifies that the worker did not change the branch, HEAD, or staged Git state.
+   1. Start a new worker thread. The worker should run gates as appropriate and explain any gate it did not run or that failed. The script verifies that the worker did not change the branch, HEAD, or staged Git state.
    2. Start reviewers concurrently and reuse reviewer threads by reviewer name across rounds. Reviewers receive the complete unstaged diff.
    3. If a reviewer returns `verdict=None` or another ambiguous result, resume the run with `--decision retry`. The script prefers the just-failed thread and sends `output VERDICT: PASS|FAIL` for one retry turn.
    4. If the review fails, the script stages the current changes with `git add --all` before starting the next repair round, then starts a fresh worker. The first failed round automatically starts round two. If round two still fails, pause and report the findings; `start-next-round` can be used to continue manually beyond two rounds.
@@ -48,5 +50,5 @@ Orchestrate the following workflow:
    ```
 
    Only after every reviewer passes does the script enter the final gate phase. It runs the configured gates sequentially on the final checkout. On the normal successful path, each gate is executed once by the orchestrator; an explicit `retry` after a failed gate is failure recovery. The script finishes in `READY_FOR_HANDOFF` when the workflow is ready for the caller's handoff steps.
-4. After the final review passes, let `impl_review.py` run the project gates once. Confirm that they pass, or report the failure reason and pause.
-5. Commit the changes.
+
+4. Commit the changes.
