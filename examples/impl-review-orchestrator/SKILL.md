@@ -8,12 +8,15 @@ Orchestrate the following workflow:
 
 1. If the requirements are ambiguous, use `grilling` to question the user until the spec is clear. Make the in-scope and out-of-scope behavior explicit so the implementation does not expand beyond the request. After reaching agreement, pause and wait for the user's confirmation.
 2. If designing a new module or public interface is necessary, use `codebase-design` to start sub-agents and present the available design options. If the design already exists or can be determined simply, explain why this step can be skipped. Pause and wait for design confirmation before continuing.
-3. Run the following implement-review-stage loop with `impl_review.py`. Run two rounds autonomously; if the second review still fails, report the review findings and pause.
+3. Run the following implement-review-stage loop with `impl_review.py`. Run two rounds autonomously; if the second review still fails, report the review findings, tell the user that `start-next-round` creates another repair round and `accept` continues to gates, and pause.
 
    Run the script with the provided example prompts:
 
+   See the [README.md](README.md) for additional usage details.
+
    ```sh
    python impl_review.py \
+     --json \
      --cwd <checkout-root> \
      --spec <spec-file> \
      [--issue <github-issue-uri>] \
@@ -25,6 +28,8 @@ Orchestrate the following workflow:
      --gate '<gate-command>' \
      --gate '<another-gate-command>'
    ```
+
+   If waiting by polling, use the maximum polling interval.
 
    The `--issue` and `--publish-review-findings` arguments are optional; the latter requires the former. Add `--issue` and `--publish-review-findings` when the task has a related GitHub issue. Add one `--gate` argument for each project gate. The example prompts may be copied and customized when the task needs different worker or reviewer instructions.
 
