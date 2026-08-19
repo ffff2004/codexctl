@@ -20,14 +20,15 @@ from codexctl.appserver import (
     REQUIRED_LIFECYCLE_OPERATIONS,
     UNSUPPORTED_INTERACTION_METHOD,
     AppServerTurn,
+    JsonlStdioMessageTransport,
     JsonRpcAppServerSession,
     JsonRpcError,
-    StdioFrameTransport,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
-    _decode_frame,
-    _launch_stdio_transport,
+    _decode_message,
+    _launch_stdio_process,
+    _OwnedStdioProcess,
     connect_endpoint,
     parse_user_agent_version,
     project_item,
@@ -35,7 +36,13 @@ from codexctl.appserver import (
     project_response,
     project_thread_status,
 )
-from codexctl.endpoint import AppServerEndpoint, StdioTarget, TcpTarget, UnixTarget
+from codexctl.endpoint import (
+    AppServerEndpoint,
+    StdioProtocol,
+    StdioTarget,
+    TcpTarget,
+    UnixTarget,
+)
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -44,6 +51,100 @@ from codexctl.model import (
     SandboxPolicy,
     StartConfig,
 )
+
+
+def _stdio_websocket_proxy_source(
+    *,
+    initialize_action: str = (
+        "send_text(json.dumps({'id': value['id'], 'result': "
+        "{'userAgent': 'proxy/2.0'}}))"
+    ),
+    initialized_action: str = "pass",
+    after_handshake: str = "pass",
+    termination_marker: bool = False,
+) -> str:
+    signal_setup = ""
+    if termination_marker:
+        signal_setup = (
+            "def stop(signum, frame):\n"
+            "    pathlib.Path(sys.argv[-1]).write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+        )
+    return (
+        "import base64, hashlib, json, pathlib, signal, struct, sys, time\n"
+        f"{signal_setup}"
+        "def read_exact(size):\n"
+        "    value = b''\n"
+        "    while len(value) < size:\n"
+        "        chunk = sys.stdin.buffer.read(size - len(value))\n"
+        "        if not chunk:\n"
+        "            raise EOFError\n"
+        "        value += chunk\n"
+        "    return value\n"
+        "def read_frame():\n"
+        "    first, second = read_exact(2)\n"
+        "    length = second & 127\n"
+        "    if length == 126:\n"
+        "        length = struct.unpack('!H', read_exact(2))[0]\n"
+        "    elif length == 127:\n"
+        "        length = struct.unpack('!Q', read_exact(8))[0]\n"
+        "    mask = read_exact(4) if second & 128 else None\n"
+        "    data = read_exact(length)\n"
+        "    if mask:\n"
+        "        data = bytes(value ^ mask[index % 4] for index, value in enumerate(data))\n"
+        "    return first & 15, bool(first & 128), data\n"
+        "def send_frame(opcode, data, final=True):\n"
+        "    length = len(data)\n"
+        "    header = bytes([(128 if final else 0) | opcode])\n"
+        "    if length < 126:\n"
+        "        header += bytes([length])\n"
+        "    elif length < 65536:\n"
+        "        header += bytes([126]) + struct.pack('!H', length)\n"
+        "    else:\n"
+        "        header += bytes([127]) + struct.pack('!Q', length)\n"
+        "    sys.stdout.buffer.write(header + data)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "def send_text(data):\n"
+        "    send_frame(1, data.encode())\n"
+        "request = b''\n"
+        "while not request.endswith(b'\\r\\n\\r\\n'):\n"
+        "    request += read_exact(1)\n"
+        "headers = {line.split(b':', 1)[0].lower(): line.split(b':', 1)[1].strip()\n"
+        "           for line in request.split(b'\\r\\n')[1:] if b':' in line}\n"
+        "assert request.startswith(b'GET / HTTP/1.1\\r\\n')\n"
+        "assert b'sec-websocket-extensions' not in headers\n"
+        "accept = base64.b64encode(hashlib.sha1(\n"
+        "    headers[b'sec-websocket-key'] + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'\n"
+        ").digest())\n"
+        "sys.stdout.buffer.write(\n"
+        "    b'HTTP/1.1 101 Switching Protocols\\r\\n'\n"
+        "    b'Upgrade: websocket\\r\\nConnection: Upgrade\\r\\n'\n"
+        "    b'Sec-WebSocket-Accept: ' + accept + b'\\r\\n\\r\\n'\n"
+        ")\n"
+        "sys.stdout.buffer.flush()\n"
+        f"{after_handshake}\n"
+        "message = b''\n"
+        "while True:\n"
+        "    opcode, final, data = read_frame()\n"
+        "    if opcode == 8:\n"
+        "        send_frame(8, data)\n"
+        "        break\n"
+        "    if opcode == 1:\n"
+        "        message = data\n"
+        "    elif opcode == 0:\n"
+        "        message += data\n"
+        "    else:\n"
+        "        continue\n"
+        "    if not final:\n"
+        "        continue\n"
+        "    value = json.loads(message)\n"
+        "    if value.get('method') == 'initialize':\n"
+        f"        {initialize_action}\n"
+        "    elif value.get('method') == 'initialized':\n"
+        f"        {initialized_action}\n"
+        "    message = b''\n"
+    )
 
 
 class TestProjectThreadStatus:
@@ -335,11 +436,11 @@ class TestStrictFraming:
     )
     def test_invalid_frames_are_protocol_errors(self, frame):
         with pytest.raises(CodexCtlError) as excinfo:
-            _decode_frame(frame)
+            _decode_message(frame)
         assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
 
     def test_valid_json_object_does_not_require_jsonrpc_header(self):
-        assert _decode_frame('{"method":"initialize","id":1}') == {
+        assert _decode_message('{"method":"initialize","id":1}') == {
             "method": "initialize",
             "id": 1,
         }
@@ -348,14 +449,13 @@ class TestStrictFraming:
         stdout = asyncio.StreamReader()
         stdout.feed_data(b'\n  \r\n{"first": 1}\r\n{"last": 2}')
         stdout.feed_eof()
-        process = cast(
-            asyncio.subprocess.Process,
-            SimpleNamespace(stdout=stdout),
+        process = _OwnedStdioProcess(
+            cast(asyncio.subprocess.Process, SimpleNamespace(stdout=stdout))
         )
 
-        transport = StdioFrameTransport(process)
+        transport = JsonlStdioMessageTransport(process)
 
-        assert [frame async for frame in transport.frames()] == [
+        assert [message async for message in transport.messages()] == [
             '{"first": 1}',
             '{"last": 2}',
         ]
@@ -368,7 +468,7 @@ class TestStrictFraming:
             async def send_text(self, payload):
                 pass
 
-            async def frames(self):
+            async def messages(self):
                 yield "{malformed"
 
             async def close(self):
@@ -404,6 +504,293 @@ class TestStrictFraming:
             assert adapter.app_server_version == "1.0"
         finally:
             await adapter.close()
+
+    async def test_stdio_websocket_proxy_upgrades_and_routes_messages(
+        self, tmp_path, stdio_endpoint
+    ):
+        pong = tmp_path / "pong"
+        endpoint = stdio_endpoint(
+            """
+import base64, hashlib, json, pathlib, struct, sys
+
+pong = pathlib.Path(sys.argv[-1])
+
+def read_exact(size):
+    value = b""
+    while len(value) < size:
+        chunk = sys.stdin.buffer.read(size - len(value))
+        if not chunk:
+            raise EOFError
+        value += chunk
+    return value
+
+def read_frame():
+    first, second = read_exact(2)
+    length = second & 127
+    if length == 126:
+        length = struct.unpack("!H", read_exact(2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", read_exact(8))[0]
+    mask = read_exact(4) if second & 128 else None
+    data = read_exact(length)
+    if mask:
+        data = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+    return first & 15, bool(first & 128), data
+
+def send_frame(opcode, data, final=True):
+    length = len(data)
+    header = bytes([(128 if final else 0) | opcode])
+    if length < 126:
+        header += bytes([length])
+    elif length < 65536:
+        header += bytes([126]) + struct.pack("!H", length)
+    else:
+        header += bytes([127]) + struct.pack("!Q", length)
+    sys.stdout.buffer.write(header + data)
+    sys.stdout.buffer.flush()
+
+def send_text(data):
+    payload = data.encode()
+    split = max(1, len(payload) // 2)
+    send_frame(1, payload[:split], False)
+    send_frame(0, payload[split:])
+
+request = b""
+while not request.endswith(b"\\r\\n\\r\\n"):
+    request += read_exact(1)
+headers = {
+    line.split(b":", 1)[0].lower(): line.split(b":", 1)[1].strip()
+    for line in request.split(b"\\r\\n")[1:]
+    if b":" in line
+}
+assert request.startswith(b"GET / HTTP/1.1\\r\\n")
+assert b"sec-websocket-extensions" not in headers
+accept = base64.b64encode(hashlib.sha1(
+    headers[b"sec-websocket-key"] + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+).digest())
+sys.stdout.buffer.write(
+    b"HTTP/1.1 101 Switching Protocols\\r\\n"
+    b"Upgrade: websocket\\r\\n"
+    b"Connection: Upgrade\\r\\n"
+    b"Sec-WebSocket-Accept: " + accept + b"\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+
+message = b""
+message_opcode = None
+while True:
+    opcode, final, data = read_frame()
+    if opcode == 10:
+        if data == b"ping-check":
+            pong.write_text("seen", encoding="utf-8")
+        continue
+    if opcode == 8:
+        send_frame(8, data)
+        break
+    if opcode == 1:
+        message_opcode = opcode
+        message = data
+    elif opcode == 0:
+        message += data
+    else:
+        continue
+    if not final:
+        continue
+    value = json.loads(message)
+    if value.get("method") == "initialize":
+        send_text(json.dumps({"id": value["id"], "result": {
+            "userAgent": "proxy/2.0"
+        }}))
+        send_frame(9, b"ping-check")
+    elif value.get("method") == "thread/list":
+        send_text(json.dumps({"id": value["id"], "result": {"data": []}}))
+    message = b""
+""",
+            str(pong),
+            filename="stdio-websocket-proxy.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+
+        adapter = await connect_endpoint(endpoint)
+        try:
+            assert adapter.app_server_version == "2.0"
+            assert (await adapter.list_threads()).threads == []
+        finally:
+            await adapter.close()
+
+        assert pong.read_text(encoding="utf-8") == "seen"
+
+    async def test_stdio_websocket_malformed_upgrade_is_unavailable(
+        self, stdio_endpoint
+    ):
+        endpoint = stdio_endpoint(
+            "import sys\n"
+            "sys.stdin.buffer.read(1)\n"
+            "sys.stdout.buffer.write(b'not an HTTP response')\n"
+            "sys.stdout.buffer.flush()\n",
+            filename="stdio-websocket-bad-upgrade.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await connect_endpoint(endpoint, timeout=0.5)
+
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+
+    @pytest.mark.parametrize(
+        ("opcode", "payload"),
+        [(2, b"{}"), (1, b"{malformed"), (1, b"\xff")],
+    )
+    async def test_stdio_websocket_invalid_messages_are_protocol_errors(
+        self, stdio_endpoint, opcode, payload
+    ):
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                initialized_action=f"send_frame({opcode}, {payload!r})"
+            ),
+            filename="stdio-websocket-invalid-message.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+
+        adapter = await connect_endpoint(endpoint)
+        try:
+            with pytest.raises(CodexCtlError) as excinfo:
+                await adapter.list_threads()
+            assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+        finally:
+            await adapter.close()
+
+    async def test_stdio_websocket_eof_is_runtime_protocol_error(self, stdio_endpoint):
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(initialized_action="raise SystemExit(0)"),
+            filename="stdio-websocket-eof.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+
+        adapter = await connect_endpoint(endpoint)
+        try:
+            with pytest.raises(CodexCtlError) as excinfo:
+                await adapter.list_threads()
+            assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+        finally:
+            await adapter.close()
+
+    async def test_stdio_websocket_framing_failure_is_protocol_error(
+        self, stdio_endpoint
+    ):
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                initialized_action=(
+                    "sys.stdout.buffer.write(b'\\xc1\\x00'); sys.stdout.buffer.flush()"
+                )
+            ),
+            filename="stdio-websocket-framing-failure.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+
+        adapter = await connect_endpoint(endpoint)
+        try:
+            with pytest.raises(CodexCtlError) as excinfo:
+                await asyncio.wait_for(adapter.list_threads(), timeout=0.5)
+            assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+        finally:
+            await adapter.close()
+
+    async def test_stdio_websocket_startup_timeout_cleans_up_child(
+        self, tmp_path, stdio_endpoint, monkeypatch
+    ):
+        ready = tmp_path / "websocket-timeout.ready"
+        terminated = tmp_path / "websocket-timeout.terminated"
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                initialize_action="pass",
+                after_handshake=(
+                    "pathlib.Path(sys.argv[-2]).write_text('ready')\ntime.sleep(60)"
+                ),
+                termination_marker=True,
+            ),
+            str(ready),
+            str(terminated),
+            filename="stdio-websocket-timeout.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await connect_endpoint(endpoint, timeout=0.5)
+
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+        assert ready.read_text(encoding="utf-8") == "ready"
+        for _ in range(100):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
+
+    async def test_stdio_websocket_cancellation_cleans_up_child(
+        self, tmp_path, stdio_endpoint, monkeypatch
+    ):
+        ready = tmp_path / "websocket-cancel.ready"
+        terminated = tmp_path / "websocket-cancel.terminated"
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                initialize_action="pass",
+                after_handshake=(
+                    "pathlib.Path(sys.argv[-2]).write_text('ready')\ntime.sleep(60)"
+                ),
+                termination_marker=True,
+            ),
+            str(ready),
+            str(terminated),
+            filename="stdio-websocket-cancel.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+
+        task = asyncio.create_task(connect_endpoint(endpoint, timeout=5.0))
+        for _ in range(100):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert ready.read_text(encoding="utf-8") == "ready"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(100):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
+
+    async def test_stdio_websocket_cleanup_does_not_wait_for_close_handshake(
+        self, tmp_path, stdio_endpoint, monkeypatch
+    ):
+        terminated = tmp_path / "websocket-cleanup.terminated"
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                initialized_action="time.sleep(60)",
+                termination_marker=True,
+            ),
+            str(tmp_path / "unused"),
+            str(terminated),
+            filename="stdio-websocket-cleanup.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+
+        adapter = await connect_endpoint(endpoint)
+        await asyncio.wait_for(adapter.close(), timeout=0.5)
+
+        for _ in range(100):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_preinitialize_exit_is_unavailable(self, stdio_endpoint):
         endpoint = stdio_endpoint("raise SystemExit(0)\n", filename="stdio-exit.py")
@@ -591,8 +978,8 @@ class TestStrictFraming:
         endpoint = stdio_endpoint(
             "import time\ntime.sleep(60)\n", filename="stdio-hang.py"
         )
-        monkeypatch.setattr(StdioFrameTransport, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(StdioFrameTransport, "_TERMINATE_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_endpoint(endpoint, timeout=0.05)
@@ -611,12 +998,12 @@ class TestStrictFraming:
             "        time.sleep(60)\n",
             filename="stdio-running.py",
         )
-        monkeypatch.setattr(StdioFrameTransport, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(StdioFrameTransport, "_TERMINATE_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         adapter = await connect_endpoint(endpoint)
         transport = adapter._transport
-        assert isinstance(transport, StdioFrameTransport)
+        assert isinstance(transport, JsonlStdioMessageTransport)
         process = transport._process
         await adapter.close()
 
@@ -653,8 +1040,8 @@ class TestStrictFraming:
             str(marker),
             filename="stdio-descendant.py",
         )
-        monkeypatch.setattr(StdioFrameTransport, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(StdioFrameTransport, "_TERMINATE_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         adapter = await connect_endpoint(endpoint)
         await adapter.close()
@@ -685,8 +1072,8 @@ class TestStrictFraming:
                 await release.wait()
             return transport
 
-        monkeypatch.setattr(StdioFrameTransport, "launch", launch)
-        task = asyncio.create_task(_launch_stdio_transport(("app-server",)))
+        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
+        task = asyncio.create_task(_launch_stdio_process(("app-server",)))
         await started.wait()
         task.cancel()
         release.set()
@@ -709,8 +1096,8 @@ class TestStrictFraming:
                 await release.wait()
             return SimpleNamespace(close=lambda: None)
 
-        monkeypatch.setattr(StdioFrameTransport, "launch", launch)
-        task = asyncio.create_task(_launch_stdio_transport(("app-server",)))
+        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
+        task = asyncio.create_task(_launch_stdio_process(("app-server",)))
         await started.wait()
         task.cancel()
 
@@ -751,10 +1138,10 @@ class TestStrictFraming:
             return raw_transport, protocol
 
         monkeypatch.setattr(loop, "subprocess_exec", delayed_subprocess_exec)
-        monkeypatch.setattr(StdioFrameTransport, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(StdioFrameTransport, "_TERMINATE_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
         task = asyncio.create_task(
-            _launch_stdio_transport(
+            _launch_stdio_process(
                 (sys.executable, "-c", source, str(ready), str(terminated))
             )
         )
@@ -800,7 +1187,7 @@ class TestStrictFraming:
             async def send_text(self, _payload):
                 pass
 
-            async def frames(self):
+            async def messages(self):
                 await asyncio.Future()
                 yield "{}"
 
@@ -816,7 +1203,7 @@ class TestStrictFraming:
             initialized.set()
             await asyncio.Future()
 
-        monkeypatch.setattr(StdioFrameTransport, "launch", launch)
+        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
         monkeypatch.setattr(JsonRpcAppServerSession, "_initialize", initialize)
         endpoint = AppServerEndpoint("stdio", StdioTarget(("app-server",)))
         task = asyncio.create_task(connect_endpoint(endpoint))

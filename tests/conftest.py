@@ -25,6 +25,7 @@ from codexctl.appserver import (
 from codexctl.endpoint import (
     AppServerEndpoint,
     StdioEndpointAdapter,
+    StdioProtocol,
     StdioTarget,
     UnixTarget,
 )
@@ -265,12 +266,13 @@ def stdio_endpoint(tmp_path):
         source: str,
         *args: str,
         filename: str = "stdio-server.py",
+        protocol: StdioProtocol = StdioProtocol.JSONL,
     ) -> AppServerEndpoint:
         script = tmp_path / filename
         script.write_text(source, encoding="utf-8")
         return AppServerEndpoint(
             "stdio",
-            StdioTarget((sys.executable, str(script), *args)),
+            StdioTarget((sys.executable, str(script), *args), protocol),
         )
 
     return make_endpoint

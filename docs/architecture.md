@@ -127,8 +127,10 @@ detail and is opaque to [core.py](../src/codexctl/core.py):
   performs no lifecycle mutation. Its resolved target is transport-private;
   token contents are never part of the resolved endpoint.
 - `StdioEndpointAdapter` resolves `display="stdio"` plus an exact argv tuple
-  without launching anything. `StdioFrameTransport` owns the child process
-  for a connection; its externally visible mode contract is defined in
+  and a `StdioProtocol` selector without launching anything. The private
+  `_OwnedStdioProcess` owns the child process for a connection; JSONL and
+  WebSocket stdio transports share that lifecycle. Their externally visible
+  mode contract is defined in
   [reference.md — Runtime resolution](reference.md#runtime-resolution).
 
 The port also carries a best-effort `probe_cli_version()` used by doctor;
@@ -153,12 +155,15 @@ Transport and session facts (verified against the Codex source):
   (`clientInfo`, `capabilities: {experimentalApi: false}`) followed by the
   `initialized` notification before any other traffic.
 
-A shared JSON-RPC session sits above the raw-frame transports
-`WebSocketFrameTransport` and `StdioFrameTransport`. The session owns frame
-decoding, pending-request routing, notification projection, and
-server-initiated request handling. The public framing and failure contract is
-defined in [reference.md — Runtime resolution](reference.md#runtime-resolution),
-and the unattended interaction policy is defined in
+A shared JSON-RPC session sits above the message transports
+`WebSocketMessageTransport` and `JsonlStdioMessageTransport`. The session owns
+JSON decoding, pending-request routing, notification projection, and
+server-initiated request handling. `StdioWebSocketConnection` drives the
+WebSocket Sans-I/O client over `_RawByteStream`; it performs the fixed
+`ws://localhost/` Upgrade, disables compression, handles control frames and
+fragmentation, and exposes only complete text or binary messages. The public
+framing and failure contract is defined in
+[reference.md — Runtime resolution](reference.md#runtime-resolution), and the unattended interaction policy is defined in
 [reference.md — Unattended operation](reference.md#unattended-operation).
 The adapter also probes the required lifecycle RPC surface for `doctor` using
 sentinel requests; method-not-found responses are reported as unavailable,

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from conftest import FakeAppServer, make_ctl
 
-from codexctl.appserver import StdioFrameTransport
+from codexctl.appserver import JsonlStdioMessageTransport
 from codexctl.cli import (
     _OUTPUT_MATRIX,
     EXIT_DOMAIN,
@@ -32,7 +32,7 @@ from codexctl.cli import (
     main,
 )
 from codexctl.core import CodexCtl
-from codexctl.endpoint import StdioEndpointAdapter, StdioTarget
+from codexctl.endpoint import StdioEndpointAdapter, StdioProtocol, StdioTarget
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -119,13 +119,13 @@ class TestStdioExecution:
         self, stdio_adapter, capsys, monkeypatch
     ):
         endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="cleanup.py")
-        original_close = StdioFrameTransport.close
+        original_close = JsonlStdioMessageTransport.close
 
         async def close_then_fail(transport):
             await original_close(transport)
             raise RuntimeError("cleanup failed")
 
-        monkeypatch.setattr(StdioFrameTransport, "close", close_then_fail)
+        monkeypatch.setattr(JsonlStdioMessageTransport, "close", close_then_fail)
 
         code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
 
@@ -373,6 +373,53 @@ class TestUsageErrors:
         assert isinstance(endpoint, StdioEndpointAdapter)
         assert endpoint.mode == "stdio"
         assert endpoint._target == StdioTarget(("app-server", "--child-flag", "value"))
+
+    def test_stdio_websocket_protocol_is_recorded_on_the_target(self):
+        args = build_parser().parse_args(
+            [
+                "list",
+                "--stdio-exec",
+                "codex",
+                "--stdio-protocol",
+                "websocket",
+                "--stdio-arg",
+                "app-server",
+                "--stdio-arg",
+                "proxy",
+            ]
+        )
+
+        endpoint = _select_endpoint(args)
+
+        assert endpoint._target == StdioTarget(
+            ("codex", "app-server", "proxy"), StdioProtocol.WEBSOCKET
+        )
+
+    def test_stdio_websocket_protocol_requires_an_executable(self, capsys):
+        assert main(["list", "--stdio-protocol", "websocket"]) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_stdio_websocket_protocol_is_not_silently_external(self, capsys):
+        assert (
+            main(
+                [
+                    "list",
+                    "--stdio-protocol",
+                    "websocket",
+                    "--endpoint",
+                    "ws://localhost:1",
+                ]
+            )
+            == EXIT_USAGE
+        )
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_stdio_exec_help_describes_both_protocols(self, capsys):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["list", "--help"])
+        help_text = capsys.readouterr().out
+        assert "selected stdio protocol" in help_text
+        assert "newline-delimited JSON" not in help_text
 
     def test_stdio_literal_double_dash_can_precede_prompt_delimiter(self):
         args = build_parser().parse_args(

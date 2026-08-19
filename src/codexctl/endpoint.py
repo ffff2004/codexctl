@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -46,11 +47,19 @@ class TcpTarget:
     token_file: Path | None
 
 
+class StdioProtocol(StrEnum):
+    """Wire protocol spoken over a child process's stdin/stdout pipes."""
+
+    JSONL = "jsonl"
+    WEBSOCKET = "websocket"
+
+
 @dataclass(frozen=True)
 class StdioTarget:
     """Exact argv for a one-shot stdio app-server process."""
 
     argv: tuple[str, ...]
+    protocol: StdioProtocol = StdioProtocol.JSONL
 
 
 # Endpoint URLs are locations, never credential carriers. Keep this closed
@@ -237,8 +246,13 @@ class StdioEndpointAdapter:
 
     mode = "stdio"
 
-    def __init__(self, executable: str, args: tuple[str, ...] = ()) -> None:
-        self._target = StdioTarget((executable, *args))
+    def __init__(
+        self,
+        executable: str,
+        args: tuple[str, ...] = (),
+        protocol: StdioProtocol = StdioProtocol.JSONL,
+    ) -> None:
+        self._target = StdioTarget((executable, *args), protocol)
 
     async def resolve(self) -> AppServerEndpoint:
         # Resolution is deliberately side-effect free. The connection adapter

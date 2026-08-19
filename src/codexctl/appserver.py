@@ -267,15 +267,15 @@ class AppServerPort(Protocol):
     async def close(self) -> None: ...
 
 
-type Frame = str | bytes
+type AppServerMessage = str | bytes
 
 
-class _FrameTransport(Protocol):
+class _AppServerMessageTransport(Protocol):
     """Raw message transport below JSON decoding."""
 
     async def send_text(self, payload: str) -> None: ...
 
-    def frames(self) -> AsyncIterator[Frame]: ...
+    def messages(self) -> AsyncIterator[AppServerMessage]: ...
 
     async def close(self) -> None: ...
 
@@ -283,7 +283,7 @@ class _FrameTransport(Protocol):
 class _WebSocketConnection(Protocol):
     async def send(self, message: str) -> None: ...
 
-    def __aiter__(self) -> AsyncIterator[Frame]: ...
+    def __aiter__(self) -> AsyncIterator[AppServerMessage]: ...
 
     async def close(self) -> None: ...
 
@@ -292,7 +292,7 @@ class _StdioLaunchState:
     """Keep the child handle reachable while subprocess setup is pending."""
 
     def __init__(self) -> None:
-        self.transport: StdioFrameTransport | None = None
+        self.process: _OwnedStdioProcess | None = None
 
     def capture(
         self,
@@ -301,7 +301,7 @@ class _StdioLaunchState:
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         process = asyncio.subprocess.Process(raw_transport, protocol, loop)
-        self.transport = StdioFrameTransport(process)
+        self.process = _OwnedStdioProcess(process)
 
 
 class _CapturingSubprocessStreamProtocol(asyncio.subprocess.SubprocessStreamProtocol):
@@ -317,8 +317,8 @@ class _CapturingSubprocessStreamProtocol(asyncio.subprocess.SubprocessStreamProt
         self._launch_state.capture(transport, self, self._launch_loop)
 
 
-class WebSocketFrameTransport:
-    """Adapt a websockets connection to the raw frame transport seam."""
+class WebSocketMessageTransport:
+    """Adapt a websockets connection to the app-server message seam."""
 
     def __init__(self, conn: _WebSocketConnection) -> None:
         self._conn = conn
@@ -326,19 +326,19 @@ class WebSocketFrameTransport:
     async def send_text(self, payload: str) -> None:
         await self._conn.send(payload)
 
-    async def _frames(self) -> AsyncIterator[Frame]:
-        async for frame in self._conn:
-            yield frame
+    async def _messages(self) -> AsyncIterator[AppServerMessage]:
+        async for message in self._conn:
+            yield message
 
-    def frames(self) -> AsyncIterator[Frame]:
-        return self._frames()
+    def messages(self) -> AsyncIterator[AppServerMessage]:
+        return self._messages()
 
     async def close(self) -> None:
         await self._conn.close()
 
 
-class StdioFrameTransport:
-    """Newline-delimited JSON transport backed by one child process."""
+class _OwnedStdioProcess:
+    """Own one child process and its bounded process-group cleanup."""
 
     _GRACEFUL_WAIT_SECONDS = 1.0
     _TERMINATE_WAIT_SECONDS = 1.0
@@ -350,7 +350,7 @@ class StdioFrameTransport:
     @classmethod
     async def launch(
         cls, argv: tuple[str, ...], state: _StdioLaunchState | None = None
-    ) -> "StdioFrameTransport":
+    ) -> "_OwnedStdioProcess":
         launch_state = state or _StdioLaunchState()
         loop = asyncio.get_running_loop()
 
@@ -376,32 +376,46 @@ class StdioFrameTransport:
                 "cannot start stdio app-server process",
                 cause=exc,
             ) from exc
-        transport = launch_state.transport
-        if transport is None:  # pragma: no cover - loop contract fallback
+        process = launch_state.process
+        if process is None:  # pragma: no cover - loop contract fallback
             raise RuntimeError("stdio subprocess setup returned without a process")
-        return transport
+        return process
 
-    async def send_text(self, payload: str) -> None:
-        stdin = self._process.stdin
-        if stdin is None:
-            raise RuntimeError("stdio app-server stdin is unavailable")
-        stdin.write(payload.encode("utf-8") + b"\n")
-        await stdin.drain()
+    async def read(self, size: int) -> bytes:
+        stdout = self._process.stdout
+        if stdout is None:
+            raise RuntimeError("stdio app-server stdout is unavailable")
+        return await stdout.read(size)
 
-    async def _frames(self) -> AsyncIterator[Frame]:
+    @property
+    def returncode(self) -> int | None:
+        return self._process.returncode
+
+    async def read_until(self, separator: bytes) -> bytes:
+        stdout = self._process.stdout
+        if stdout is None:
+            raise RuntimeError("stdio app-server stdout is unavailable")
+        return await stdout.readuntil(separator)
+
+    async def read_lines(self) -> AsyncIterator[bytes]:
         stdout = self._process.stdout
         if stdout is None:
             raise RuntimeError("stdio app-server stdout is unavailable")
         async for line in stdout:
-            line = line.rstrip(b"\r\n")
-            if not line.strip():
-                continue
-            # Keep decoding below the framing seam: the shared decoder rejects
-            # malformed UTF-8 as a protocol error without resynchronizing.
-            yield line.decode("utf-8")
+            yield line
 
-    def frames(self) -> AsyncIterator[Frame]:
-        return self._frames()
+    async def write(self, data: bytes) -> None:
+        stdin = self._process.stdin
+        if stdin is None:
+            raise RuntimeError("stdio app-server stdin is unavailable")
+        stdin.write(data)
+        await stdin.drain()
+
+    def write_nowait(self, data: bytes) -> None:
+        stdin = self._process.stdin
+        if stdin is None:
+            raise RuntimeError("stdio app-server stdin is unavailable")
+        stdin.write(data)
 
     async def close(self) -> None:
         if self._closed:
@@ -411,7 +425,6 @@ class StdioFrameTransport:
         if stdin is not None:
             with contextlib.suppress(Exception):
                 stdin.close()
-                await stdin.wait_closed()
 
         await self._wait(self._GRACEFUL_WAIT_SECONDS)
         # The parent may already have exited while a descendant still holds
@@ -421,8 +434,7 @@ class StdioFrameTransport:
         await self._wait(self._TERMINATE_WAIT_SECONDS)
         if self._group_exists():
             self._signal_group(signal.SIGKILL)
-        with contextlib.suppress(Exception):
-            await self._process.wait()
+            await self._wait(self._TERMINATE_WAIT_SECONDS)
 
     async def _wait(self, timeout: float) -> bool:
         if self._process.returncode is not None:
@@ -447,15 +459,196 @@ class StdioFrameTransport:
         return True
 
 
+class JsonlStdioMessageTransport:
+    """Newline-delimited JSON transport backed by one owned child process."""
+
+    def __init__(self, process: _OwnedStdioProcess) -> None:
+        self._process = process
+        self._stream = _RawByteStream(process)
+
+    async def send_text(self, payload: str) -> None:
+        await self._stream.write(payload.encode("utf-8") + b"\n")
+
+    async def _messages(self) -> AsyncIterator[AppServerMessage]:
+        async for line in self._stream.lines():
+            line = line.rstrip(b"\r\n")
+            if not line.strip():
+                continue
+            # Keep decoding below the framing seam: the shared decoder rejects
+            # malformed UTF-8 as a protocol error without resynchronizing.
+            yield line.decode("utf-8")
+
+    def messages(self) -> AsyncIterator[AppServerMessage]:
+        return self._messages()
+
+    async def close(self) -> None:
+        await self._process.close()
+
+
+class _RawByteStream:
+    """Raw byte access to a child process's private stdin/stdout pipes."""
+
+    _READ_SIZE = 64 * 1024
+
+    def __init__(self, process: _OwnedStdioProcess) -> None:
+        self._process = process
+
+    async def read(self, size: int = _READ_SIZE) -> bytes:
+        return await self._process.read(size)
+
+    async def read_until(self, separator: bytes) -> bytes:
+        return await self._process.read_until(separator)
+
+    async def lines(self) -> AsyncIterator[bytes]:
+        async for line in self._process.read_lines():
+            yield line
+
+    async def write(self, data: bytes) -> None:
+        await self._process.write(data)
+
+    def write_nowait(self, data: bytes) -> None:
+        self._process.write_nowait(data)
+
+
+class StdioWebSocketConnection:
+    """Sans-I/O WebSocket client running over an owned stdio byte stream."""
+
+    _HTTP_RESPONSE_LIMIT = 64 * 1024
+
+    def __init__(self, process: _OwnedStdioProcess) -> None:
+        from websockets.uri import parse_uri
+
+        try:
+            from websockets.client import ClientProtocol
+        except ImportError:  # websockets 13.x named this Sans-I/O class differently
+            from websockets.client import ClientConnection as ClientProtocol
+
+        self._process = process
+        self._stream = _RawByteStream(process)
+        self._protocol = ClientProtocol(
+            parse_uri("ws://localhost/"),
+            extensions=None,
+            subprotocols=None,
+            max_size=None,
+        )
+        self._handshake_complete = False
+        self._closed = False
+
+    @classmethod
+    async def connect(cls, process: _OwnedStdioProcess) -> "StdioWebSocketConnection":
+        connection = cls(process)
+        try:
+            await connection._handshake()
+        except BaseException:
+            await _close_owned_process(process)
+            raise
+        return connection
+
+    async def _handshake(self) -> None:
+        request = self._protocol.connect()
+        await self._stream.write(request.serialize())
+        raw_response = await self._stream.read_until(b"\r\n\r\n")
+        if len(raw_response) > self._HTTP_RESPONSE_LIMIT:
+            raise ValueError("WebSocket handshake response is too large")
+        response = _parse_stdio_websocket_response(raw_response)
+        self._protocol.process_response(response)
+        # The Sans-I/O client normally transitions this state from its parser;
+        # the raw HTTP response is parsed by _RawByteStream instead.
+        from websockets.protocol import OPEN
+
+        self._protocol.state = OPEN
+        # The regular client parser consumes the HTTP response itself. Since
+        # the byte stream parses that response, restart it at the WebSocket
+        # frame parser before accepting application traffic.
+        self._protocol.parser = self._protocol.parse()
+        next(self._protocol.parser)
+        self._handshake_complete = True
+
+    async def send(self, message: str) -> None:
+        if self._closed:
+            raise RuntimeError("stdio WebSocket connection is closed")
+        self._protocol.send_text(message.encode("utf-8"))
+        await self._flush()
+
+    async def _flush(self) -> None:
+        for data in self._protocol.data_to_send():
+            # websockets uses b"" as a transport-level EOF marker. Closing
+            # the owned process is the bounded stdio equivalent.
+            if data:
+                await self._stream.write(data)
+
+    def _flush_nowait(self) -> None:
+        for data in self._protocol.data_to_send():
+            if data:
+                self._stream.write_nowait(data)
+
+    async def _messages(self) -> AsyncIterator[AppServerMessage]:
+        message_opcode: object | None = None
+        message_data = bytearray()
+        while True:
+            data = await self._stream.read()
+            if not data:
+                self._protocol.receive_eof()
+                self._flush_nowait()
+                if self._protocol.parser_exc is not None:
+                    raise self._protocol.parser_exc
+                raise EOFError("stdio WebSocket stream closed")
+
+            self._protocol.receive_data(data)
+            if self._protocol.parser_exc is not None:
+                self._flush_nowait()
+                raise self._protocol.parser_exc
+            await self._flush()
+
+            for event in self._protocol.events_received():
+                # The handshake is parsed outside the Sans-I/O parser, so
+                # post-upgrade events are WebSocket frames. Keep the runtime
+                # narrowing local to this compatibility module.
+                frame: Any = event
+                if frame.opcode == 8:  # CLOSE
+                    return
+                if frame.opcode == 1 or frame.opcode == 2:  # TEXT or BINARY
+                    message_opcode = frame.opcode
+                    message_data = bytearray(frame.data)
+                elif frame.opcode == 0 and message_opcode is not None:  # CONT
+                    message_data.extend(frame.data)
+                else:
+                    continue
+
+                if not frame.fin:
+                    continue
+                if message_opcode == 1:  # TEXT
+                    yield bytes(message_data).decode("utf-8")
+                else:
+                    yield bytes(message_data)
+                message_opcode = None
+                message_data.clear()
+
+    def __aiter__(self) -> AsyncIterator[AppServerMessage]:
+        return self._messages()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._handshake_complete:
+            with contextlib.suppress(Exception):
+                self._protocol.send_close()
+                self._flush_nowait()
+        await self._process.close()
+
+
 class JsonRpcAppServerSession:
-    """Shared JSON-RPC session over a transport-specific frame stream.
+    """Shared JSON-RPC session over a transport-specific message stream.
 
     Transport setup is intentionally outside this session implementation so
     Unix and TCP endpoints share reader routing, projection, and the
     unattended interaction policy.
     """
 
-    def __init__(self, transport: _FrameTransport | None, display: str) -> None:
+    def __init__(
+        self, transport: _AppServerMessageTransport | None, display: str
+    ) -> None:
         self._transport = transport
         self._display = display
         self._pending: dict[int, asyncio.Future[dict]] = {}
@@ -671,8 +864,8 @@ class JsonRpcAppServerSession:
         try:
             if self._transport is None:
                 raise RuntimeError("app-server transport is unavailable")
-            async for frame in self._transport.frames():
-                message = _decode_frame(frame)
+            async for raw_message in self._transport.messages():
+                message = _decode_message(raw_message)
                 if "method" in message:
                     if "id" in message:
                         await self._handle_server_request(message)
@@ -768,7 +961,7 @@ async def connect_endpoint(
     """Connect one resolved endpoint without exposing transport to callers."""
     # Delayed import avoids an endpoint -> appserver import cycle during
     # managed-runtime probing.
-    from .endpoint import StdioTarget, TcpTarget, UnixTarget
+    from .endpoint import StdioProtocol, StdioTarget, TcpTarget, UnixTarget
 
     target = endpoint.target
     adapter: JsonRpcAppServerSession | None = None
@@ -782,7 +975,7 @@ async def connect_endpoint(
                 conn = await unix_connect(
                     str(target.path), max_size=None, compression=None
                 )
-                transport: _FrameTransport = WebSocketFrameTransport(conn)
+                transport: _AppServerMessageTransport = WebSocketMessageTransport(conn)
             elif isinstance(target, TcpTarget):
                 from websockets.asyncio.client import connect
 
@@ -796,9 +989,15 @@ async def connect_endpoint(
                     max_size=None,
                     compression=None,
                 )
-                transport = WebSocketFrameTransport(conn)
+                transport = WebSocketMessageTransport(conn)
             elif isinstance(target, StdioTarget):
-                transport = await _launch_stdio_transport(target.argv)
+                process = await _launch_stdio_process(target.argv)
+                if target.protocol is StdioProtocol.WEBSOCKET:
+                    transport = WebSocketMessageTransport(
+                        await StdioWebSocketConnection.connect(process)
+                    )
+                else:
+                    transport = JsonlStdioMessageTransport(process)
             else:  # pragma: no cover - targets are a closed endpoint vocabulary
                 raise RuntimeError("unknown app-server endpoint target")
 
@@ -829,10 +1028,10 @@ async def connect_endpoint(
     return adapter
 
 
-async def _launch_stdio_transport(argv: tuple[str, ...]) -> StdioFrameTransport:
+async def _launch_stdio_process(argv: tuple[str, ...]) -> _OwnedStdioProcess:
     """Launch stdio without making cancellation wait for process creation."""
     state = _StdioLaunchState()
-    launch_task = asyncio.create_task(StdioFrameTransport.launch(argv, state))
+    launch_task = asyncio.create_task(_OwnedStdioProcess.launch(argv, state))
     try:
         return await asyncio.shield(launch_task)
     except BaseException:
@@ -841,7 +1040,7 @@ async def _launch_stdio_transport(argv: tuple[str, ...]) -> StdioFrameTransport:
         # not let stalled process setup extend the startup deadline.
         launch_task.cancel()
         try:
-            transport = await asyncio.wait_for(
+            process = await asyncio.wait_for(
                 asyncio.shield(launch_task), _STDIO_LAUNCH_DRAIN_SECONDS
             )
         except asyncio.TimeoutError:
@@ -851,27 +1050,27 @@ async def _launch_stdio_transport(argv: tuple[str, ...]) -> StdioFrameTransport:
         except BaseException:
             await _close_stdio_launch(state)
         else:
-            await _close_stdio_transport(transport)
+            await _close_owned_process(process)
         raise
 
 
 _STDIO_LAUNCH_DRAIN_SECONDS = 0.1
 
 
-async def _close_stdio_transport(transport: StdioFrameTransport) -> None:
+async def _close_owned_process(process: _OwnedStdioProcess) -> None:
     """Close a transport from a cancelled launch without leaking exceptions."""
     with contextlib.suppress(BaseException):
-        await transport.close()
+        await process.close()
 
 
 async def _close_stdio_launch(state: _StdioLaunchState) -> None:
     """Close a child captured before its transport wrapper was returned."""
-    if state.transport is not None:
-        await _close_stdio_transport(state.transport)
+    if state.process is not None:
+        await _close_owned_process(state.process)
 
 
 def _cleanup_stdio_launch(
-    launch_task: asyncio.Task[StdioFrameTransport], state: _StdioLaunchState
+    launch_task: asyncio.Task[_OwnedStdioProcess], state: _StdioLaunchState
 ) -> None:
     """Finish cleanup if a cancelled launch eventually captures a process."""
     with contextlib.suppress(BaseException):
@@ -889,27 +1088,59 @@ def _reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-standard JSON constant: {value}")
 
 
-def _decode_frame(frame: Frame) -> dict:
-    """Decode exactly one text frame/line into one JSON object."""
-    if isinstance(frame, bytes):
+def _decode_message(message: AppServerMessage) -> dict:
+    """Decode exactly one text message/line into one JSON object."""
+    if isinstance(message, bytes):
         raise CodexCtlError(
             ErrorCode.APP_SERVER_PROTOCOL_ERROR,
             "app-server protocol error: binary frame is not allowed",
         )
     try:
-        message = json.loads(frame, parse_constant=_reject_json_constant)
+        decoded = json.loads(message, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError) as exc:
         raise CodexCtlError(
             ErrorCode.APP_SERVER_PROTOCOL_ERROR,
             "app-server protocol error: malformed JSON frame",
             cause=exc,
         ) from exc
-    if not isinstance(message, dict):
+    if not isinstance(decoded, dict):
         raise CodexCtlError(
             ErrorCode.APP_SERVER_PROTOCOL_ERROR,
             "app-server protocol error: frame must contain a JSON object",
         )
-    return message
+    return decoded
+
+
+def _parse_stdio_websocket_response(raw_response: bytes) -> Any:
+    """Parse the HTTP/1.1 response to the fixed stdio WebSocket upgrade."""
+    from websockets.datastructures import Headers
+    from websockets.http11 import Response
+
+    if not raw_response.endswith(b"\r\n\r\n"):
+        raise ValueError("incomplete WebSocket handshake response")
+    lines = raw_response[:-4].split(b"\r\n")
+    if not lines or len(lines[0].split(b" ", 2)) != 3:
+        raise ValueError("malformed WebSocket handshake status line")
+    protocol, raw_status, raw_reason = lines[0].split(b" ", 2)
+    if protocol != b"HTTP/1.1":
+        raise ValueError("WebSocket handshake must use HTTP/1.1")
+    try:
+        status = int(raw_status)
+    except ValueError as exc:
+        raise ValueError("malformed WebSocket handshake status code") from exc
+
+    headers = Headers()
+    for line in lines[1:]:
+        if not line:
+            raise ValueError("malformed WebSocket handshake header")
+        try:
+            name, value = line.split(b":", 1)
+            header_name = name.decode("ascii")
+            header_value = value.strip().decode("iso-8859-1")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("malformed WebSocket handshake header") from exc
+        headers[header_name] = header_value
+    return Response(status, raw_reason.decode("iso-8859-1"), headers)
 
 
 def _transport_failure(

@@ -9,6 +9,7 @@ from codexctl.endpoint import (
     ExternalEndpointAdapter,
     ManagedDaemonAdapter,
     StdioEndpointAdapter,
+    StdioProtocol,
     StdioTarget,
     TcpTarget,
     UnixTarget,
@@ -221,10 +222,23 @@ class TestStdioEndpointAdapter:
         endpoint = await adapter.resolve()
 
         assert endpoint.display == "stdio"
-        assert endpoint.target == StdioTarget(("app-server", "--flag", "--", "value"))
+        assert endpoint.target == StdioTarget(
+            ("app-server", "--flag", "--", "value"), StdioProtocol.JSONL
+        )
         assert endpoint.runtime_pid is None
         assert adapter.mode == "stdio"
         assert adapter.probe_cli_version() is None
+
+    async def test_resolves_websocket_protocol_without_starting_a_process(self):
+        adapter = StdioEndpointAdapter(
+            "codex", ("app-server", "proxy"), StdioProtocol.WEBSOCKET
+        )
+
+        endpoint = await adapter.resolve()
+
+        assert endpoint.target == StdioTarget(
+            ("codex", "app-server", "proxy"), StdioProtocol.WEBSOCKET
+        )
 
 
 class TestDefaultControlSocketPath:

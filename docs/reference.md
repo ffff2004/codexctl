@@ -49,19 +49,20 @@ Every command accepts:
 | `--jsonl` | Shorthand for `-o jsonl` |
 | `--endpoint <uri>` | Use an externally managed app-server endpoint; `codexctl` performs no daemon lifecycle actions in this mode |
 | `--endpoint-token-file <path>` | Read a Bearer token from this file immediately before connecting to a `ws://` endpoint |
-| `--stdio-exec <executable>` | Run one caller-selected app-server process; its stdin/stdout carry newline-delimited JSON |
+| `--stdio-exec <executable>` | Run one caller-selected app-server process; its stdin/stdout carry the selected stdio protocol |
+| `--stdio-protocol {jsonl,websocket}` | Select newline-delimited JSON (default) or the Codex-compatible WebSocket-over-stdio protocol |
 | `--stdio-arg <arg>` | Repeatable; append this exact argument, in order, to `--stdio-exec` |
 
 `--stdio-exec` and `--stdio-arg` select `stdio` mode. Stdio mode is mutually
-exclusive with `--endpoint` and `--endpoint-token-file`; `--stdio-arg`
-requires `--stdio-exec`. The executable and arguments are passed directly as
-one argv vector: there is no shell parsing, pipeline, redirection, glob
-expansion, or environment interpolation. The child inherits codexctl's
-environment and working directory. Its stdin/stdout are private pipes owned
-by codexctl: the child receives protocol input on its stdin and writes
-protocol output on its stdout. These pipes do not consume or replace
-codexctl's own stdin/stdout; the child's stderr is forwarded to codexctl's
-stderr.
+exclusive with `--endpoint` and `--endpoint-token-file`; `--stdio-arg` and
+`--stdio-protocol websocket` require `--stdio-exec`. The executable and
+arguments are passed directly as one argv vector: there is no shell parsing,
+pipeline, redirection, glob expansion, or environment interpolation. The
+child inherits codexctl's environment and working directory. Its stdin/stdout
+are private pipes owned by codexctl: the child receives protocol input on its
+stdin and writes protocol output on its stdout. These pipes do not consume or
+replace codexctl's own stdin/stdout; the child's stderr is forwarded to
+codexctl's stderr.
 Dash-prefixed values are accepted; use the attached spelling
 `--stdio-arg=--` when passing a literal `--` before the prompt delimiter.
 
@@ -414,12 +415,20 @@ External endpoints use one of these forms:
 Malformed endpoint configuration is a `USAGE_ERROR`. An unavailable endpoint,
 or a missing, unreadable, or empty token file, is `APP_SERVER_UNAVAILABLE`.
 
-Stdio mode starts a fresh child for each command invocation. It uses
-newline-delimited JSON: blank lines are ignored, LF and CRLF are accepted,
-and a final valid line need not end with a newline. Each line must contain
-exactly one JSON object. WebSocket frames follow the same strict object rule;
-binary frames, malformed JSON, non-object values, and any later framing
+Stdio mode starts a fresh child for each command invocation. The default
+`--stdio-protocol jsonl` uses newline-delimited JSON: blank lines are ignored,
+LF and CRLF are accepted, and a final valid line need not end with a newline.
+Each line must contain exactly one JSON object.
+
+`--stdio-protocol websocket` requires `--stdio-exec` and connects to the child
+using the fixed internal URI `ws://localhost/`. The child pipes carry the raw
+HTTP Upgrade exchange and WebSocket wire frames; the child is a transparent
+Codex-compatible relay and doesn't parse JSON or WebSocket framing.
+Compression is disabled. Text WebSocket messages must contain one JSON object;
+binary messages, malformed JSON, non-object values, and any later framing
 failure are `APP_SERVER_PROTOCOL_ERROR` failures with no resynchronization.
+WebSocket control frames, fragmentation, masking, ping/pong, and close
+handling are internal transport details.
 The initialize/startup deadline is 15 seconds. Executable failures,
 permission failures, pre-initialize child exits, and startup timeouts are
 `APP_SERVER_UNAVAILABLE`; unexpected runtime exits are
