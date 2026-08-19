@@ -71,6 +71,39 @@ Consulted for the projected status vocabulary.
   `activeFlags`) and `TurnStatus` (`completed` / `interrupted` /
   `failed` / `inProgress`).
 
+### Experimental API marking
+
+Consulted for how upstream marks an app-server method or param field as
+experimental and gates it behind a client capability. Facts read, in
+brief: method-level `#[experimental("...")]` attributes inside the
+`client_request_definitions!` declaration, field-level marking via the
+`ExperimentalApi` derive macro, and runtime rejection unless the client
+declared the `experimentalApi` capability in `initialize`.
+
+- [codex-rs/app-server-protocol/src/protocol/common.rs](../vendor/codex/codex-rs/app-server-protocol/src/protocol/common.rs) —
+  `client_request_definitions!` macro: the central client-method table;
+  optional `#[experimental("reason")]` per method entry (wire names are
+  not prefixed), generated `experimental_reason()` dispatch, and the
+  `EXPERIMENTAL_CLIENT_METHODS` test constant.
+- [codex-rs/app-server-protocol/src/experimental_api.rs](../vendor/codex/codex-rs/app-server-protocol/src/experimental_api.rs) —
+  `ExperimentalApi` trait, the `ExperimentalField` inventory registry of
+  experimental fields, and the `"... requires experimentalApi capability"`
+  error message.
+- [codex-rs/codex-experimental-api-macros/src/lib.rs](../vendor/codex/codex-rs/codex-experimental-api-macros/src/lib.rs) —
+  `#[derive(ExperimentalApi)]` proc-macro: `#[experimental("method.field")]`
+  and `#[experimental(nested)]` field-level marking.
+- [codex-rs/app-server-protocol/src/protocol/v1.rs](../vendor/codex/codex-rs/app-server-protocol/src/protocol/v1.rs) —
+  `InitializeCapabilities.experimental_api` (wire name `experimentalApi`).
+- [codex-rs/app-server/src/request_processors/initialize_processor.rs](../vendor/codex/codex-rs/app-server/src/request_processors/initialize_processor.rs) —
+  capability read during `initialize` and stored per connection session.
+- [codex-rs/app-server/src/message_processor.rs](../vendor/codex/codex-rs/app-server/src/message_processor.rs) —
+  per-request gate: requests with an experimental reason are rejected as
+  invalid requests when the session has not enabled the experimental API.
+
+Note: `experimentalFeature/list` and `experimentalFeature/enablement/set`
+are themselves stable methods for feature-flag enablement, distinct from
+the experimental API capability gating above.
+
 ### Daemon lifecycle
 
 Consulted for `codex app-server daemon start` semantics.
