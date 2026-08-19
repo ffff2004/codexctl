@@ -124,7 +124,9 @@ Context: 83k / 200k (38%) | -
 ```
 
 Context usage is best-effort enrichment from the Codex runtime or rollout
-store; `-` means unavailable. `usedTokens` is the latest context size, not a
+store for runtimes that support local enrichment; `-` means unavailable.
+External and stdio runtimes do not read the local rollout store, so their
+status context is unavailable. `usedTokens` is the latest context size, not a
 cumulative session total. `ratio` is the effective context usage fraction
 after reserving 12,000 tokens for the system prompt, fixed tool instructions,
 and compaction space; the text output shows its rounded percentage.
@@ -241,9 +243,10 @@ codexctl doctor
 
 Runs diagnostics and prints a compatibility verdict: endpoint
 reachability, the initialize handshake, required lifecycle operations, the
-local `codex` CLI version (managed mode only), and rollout-based context
-enrichment availability. Context enrichment is optional and does not make a
-runtime incompatible.
+local `codex` CLI version for runtimes with managed lifecycle ownership, and
+rollout-based context enrichment availability when that capability is enabled.
+External and stdio runtimes omit the enrichment check. Context enrichment is
+optional and does not make a runtime incompatible.
 Exit code 0 means the checks completed (regardless of verdict).
 
 ## Output modes

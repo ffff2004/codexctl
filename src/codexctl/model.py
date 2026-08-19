@@ -186,6 +186,7 @@ class Interrupt:
 @dataclass(frozen=True)
 class ListThreads:
     all_threads: bool = False
+    cwd: str | None = None
 
 
 @dataclass(frozen=True)

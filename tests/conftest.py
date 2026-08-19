@@ -24,6 +24,8 @@ from codexctl.appserver import (
 )
 from codexctl.endpoint import (
     AppServerEndpoint,
+    LifecycleOwnership,
+    RuntimePolicy,
     StdioFraming,
     StdioRuntimeProvider,
     StdioTarget,
@@ -216,11 +218,28 @@ class FakeRuntimeProvider:
         resolve_error: Exception | None = None,
         cli_version: str | None = None,
         mode: str | None = None,
+        policy: RuntimePolicy | None = None,
     ) -> None:
         self._resolve_error = resolve_error
         self._cli_version = cli_version
         if mode is not None:
             self.mode = mode
+        if policy is None:
+            managed = self.mode in {"fake", "managed"}
+            policy = RuntimePolicy(
+                default_cwd=str(Path.cwd()),
+                lifecycle=(
+                    LifecycleOwnership.MANAGED
+                    if managed
+                    else LifecycleOwnership.EXTERNAL
+                ),
+                supports_rollout_enrichment=managed,
+            )
+        self._policy = policy
+
+    @property
+    def policy(self) -> RuntimePolicy:
+        return self._policy
 
     async def resolve_endpoint(self) -> AppServerEndpoint:
         if self._resolve_error is not None:
@@ -229,7 +248,7 @@ class FakeRuntimeProvider:
             display="/fake.sock", target=UnixSocketTarget(Path("/fake.sock"))
         )
 
-    def probe_cli_version(self) -> str | None:
+    async def probe_cli_version(self) -> str | None:
         return self._cli_version
 
 

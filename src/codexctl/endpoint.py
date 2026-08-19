@@ -9,13 +9,13 @@ Three real production behaviors justify this seam:
 - ``StdioRuntimeProvider`` records one caller-supplied process invocation;
   process ownership begins when the app-server transport connects.
 
-Core execution only ever sees an :class:`AppServerEndpoint`.
+Core execution sees an :class:`AppServerEndpoint` and an immutable
+:class:`RuntimePolicy`; transport targets remain opaque outside this module.
 """
 
 import asyncio
 import json
 import os
-import subprocess
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +34,8 @@ class AppServerEndpoint:
     target: "UnixSocketTarget | WebSocketTarget | StdioTarget" = field(repr=False)
     runtime_pid: int | None = None
     runtime_version: str | None = None
+    cli_version: str | None = None
+    socket_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,45 @@ class StdioTarget:
     framing: StdioFraming = StdioFraming.JSONL
 
 
+class LifecycleOwnership(StrEnum):
+    """Whether a runtime owns the app-server lifecycle."""
+
+    MANAGED = "managed"
+    EXTERNAL = "external"
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    """Immutable behavioral capabilities of a runtime provider.
+
+    ``default_cwd`` is captured by local providers when they are created. A
+    remote provider can leave it unset (or provide a remote-specific value)
+    without making core infer a local working directory. ``lifecycle`` is
+    intentionally independent from the provider's public ``mode`` identity.
+    """
+
+    default_cwd: str | None
+    lifecycle: LifecycleOwnership
+    supports_rollout_enrichment: bool
+    require_explicit_cwd: bool = False
+
+    def resolve_cwd(self, requested: str | None) -> str | None:
+        """Resolve an optional command cwd using this runtime's policy."""
+        if requested is None and self.require_explicit_cwd:
+            raise UsageError("this runtime requires an explicit cwd")
+        return self.default_cwd if requested is None else requested
+
+    @property
+    def lifecycle_ownership(self) -> LifecycleOwnership:
+        """Descriptive alias for callers that prefer the full field name."""
+        return self.lifecycle
+
+    @property
+    def supports_context_usage_enrichment(self) -> bool:
+        """Alias for the rollout capability's observable purpose."""
+        return self.supports_rollout_enrichment
+
+
 # Endpoint URLs are locations, never credential carriers. Keep this closed
 # list deliberately specific so ordinary application query parameters remain
 # opaque and are forwarded unchanged.
@@ -81,9 +122,12 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
 class RuntimeProvider(Protocol):
     mode: str
 
+    @property
+    def policy(self) -> RuntimePolicy: ...
+
     async def resolve_endpoint(self) -> AppServerEndpoint: ...
 
-    def probe_cli_version(self) -> str | None:
+    async def probe_cli_version(self) -> str | None:
         """Best-effort codex CLI version probe; never raises."""
         ...
 
@@ -102,6 +146,16 @@ def _pid_from_pidfile(home: Path | None = None) -> int | None:
         return None
 
 
+def _local_runtime_policy(
+    lifecycle: LifecycleOwnership, *, supports_rollout_enrichment: bool
+) -> RuntimePolicy:
+    return RuntimePolicy(
+        default_cwd=str(Path.cwd()),
+        lifecycle=lifecycle,
+        supports_rollout_enrichment=supports_rollout_enrichment,
+    )
+
+
 class ManagedRuntimeProvider:
     """Resolves the managed shared app-server, starting the daemon if needed.
 
@@ -115,6 +169,13 @@ class ManagedRuntimeProvider:
     def __init__(self, codex_bin: str | None = None, home: Path | None = None) -> None:
         self._codex_bin = codex_bin or os.environ.get("CODEXCTL_CODEX_BIN", "codex")
         self._home = home
+        self._policy = _local_runtime_policy(
+            LifecycleOwnership.MANAGED, supports_rollout_enrichment=True
+        )
+
+    @property
+    def policy(self) -> RuntimePolicy:
+        return self._policy
 
     async def resolve_endpoint(self) -> AppServerEndpoint:
         socket_path = default_control_socket_path(self._home)
@@ -142,6 +203,7 @@ class ManagedRuntimeProvider:
             target=UnixSocketTarget(socket_path),
             runtime_pid=_pid_from_pidfile(self._home),
             runtime_version=version,
+            socket_path=socket_path,
         )
 
     async def _daemon_start(self, fallback_socket: Path) -> AppServerEndpoint:
@@ -185,23 +247,31 @@ class ManagedRuntimeProvider:
             target=UnixSocketTarget(Path(socket_path)),
             runtime_pid=int(pid) if pid is not None else None,
             runtime_version=payload.get("appServerVersion"),
+            cli_version=payload.get("cliVersion"),
+            socket_path=Path(socket_path),
         )
 
-    def probe_cli_version(self) -> str | None:
+    async def probe_cli_version(self) -> str | None:
         """Best-effort ``codex --version`` probe against the managed binary."""
+        proc: asyncio.subprocess.Process | None = None
         try:
-            proc = subprocess.run(
-                [self._codex_bin, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
+            proc = await asyncio.create_subprocess_exec(
+                self._codex_bin,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except OSError, subprocess.TimeoutExpired:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.communicate()
+            return None
+        except OSError:
             return None
         if proc.returncode != 0:
             return None
-        output = (proc.stdout or proc.stderr or "").strip()
+        output = (stdout or stderr).decode(errors="replace").strip()
         return output.splitlines()[0] if output else None
 
 
@@ -226,6 +296,13 @@ class ExternalRuntimeProvider:
 
     def __init__(self, endpoint: str, token_file: Path | None = None) -> None:
         self._endpoint = parse_external_endpoint(endpoint, token_file)
+        self._policy = _local_runtime_policy(
+            LifecycleOwnership.EXTERNAL, supports_rollout_enrichment=False
+        )
+
+    @property
+    def policy(self) -> RuntimePolicy:
+        return self._policy
 
     async def resolve_endpoint(self) -> AppServerEndpoint:
         target = self._endpoint.target
@@ -236,7 +313,7 @@ class ExternalRuntimeProvider:
             )
         return self._endpoint
 
-    def probe_cli_version(self) -> str | None:
+    async def probe_cli_version(self) -> str | None:
         # External endpoints own no codex binary lifecycle.
         return None
 
@@ -253,13 +330,20 @@ class StdioRuntimeProvider:
         framing: StdioFraming = StdioFraming.JSONL,
     ) -> None:
         self._target = StdioTarget((executable, *args), framing)
+        self._policy = _local_runtime_policy(
+            LifecycleOwnership.EXTERNAL, supports_rollout_enrichment=False
+        )
+
+    @property
+    def policy(self) -> RuntimePolicy:
+        return self._policy
 
     async def resolve_endpoint(self) -> AppServerEndpoint:
         # Resolution is deliberately side-effect free. The connection layer
         # owns spawning and cleanup so every operation gets one fresh process.
         return AppServerEndpoint(display="stdio", target=self._target)
 
-    def probe_cli_version(self) -> str | None:
+    async def probe_cli_version(self) -> str | None:
         # Stdio mode does not expose or probe a separate Codex CLI lifecycle.
         return None
 
@@ -298,7 +382,11 @@ def parse_external_endpoint(
         path = Path(unquote(parsed.path))
         if not path.is_absolute():  # Defensive: keep URI validation explicit.
             raise UsageError("--endpoint unix URI must be unix:///absolute/path")
-        return AppServerEndpoint(display=endpoint, target=UnixSocketTarget(path))
+        return AppServerEndpoint(
+            display=endpoint,
+            target=UnixSocketTarget(path),
+            socket_path=path,
+        )
 
     if parsed.scheme != "ws":
         raise UsageError("--endpoint must use unix:///absolute/path or ws://host:port")

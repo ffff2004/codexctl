@@ -101,23 +101,29 @@ Selector parsing is pure and follows Python semantics exactly
   [reference.md — Error codes](reference.md#error-codes) and
   [reference.md — resume](reference.md#resume).
 - **Doctor** reuses the same seams: endpoint resolution, connect +
-  initialize handshake, the runtime-provider `probe_cli_version()` policy,
-  the app-server lifecycle compatibility probe, and the rollout sessions
-  directory check. Managed, external, and stdio endpoint behavior is defined
-  by the [runtime resolution contract](reference.md#runtime-resolution). The
-  lifecycle probe is the compatibility gate; rollout context enrichment
-  remains diagnostic-only.
+  initialize handshake, the runtime-provider's asynchronous CLI-version
+  probe, the app-server lifecycle compatibility probe, and the optional
+  rollout sessions directory check. `RuntimePolicy` supplies lifecycle
+  ownership and enrichment capabilities; the public runtime mode remains an
+  identity used for diagnostics. The lifecycle probe is the compatibility
+  gate; rollout context enrichment remains diagnostic-only.
 
 ### endpoint.py — runtime resolution
 
-`RuntimeProvider.resolve_endpoint() -> AppServerEndpoint(display, target, runtime_pid,
-runtime_version)` has three implementations. `target` is a closed transport
-detail and is opaque to [core.py](../src/codexctl/core.py):
+`RuntimeProvider` exposes an immutable `RuntimePolicy` alongside
+`resolve_endpoint() -> AppServerEndpoint(display, target, runtime_pid,
+runtime_version, cli_version, socket_path)`. The policy carries the default
+cwd, lifecycle ownership, explicit-cwd requirements, and whether local rollout
+enrichment is supported;
+the public `mode` remains an identity and is not used to select behavior in
+core. `target` is a closed transport detail and is opaque to
+[core.py](../src/codexctl/core.py):
 
 - `ManagedRuntimeProvider` contains all daemon lifecycle knowledge: probe
   the default control socket first (connecting + initializing to verify
   the runtime responds), otherwise run `codex app-server daemon start`
-  and parse the last JSON line of stdout for `socketPath`/`pid`. No JSON
+  and parse the last JSON line of stdout for `socketPath`/`pid`, plus optional
+  runtime and CLI version metadata. No JSON
   means `INCOMPATIBLE_CODEX`; binary-missing or non-zero exit means
   `APP_SERVER_UNAVAILABLE`. The binary can be overridden with
   `CODEXCTL_CODEX_BIN` (see
@@ -138,8 +144,12 @@ detail and is opaque to [core.py](../src/codexctl/core.py):
   immediate PID disappearance from the process table is not part of the
   internal contract.
 
-The runtime-provider interface also carries a best-effort `probe_cli_version()` used by doctor;
-each provider owns the policy for that probe.
+The runtime-provider interface also carries an asynchronous, best-effort
+`probe_cli_version()` used by doctor. Managed providers use an asyncio child
+process for the local probe; external and stdio providers return no version.
+The public status context behavior is defined in
+[reference.md — status](reference.md#status), and the public doctor checks are
+defined in [reference.md — doctor](reference.md#doctor).
 
 ### appserver.py — the compatibility firewall
 

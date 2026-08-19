@@ -14,6 +14,7 @@ from conftest import FakeAppServer, FakeRuntimeProvider, collect, make_ctl
 
 import codexctl.core as core
 from codexctl.appserver import UNSUPPORTED_INTERACTION_METHOD
+from codexctl.endpoint import LifecycleOwnership, RuntimePolicy
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -219,6 +220,23 @@ class TestStart:
             "model": "gpt-5",
         }
         assert server.params_of("turn/start")["effort"] == "low"
+
+    async def test_default_cwd_comes_from_runtime_policy(self):
+        server = FakeAppServer()
+        self._script(server)
+        emit_completed(server, "t1", "u1")
+        policy = RuntimePolicy(
+            default_cwd="/remote/workspace",
+            lifecycle=LifecycleOwnership.EXTERNAL,
+            supports_rollout_enrichment=False,
+        )
+
+        outcome = await make_ctl(
+            server, FakeRuntimeProvider(mode="ssh", policy=policy)
+        ).run(Start(prompt="hello"))
+        await collect(outcome)
+
+        assert server.params_of("thread/start")["cwd"] == "/remote/workspace"
 
     async def test_approve_for_me_reaches_the_wire(self):
         server = FakeAppServer()
@@ -463,6 +481,36 @@ class TestStatus:
         assert snapshot.context is not None
         assert snapshot.context.used_tokens == 600
         assert snapshot.context.source == "rollout"
+
+    @pytest.mark.parametrize("mode", ["external", "stdio"])
+    async def test_non_managed_runtime_does_not_read_local_rollout(
+        self, isolated_codex_home, mode
+    ):
+        import json as _json
+
+        directory = isolated_codex_home / "sessions" / "2026" / "08" / "15"
+        directory.mkdir(parents=True)
+        record = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {"total_tokens": 600},
+                    "model_context_window": 200000,
+                },
+            },
+        }
+        (directory / "rollout-2026-08-15T00-00-00-t1.jsonl").write_text(
+            _json.dumps(record) + "\n"
+        )
+        server = FakeAppServer()
+        server.result("thread/read", {"thread": thread_doc()})
+
+        snapshot = await make_ctl(server, FakeRuntimeProvider(mode=mode)).run(
+            Status(thread_id="t1")
+        )
+
+        assert snapshot.context is None
 
     async def test_unknown_thread(self):
         server = FakeAppServer()
@@ -1141,6 +1189,33 @@ class TestList:
 
         assert server.params_of("thread/list") == {"limit": 100}
 
+    async def test_uses_runtime_policy_cwd_and_explicit_command_cwd(self):
+        policy = RuntimePolicy(
+            default_cwd="/remote/workspace",
+            lifecycle=LifecycleOwnership.EXTERNAL,
+            supports_rollout_enrichment=False,
+        )
+        server = FakeAppServer()
+        server.result("thread/list", {"data": []})
+
+        await make_ctl(server, FakeRuntimeProvider(mode="ssh", policy=policy)).run(
+            ListThreads()
+        )
+        assert server.params_of("thread/list") == {
+            "limit": 100,
+            "cwd": "/remote/workspace",
+        }
+
+        server = FakeAppServer()
+        server.result("thread/list", {"data": []})
+        await make_ctl(server, FakeRuntimeProvider(mode="ssh", policy=policy)).run(
+            ListThreads(cwd="/explicit/workspace")
+        )
+        assert server.params_of("thread/list") == {
+            "limit": 100,
+            "cwd": "/explicit/workspace",
+        }
+
 
 class TestDoctor:
     async def test_compatible_runtime_reports_lifecycle_operations(self):
@@ -1195,6 +1270,7 @@ class TestDoctor:
         assert snapshot.endpoint_mode == "external"
         assert snapshot.codex_cli_version is None
         assert all(c.name != "codex cli version" for c in snapshot.checks)
+        assert all(c.name != "context usage enrichment" for c in snapshot.checks)
 
     async def test_stdio_mode_exposes_only_mode_in_doctor_document(self):
         endpoint = FakeRuntimeProvider(mode="stdio")
@@ -1204,3 +1280,21 @@ class TestDoctor:
         assert document["endpointMode"] == "stdio"
         assert "executable" not in document
         assert "arguments" not in document
+        assert all(c.name != "context usage enrichment" for c in snapshot.checks)
+
+    async def test_lifecycle_policy_is_independent_of_endpoint_mode(self):
+        policy = RuntimePolicy(
+            default_cwd=None,
+            lifecycle=LifecycleOwnership.MANAGED,
+            supports_rollout_enrichment=False,
+        )
+        endpoint = FakeRuntimeProvider(
+            mode="ssh", cli_version="codex-cli 0.101.0", policy=policy
+        )
+
+        snapshot = await make_ctl(FakeAppServer(), endpoint).run(Doctor())
+
+        assert snapshot.endpoint_mode == "ssh"
+        assert snapshot.codex_cli_version == "codex-cli 0.101.0"
+        assert any(c.name == "codex cli version" for c in snapshot.checks)
+        assert all(c.name != "context usage enrichment" for c in snapshot.checks)

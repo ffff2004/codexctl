@@ -8,7 +8,6 @@ It never exposes transport or protocol types through ``run``.
 import asyncio
 import time
 from dataclasses import replace
-from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import rollout
@@ -19,7 +18,11 @@ from .appserver import (
     JsonRpcError,
     connect_app_server,
 )
-from .endpoint import AppServerEndpoint, RuntimeProvider
+from .endpoint import (
+    AppServerEndpoint,
+    LifecycleOwnership,
+    RuntimeProvider,
+)
 from .model import (
     CodexCtlError,
     Command,
@@ -122,8 +125,9 @@ class CodexCtl:
 
     async def _start(self, command: Start) -> Any:
         config = command.config
-        if config.cwd is None:
-            config = replace(config, cwd=str(Path.cwd()))
+        cwd = self._runtime.policy.resolve_cwd(config.cwd)
+        if cwd != config.cwd:
+            config = replace(config, cwd=cwd)
         app_server = await self._open()
         try:
             try:
@@ -357,7 +361,11 @@ class CodexCtl:
             await app_server.close()
         status, flags = thread.status, thread.active_flags
         active = self._find_active_turn(thread)
-        context = rollout.lookup_context_usage(command.thread_id)
+        context = (
+            rollout.lookup_context_usage(command.thread_id)
+            if self._runtime.policy.supports_rollout_enrichment
+            else None
+        )
         return StatusSnapshot(
             thread_id=command.thread_id,
             status=status,
@@ -565,7 +573,11 @@ class CodexCtl:
         try:
             records: list[ThreadRecord] = []
             cursor: str | None = None
-            cwd = None if command.all_threads else str(Path.cwd())
+            cwd = (
+                None
+                if command.all_threads
+                else self._runtime.policy.resolve_cwd(command.cwd)
+            )
             for _ in range(25):  # pagination safety cap
                 try:
                     page = await app_server.list_threads(cursor, cwd=cwd)
@@ -598,6 +610,7 @@ class CodexCtl:
         compatible = False
         app_server_version: str | None = None
         endpoint_mode = getattr(self._runtime, "mode", "managed")
+        policy = self._runtime.policy
         try:
             endpoint = await self._runtime.resolve_endpoint()
             checks.append(DoctorCheck("endpoint reachable", True, endpoint.display))
@@ -640,8 +653,11 @@ class CodexCtl:
                 compatible = lifecycle_ok
             finally:
                 await app_server.close()
-        codex_cli_version = self._runtime.probe_cli_version()
-        if endpoint_mode == "managed":
+        codex_cli_version: str | None = None
+        if policy.lifecycle == LifecycleOwnership.MANAGED:
+            codex_cli_version = endpoint.cli_version
+            if codex_cli_version is None:
+                codex_cli_version = await self._runtime.probe_cli_version()
             checks.append(
                 DoctorCheck(
                     "codex cli version",
@@ -649,15 +665,17 @@ class CodexCtl:
                     codex_cli_version,
                 )
             )
-        checks.append(
-            DoctorCheck(
-                "context usage enrichment",
-                rollout.sessions_dir_exists(),
-                "rollout sessions directory present"
-                if rollout.sessions_dir_exists()
-                else "no rollout sessions directory",
+        if policy.supports_rollout_enrichment:
+            rollout_available = rollout.sessions_dir_exists()
+            checks.append(
+                DoctorCheck(
+                    "context usage enrichment",
+                    rollout_available,
+                    "rollout sessions directory present"
+                    if rollout_available
+                    else "no rollout sessions directory",
+                )
             )
-        )
         return DoctorSnapshot(
             codexctl_version=CLIENT_VERSION,
             endpoint_mode=endpoint_mode,

@@ -1,13 +1,16 @@
 """Endpoint resolution: daemon lifecycle JSON parsing and external endpoints."""
 
 import json
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from codexctl.endpoint import (
     ExternalRuntimeProvider,
+    LifecycleOwnership,
     ManagedRuntimeProvider,
+    RuntimePolicy,
     StdioFraming,
     StdioRuntimeProvider,
     StdioTarget,
@@ -49,19 +52,33 @@ class TestLastJsonObject:
 
 
 class TestManagedRuntimeProvider:
+    def test_policy_is_immutable(self):
+        provider = ManagedRuntimeProvider()
+
+        with pytest.raises(FrozenInstanceError):
+            provider.policy.default_cwd = "/changed"  # type: ignore[misc]
+
     async def test_daemon_start_parses_lifecycle_json(self, tmp_path):
         home = tmp_path / "home"
         script = _write_script(
             tmp_path,
             "echo 'starting'\n"
             'echo \'{"status":"started","socketPath":"/tmp/fake.sock",'
-            '"pid":4242,"appServerVersion":"0.101.0"}\'',
+            '"pid":4242,"appServerVersion":"0.101.0",'
+            '"cliVersion":"codex-cli 0.101.0"}\'',
         )
         provider = ManagedRuntimeProvider(codex_bin=script, home=home)
         endpoint = await provider.resolve_endpoint()
         assert endpoint.target == UnixSocketTarget(Path("/tmp/fake.sock"))
         assert endpoint.runtime_pid == 4242
         assert endpoint.runtime_version == "0.101.0"
+        assert endpoint.cli_version == "codex-cli 0.101.0"
+        assert endpoint.socket_path == Path("/tmp/fake.sock")
+        assert provider.policy == RuntimePolicy(
+            default_cwd=str(Path.cwd()),
+            lifecycle=LifecycleOwnership.MANAGED,
+            supports_rollout_enrichment=True,
+        )
 
     async def test_already_running_status_also_yields_endpoint(self, tmp_path):
         home = tmp_path / "home"
@@ -108,21 +125,21 @@ class TestManagedRuntimeProvider:
         provider = ManagedRuntimeProvider()
         assert provider._codex_bin == "/opt/codex/bin/codex"
 
-    def test_probe_cli_version_reads_first_output_line(self, tmp_path):
+    async def test_probe_cli_version_reads_first_output_line(self, tmp_path):
         script = _write_script(tmp_path, "echo 'codex-cli 0.101.0'\necho 'noise'")
         provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
-        assert provider.probe_cli_version() == "codex-cli 0.101.0"
+        assert await provider.probe_cli_version() == "codex-cli 0.101.0"
 
-    def test_probe_cli_version_none_when_binary_missing(self, tmp_path):
+    async def test_probe_cli_version_none_when_binary_missing(self, tmp_path):
         provider = ManagedRuntimeProvider(
             codex_bin=str(tmp_path / "does-not-exist"), home=tmp_path / "home"
         )
-        assert provider.probe_cli_version() is None
+        assert await provider.probe_cli_version() is None
 
-    def test_probe_cli_version_none_on_nonzero_exit(self, tmp_path):
+    async def test_probe_cli_version_none_on_nonzero_exit(self, tmp_path):
         script = _write_script(tmp_path, "exit 1")
         provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
-        assert provider.probe_cli_version() is None
+        assert await provider.probe_cli_version() is None
 
 
 class TestExternalRuntimeProvider:
@@ -140,10 +157,12 @@ class TestExternalRuntimeProvider:
         assert endpoint.target == UnixSocketTarget(socket_path)
         assert endpoint.runtime_pid is None
         assert provider.mode == "external"
+        assert provider.policy.lifecycle is LifecycleOwnership.EXTERNAL
+        assert provider.policy.supports_rollout_enrichment is False
 
-    def test_probe_cli_version_is_none(self, tmp_path):
+    async def test_probe_cli_version_is_none(self, tmp_path):
         provider = ExternalRuntimeProvider(f"unix://{tmp_path / 'external.sock'}")
-        assert provider.probe_cli_version() is None
+        assert await provider.probe_cli_version() is None
 
     async def test_tcp_endpoint_preserves_path_query_and_defers_token_read(
         self, tmp_path
@@ -227,7 +246,9 @@ class TestStdioRuntimeProvider:
         )
         assert endpoint.runtime_pid is None
         assert provider.mode == "stdio"
-        assert provider.probe_cli_version() is None
+        assert provider.policy.lifecycle is LifecycleOwnership.EXTERNAL
+        assert provider.policy.supports_rollout_enrichment is False
+        assert await provider.probe_cli_version() is None
 
     async def test_resolves_websocket_protocol_without_starting_a_process(self):
         provider = StdioRuntimeProvider(
