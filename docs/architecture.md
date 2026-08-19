@@ -165,6 +165,13 @@ fragmentation, and exposes only complete text or binary messages. The public
 framing and failure contract is defined in
 [reference.md — Runtime resolution](reference.md#runtime-resolution), and the unattended interaction policy is defined in
 [reference.md — Unattended operation](reference.md#unattended-operation).
+The session lifecycle is `OPEN -> CLOSING -> CLOSED`: `CLOSING` rejects new
+requests but does not claim that resources are gone. The session owns one
+shared transport-cleanup task; runtime reader failures fail pending requests
+before awaiting it, and `close()` joins the same task. Both waiters shield the
+cleanup task from caller cancellation, retaining cancellation while repeatedly
+waiting if needed, so the reader and close operation do not finish before
+transport and child-process cleanup completes.
 The adapter also probes the required lifecycle RPC surface for `doctor` using
 sentinel requests; method-not-found responses are reported as unavailable,
 while ordinary domain errors prove that dispatch succeeded.

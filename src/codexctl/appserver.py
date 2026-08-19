@@ -655,7 +655,9 @@ class JsonRpcAppServerSession:
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._ids = itertools.count(1)
         self._reader_task: asyncio.Task[None] | None = None
-        self._closed = False
+        self._lifecycle: Literal["OPEN", "CLOSING", "CLOSED"] = "OPEN"
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._cleanup_owner: asyncio.Task[None] | None = None
         self.user_agent: str | None = None
         self.app_server_version: str | None = None
         self.server_codex_home: str | None = None
@@ -684,17 +686,57 @@ class JsonRpcAppServerSession:
         self._initialized = True
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            if self._reader_task is not asyncio.current_task():
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._reader_task
-        if self._transport is not None:
-            with contextlib.suppress(Exception):
-                await self._transport.close()
+        """Close the session and wait for its shared transport cleanup."""
+        cleanup_task = self._begin_closing()
+        await self._await_cleanup(cleanup_task)
+
+    def _begin_closing(self) -> asyncio.Task[None]:
+        """Enter ``CLOSING`` and return the one shared cleanup task."""
+        if self._lifecycle == "OPEN":
+            self._lifecycle = "CLOSING"
+        if self._cleanup_task is None:
+            self._cleanup_owner = asyncio.current_task()
+            self._cleanup_task = asyncio.create_task(self._cleanup_transport())
+        return self._cleanup_task
+
+    async def _cleanup_transport(self) -> None:
+        """Cancel the reader, then close the transport exactly once."""
+        try:
+            reader_task = self._reader_task
+            owner = self._cleanup_owner
+            if (
+                reader_task is not None
+                and reader_task is not owner
+                and not reader_task.done()
+            ):
+                # Do not await the reader here: a reader that observed the
+                # failure may itself be waiting for this cleanup task.
+                reader_task.cancel()
+            if self._transport is not None:
+                with contextlib.suppress(Exception):
+                    await self._transport.close()
+        finally:
+            self._lifecycle = "CLOSED"
+
+    async def _await_cleanup(self, cleanup_task: asyncio.Task[None]) -> None:
+        """Await cleanup without allowing caller cancellation to cancel it."""
+        cancelled = False
+        try:
+            while True:
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # A second cancellation can arrive while cleanup is
+                    # blocked. Keep waiting for the shared task rather than
+                    # allowing this waiter to complete early.
+                    cancelled = True
+                    continue
+                break
+        finally:
+            if cancelled:
+                # Preserve the caller's cancellation only after the shared
+                # cleanup task has completed.
+                raise asyncio.CancelledError
 
     async def unsubscribe(self, thread_id: str) -> None:
         """Best-effort unsubscribe; never raises."""
@@ -827,7 +869,7 @@ class JsonRpcAppServerSession:
     async def _request(
         self, method: str, params: dict | None = None
     ) -> AppServerResponse:
-        if self._closed:
+        if self._lifecycle != "OPEN":
             raise _transport_failure(
                 self._display,
                 self._initialized,
@@ -898,20 +940,23 @@ class JsonRpcAppServerSession:
         except Exception as exc:  # noqa: BLE001 - any transport loss ends the stream
             failure = _transport_failure(self._display, self._initialized, exc)
         finally:
-            if not cancelled and failure is None and not self._closed:
+            if not cancelled and failure is None and self._lifecycle == "OPEN":
                 failure = _transport_failure(
                     self._display,
                     self._initialized,
                     RuntimeError("connection closed"),
                 )
             if failure is not None:
-                self._closed = True
+                cleanup_task = self._begin_closing()
                 for future in self._pending.values():
                     if not future.done():
                         future.set_exception(failure)
-                if self._transport is not None:
-                    with contextlib.suppress(Exception):
-                        await self._transport.close()
+            elif cancelled:
+                cleanup_task = self._begin_closing()
+            else:
+                cleanup_task = self._cleanup_task
+            if cleanup_task is not None:
+                await self._await_cleanup(cleanup_task)
             self._pending.clear()
             self._queue.shutdown()
 

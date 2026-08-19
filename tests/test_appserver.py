@@ -60,6 +60,7 @@ def _stdio_websocket_proxy_source(
         "{'userAgent': 'proxy/2.0'}}))"
     ),
     initialized_action: str = "pass",
+    thread_list_action: str | None = None,
     after_handshake: str = "pass",
     termination_marker: bool = False,
 ) -> str:
@@ -72,7 +73,7 @@ def _stdio_websocket_proxy_source(
             "signal.signal(signal.SIGTERM, stop)\n"
         )
     return (
-        "import base64, hashlib, json, pathlib, signal, struct, sys, time\n"
+        "import base64, hashlib, json, pathlib, signal, struct, subprocess, sys, time\n"
         f"{signal_setup}"
         "def read_exact(size):\n"
         "    value = b''\n"
@@ -143,7 +144,13 @@ def _stdio_websocket_proxy_source(
         f"        {initialize_action}\n"
         "    elif value.get('method') == 'initialized':\n"
         f"        {initialized_action}\n"
-        "    message = b''\n"
+        + (
+            "    elif value.get('method') == 'thread/list':\n"
+            f"        {thread_list_action}\n"
+            if thread_list_action is not None
+            else ""
+        )
+        + "    message = b''\n"
     )
 
 
@@ -485,6 +492,96 @@ class TestStrictFraming:
         assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         assert transport.closed
 
+    async def test_runtime_failure_and_concurrent_close_share_blocking_cleanup(self):
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class Transport:
+            close_calls = 0
+
+            async def send_text(self, _payload):
+                pass
+
+            async def messages(self):
+                yield "{malformed"
+
+            async def close(self):
+                self.close_calls += 1
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        transport = Transport()
+        adapter = JsonRpcAppServerSession(transport, "stdio")
+        adapter._reader_task = asyncio.create_task(adapter._reader())
+
+        await cleanup_started.wait()
+        close_task = asyncio.create_task(adapter.close())
+        await asyncio.sleep(0)
+
+        assert not close_task.done()
+        assert not adapter._reader_task.done()
+        assert adapter._lifecycle == "CLOSING"
+
+        release_cleanup.set()
+        await adapter._reader_task
+        await close_task
+
+        assert transport.close_calls == 1
+        assert adapter._lifecycle == "CLOSED"
+
+    async def test_concurrent_and_repeated_close_calls_share_cleanup(self):
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class Transport:
+            close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        transport = Transport()
+        adapter = JsonRpcAppServerSession(transport, "stdio")
+        close_tasks = [asyncio.create_task(adapter.close()) for _ in range(3)]
+
+        await cleanup_started.wait()
+        await asyncio.sleep(0)
+        assert all(not task.done() for task in close_tasks)
+
+        release_cleanup.set()
+        await asyncio.gather(*close_tasks)
+        await adapter.close()
+
+        assert transport.close_calls == 1
+        assert adapter._lifecycle == "CLOSED"
+
+    async def test_close_cancellation_waits_for_cleanup_completion(self):
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class Transport:
+            async def close(self):
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+        adapter = JsonRpcAppServerSession(Transport(), "stdio")
+        close_task = asyncio.create_task(adapter.close())
+        await cleanup_started.wait()
+
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        assert adapter._lifecycle == "CLOSED"
+
     async def test_stdio_connects_with_ndjson_and_inherits_process_setup(
         self, stdio_endpoint
     ):
@@ -674,6 +771,145 @@ while True:
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
             await adapter.close()
+
+    async def test_stdio_websocket_runtime_failure_cleans_up_descendants(
+        self, tmp_path, stdio_endpoint, monkeypatch
+    ):
+        descendant_ready = tmp_path / "websocket-runtime-descendant.ready"
+        descendant_terminated = tmp_path / "websocket-runtime-descendant.terminated"
+        descendant_pid = tmp_path / "websocket-runtime-descendant.pid"
+        descendant_source = (
+            "import os, pathlib, signal, sys, time\n"
+            "ready = pathlib.Path(sys.argv[1])\n"
+            "terminated = pathlib.Path(sys.argv[2])\n"
+            "pid_path = pathlib.Path(sys.argv[3])\n"
+            "def stop(signum, frame):\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "pid_path.write_text(str(os.getpid()))\n"
+            "ready.write_text('ready')\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                after_handshake=(
+                    "subprocess.Popen([sys.executable, '-c', "
+                    f"{descendant_source!r}, sys.argv[-4], sys.argv[-3], sys.argv[-2]])\n"
+                    "while not pathlib.Path(sys.argv[-4]).exists():\n"
+                    "    time.sleep(0.001)"
+                ),
+                thread_list_action="send_frame(1, b'{malformed}')",
+                termination_marker=True,
+            ),
+            str(descendant_ready),
+            str(descendant_terminated),
+            str(descendant_pid),
+            str(tmp_path / "websocket-runtime-parent.terminated"),
+            filename="stdio-websocket-runtime-descendant.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+
+        adapter = await connect_endpoint(endpoint)
+        try:
+            with pytest.raises(CodexCtlError) as excinfo:
+                await adapter.list_threads()
+            assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+            await adapter._reader_task
+
+            pid = int(descendant_pid.read_text(encoding="utf-8"))
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("WebSocket stdio descendant survived process-group cleanup")
+        finally:
+            await adapter.close()
+
+    async def test_stdio_websocket_close_cancellation_cleans_up_established_process_group(
+        self, tmp_path, stdio_endpoint, monkeypatch
+    ):
+        descendant_ready = tmp_path / "websocket-cancel-descendant.ready"
+        descendant_terminated = tmp_path / "websocket-cancel-descendant.terminated"
+        descendant_pid = tmp_path / "websocket-cancel-descendant.pid"
+        descendant_source = (
+            "import os, pathlib, signal, sys, time\n"
+            "ready = pathlib.Path(sys.argv[1])\n"
+            "terminated = pathlib.Path(sys.argv[2])\n"
+            "pid_path = pathlib.Path(sys.argv[3])\n"
+            "def stop(signum, frame):\n"
+            "    terminated.write_text('terminated')\n"
+            "pid_path.write_text(str(os.getpid()))\n"
+            "ready.write_text('ready')\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+        endpoint = stdio_endpoint(
+            _stdio_websocket_proxy_source(
+                after_handshake=(
+                    "subprocess.Popen([sys.executable, '-c', "
+                    f"{descendant_source!r}, sys.argv[-4], sys.argv[-3], sys.argv[-2]])\n"
+                    "while not pathlib.Path(sys.argv[-4]).exists():\n"
+                    "    time.sleep(0.001)"
+                ),
+                termination_marker=True,
+            ),
+            str(descendant_ready),
+            str(descendant_terminated),
+            str(descendant_pid),
+            str(tmp_path / "websocket-cancel-parent.terminated"),
+            filename="stdio-websocket-cancel-established.py",
+            protocol=StdioProtocol.WEBSOCKET,
+        )
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+
+        adapter = await connect_endpoint(endpoint)
+        transport = adapter._transport
+        assert transport is not None
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+        original_close = transport.close
+
+        async def delayed_close():
+            close_started.set()
+            await release_close.wait()
+            await original_close()
+
+        transport.close = delayed_close
+        close_task = asyncio.create_task(adapter.close())
+        try:
+            await close_started.wait()
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert not close_task.done()
+
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert not close_task.done()
+
+            release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+
+            pid = int(descendant_pid.read_text(encoding="utf-8"))
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("WebSocket stdio descendant survived process-group cleanup")
+        finally:
+            if not close_task.done():
+                await adapter.close()
 
     async def test_stdio_websocket_framing_failure_is_protocol_error(
         self, stdio_endpoint
