@@ -1,3 +1,11 @@
+---
+codex_repository: openai/codex
+codex_submodule_path: vendor/codex
+codex_git_tag: rust-v0.147.0
+codex_commit: be6e8eac029b183056b7e4402879f15d2c85f61b
+codex_commit_date: 2026-08-06
+---
+
 # Codex source reference
 
 Record of the Codex source files consulted when implementing codexctl's
@@ -8,13 +16,6 @@ protocol fact was read from*, not the facts themselves. Current public
 behavior is defined in [reference.md](reference.md); current internal
 design in [architecture.md](architecture.md). Do not use this document
 as an alternative source for current architecture or behavior.
-
-## Codex repository baseline
-
-- Repository: [`openai/codex`](https://github.com/openai/codex)
-- Submodule path: [vendor/codex](../vendor/codex)
-- Git tag: `rust-v0.147.0`
-- Commit: `be6e8eac029b183056b7e4402879f15d2c85f61b` (2026-08-06)
 
 ## Referenced files
 

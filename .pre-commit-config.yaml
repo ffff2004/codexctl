@@ -32,6 +32,14 @@ repos:
         always_run: true
         stages: [pre-commit]
 
+      - id: check-codex-reference
+        name: check Codex reference
+        entry: uv run --locked python scripts/check_codex_reference.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
       - id: pytest
         name: pytest
         entry: uv run --locked pytest
