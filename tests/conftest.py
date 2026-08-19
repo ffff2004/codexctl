@@ -1,4 +1,4 @@
-"""Shared test doubles: scripted fake app-server and fake endpoint."""
+"""Shared test doubles: scripted fake app-server and fake runtime provider."""
 
 import asyncio
 import sys
@@ -24,16 +24,16 @@ from codexctl.appserver import (
 )
 from codexctl.endpoint import (
     AppServerEndpoint,
-    StdioEndpointAdapter,
-    StdioProtocol,
+    StdioFraming,
+    StdioRuntimeProvider,
     StdioTarget,
-    UnixTarget,
+    UnixSocketTarget,
 )
 from codexctl.model import ProjectedEvent, StartConfig
 
 
 class FakeAppServer:
-    """Scripted ``AppServerPort`` implementation.
+    """Scripted ``AppServerClient`` implementation.
 
     Handlers are registered per method; unregistered methods fail with
     ``-32601`` like a real server would. Notifications are queued and served
@@ -97,7 +97,7 @@ class FakeAppServer:
                 return params
         return None
 
-    # -- AppServerPort ---------------------------------------------------------
+    # -- AppServerClient ---------------------------------------------------------
 
     async def read_thread(self, thread_id: str) -> AppServerThread | None:
         response = await self._request(
@@ -206,8 +206,8 @@ class FakeAppServer:
         self.closed = True
 
 
-class FakeEndpoint:
-    """Endpoint port returning a fixed fake endpoint."""
+class FakeRuntimeProvider:
+    """Runtime provider returning a fixed fake endpoint."""
 
     mode = "fake"
 
@@ -222,25 +222,25 @@ class FakeEndpoint:
         if mode is not None:
             self.mode = mode
 
-    async def resolve(self) -> AppServerEndpoint:
+    async def resolve_endpoint(self) -> AppServerEndpoint:
         if self._resolve_error is not None:
             raise self._resolve_error
         return AppServerEndpoint(
-            display="/fake.sock", target=UnixTarget(Path("/fake.sock"))
+            display="/fake.sock", target=UnixSocketTarget(Path("/fake.sock"))
         )
 
     def probe_cli_version(self) -> str | None:
         return self._cli_version
 
 
-def make_ctl(server: FakeAppServer, endpoint: FakeEndpoint | None = None):
+def make_ctl(server: FakeAppServer, runtime: FakeRuntimeProvider | None = None):
     """Build a CodexCtl wired to the fake server (no sockets involved)."""
     from codexctl.core import CodexCtl
 
     async def connect(endpoint_: AppServerEndpoint):
         return server
 
-    return CodexCtl(endpoint or FakeEndpoint(), connect=connect)
+    return CodexCtl(runtime or FakeRuntimeProvider(), connect=connect)
 
 
 async def collect(outcome) -> tuple[list, Any]:
@@ -266,30 +266,30 @@ def stdio_endpoint(tmp_path):
         source: str,
         *args: str,
         filename: str = "stdio-server.py",
-        protocol: StdioProtocol = StdioProtocol.JSONL,
+        framing: StdioFraming = StdioFraming.JSONL,
     ) -> AppServerEndpoint:
         script = tmp_path / filename
         script.write_text(source, encoding="utf-8")
         return AppServerEndpoint(
             "stdio",
-            StdioTarget((sys.executable, str(script), *args), protocol),
+            StdioTarget((sys.executable, str(script), *args), framing),
         )
 
     return make_endpoint
 
 
 @pytest.fixture
-def stdio_adapter(stdio_endpoint):
-    """Build the endpoint port for a temporary stdio server."""
+def stdio_runtime_provider(stdio_endpoint):
+    """Build a runtime provider for a temporary stdio server."""
 
-    def make_adapter(
+    def make_provider(
         source: str,
         *args: str,
         filename: str = "stdio-server.py",
-    ) -> StdioEndpointAdapter:
+    ) -> StdioRuntimeProvider:
         endpoint = stdio_endpoint(source, *args, filename=filename)
         target = endpoint.target
         assert isinstance(target, StdioTarget)
-        return StdioEndpointAdapter(target.argv[0], target.argv[1:])
+        return StdioRuntimeProvider(target.argv[0], target.argv[1:])
 
-    return make_adapter
+    return make_provider

@@ -101,7 +101,7 @@ Selector parsing is pure and follows Python semantics exactly
   [reference.md — Error codes](reference.md#error-codes) and
   [reference.md — resume](reference.md#resume).
 - **Doctor** reuses the same seams: endpoint resolution, connect +
-  initialize handshake, the endpoint-provided `probe_cli_version()` policy,
+  initialize handshake, the runtime-provider `probe_cli_version()` policy,
   the app-server lifecycle compatibility probe, and the rollout sessions
   directory check. Managed, external, and stdio endpoint behavior is defined
   by the [runtime resolution contract](reference.md#runtime-resolution). The
@@ -110,11 +110,11 @@ Selector parsing is pure and follows Python semantics exactly
 
 ### endpoint.py — runtime resolution
 
-`EndpointPort.resolve() -> AppServerEndpoint(display, target, runtime_pid,
+`RuntimeProvider.resolve_endpoint() -> AppServerEndpoint(display, target, runtime_pid,
 runtime_version)` has three implementations. `target` is a closed transport
 detail and is opaque to [core.py](../src/codexctl/core.py):
 
-- `ManagedDaemonAdapter` contains all daemon lifecycle knowledge: probe
+- `ManagedRuntimeProvider` contains all daemon lifecycle knowledge: probe
   the default control socket first (connecting + initializing to verify
   the runtime responds), otherwise run `codex app-server daemon start`
   and parse the last JSON line of stdout for `socketPath`/`pid`. No JSON
@@ -122,32 +122,32 @@ detail and is opaque to [core.py](../src/codexctl/core.py):
   `APP_SERVER_UNAVAILABLE`. The binary can be overridden with
   `CODEXCTL_CODEX_BIN` (see
   [reference.md — Runtime resolution](reference.md#runtime-resolution)).
-- `ExternalEndpointAdapter` resolves external endpoint configuration using
+- `ExternalRuntimeProvider` resolves external endpoint configuration using
   the [public endpoint contract](reference.md#runtime-resolution), then
   performs no lifecycle mutation. Its resolved target is transport-private;
   token contents are never part of the resolved endpoint.
-- `StdioEndpointAdapter` resolves `display="stdio"` plus an exact argv tuple
-  and a `StdioProtocol` selector without launching anything. The private
+- `StdioRuntimeProvider` resolves `display="stdio"` plus an exact argv tuple
+  and a `StdioFraming` selector without launching anything. The private
   `_OwnedStdioProcess` owns the child process for a connection; JSONL and
   WebSocket stdio transports share that lifecycle. Their externally visible
   mode contract is defined in
   [reference.md — Runtime resolution](reference.md#runtime-resolution).
 
-The port also carries a best-effort `probe_cli_version()` used by doctor;
-each endpoint adapter owns the policy for that probe.
+The runtime-provider interface also carries a best-effort `probe_cli_version()` used by doctor;
+each provider owns the policy for that probe.
 
 ### appserver.py — the compatibility firewall
 
 Raw Codex protocol messages never leave this module. Callers use typed
 thread/turn operations and see projected results, `JsonRpcError`, and
 `ProjectedEvent` only. The generic JSON-RPC request helper is private to this
-module; protocol method names and payload construction do not cross the port.
+module; protocol method names and payload construction do not cross the client interface.
 
 Transport and session facts (verified against the Codex source):
 
-- `connect_endpoint()` is the sole transport entry point. It owns transport
+- `connect_app_server()` is the sole transport entry point. It owns transport
   selection, credential-file loading, connection options, process startup,
-  and construction of the shared JSON-RPC session; compression is disabled
+  and construction of the app-server session; compression is disabled
   for Codex compatibility. Startup, framing, and cleanup behavior are defined
   in [reference.md — Runtime resolution](reference.md#runtime-resolution).
 - Messages are JSON-RPC 2.0-shaped without the `"jsonrpc"` header.
@@ -155,10 +155,10 @@ Transport and session facts (verified against the Codex source):
   (`clientInfo`, `capabilities: {experimentalApi: false}`) followed by the
   `initialized` notification before any other traffic.
 
-A shared JSON-RPC session sits above the message transports
+An `AppServerSession` sits above the message transports
 `WebSocketMessageTransport` and `JsonlStdioMessageTransport`. The session owns
 JSON decoding, pending-request routing, notification projection, and
-server-initiated request handling. `StdioWebSocketConnection` drives the
+server-initiated request handling. `WebSocketOverStdioConnection` drives the
 WebSocket Sans-I/O client over `_RawByteStream`; it performs the fixed
 `ws://localhost/` Upgrade, disables compression, handles control frames and
 fragmentation, and exposes only complete text or binary messages. The public
@@ -172,7 +172,7 @@ before awaiting it, and `close()` joins the same task. Both waiters shield the
 cleanup task from caller cancellation, retaining cancellation while repeatedly
 waiting if needed, so the reader and close operation do not finish before
 transport and child-process cleanup completes.
-The adapter also probes the required lifecycle RPC surface for `doctor` using
+The session also probes the required lifecycle RPC surface for `doctor` using
 sentinel requests; method-not-found responses are reported as unavailable,
 while ordinary domain errors prove that dispatch succeeded.
 Internally, declined interactions are re-emitted as a synthetic
@@ -214,7 +214,7 @@ with captured streams.
 ## Testing strategy
 
 Tests drive `CodexCtl` through a scripted `FakeAppServer` implementing
-the `AppServerPort` shape (see [tests/conftest.py](../tests/conftest.py)); no sockets are
+the `AppServerClient` shape (see [tests/conftest.py](../tests/conftest.py)); no sockets are
 opened. This covers all lifecycle behaviors pinned down above: start and
 resume contracts, busy detection, steer with `expectedTurnId`, interrupt
 waiting, read-only status, selector semantics, follow replay/live dedup

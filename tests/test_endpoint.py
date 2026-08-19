@@ -6,13 +6,13 @@ from pathlib import Path
 import pytest
 
 from codexctl.endpoint import (
-    ExternalEndpointAdapter,
-    ManagedDaemonAdapter,
-    StdioEndpointAdapter,
-    StdioProtocol,
+    ExternalRuntimeProvider,
+    ManagedRuntimeProvider,
+    StdioFraming,
+    StdioRuntimeProvider,
     StdioTarget,
-    TcpTarget,
-    UnixTarget,
+    UnixSocketTarget,
+    WebSocketTarget,
     _last_json_object,
     default_control_socket_path,
 )
@@ -48,7 +48,7 @@ class TestLastJsonObject:
         assert _last_json_object("{broken\n" + '{"ok": true}\n') == {"ok": True}
 
 
-class TestManagedDaemonAdapter:
+class TestManagedRuntimeProvider:
     async def test_daemon_start_parses_lifecycle_json(self, tmp_path):
         home = tmp_path / "home"
         script = _write_script(
@@ -57,9 +57,9 @@ class TestManagedDaemonAdapter:
             'echo \'{"status":"started","socketPath":"/tmp/fake.sock",'
             '"pid":4242,"appServerVersion":"0.101.0"}\'',
         )
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
-        endpoint = await adapter.resolve()
-        assert endpoint.target == UnixTarget(Path("/tmp/fake.sock"))
+        provider = ManagedRuntimeProvider(codex_bin=script, home=home)
+        endpoint = await provider.resolve_endpoint()
+        assert endpoint.target == UnixSocketTarget(Path("/tmp/fake.sock"))
         assert endpoint.runtime_pid == 4242
         assert endpoint.runtime_version == "0.101.0"
 
@@ -69,91 +69,91 @@ class TestManagedDaemonAdapter:
             {"status": "alreadyRunning", "socketPath": "/tmp/r.sock", "pid": 7}
         )
         script = _write_script(tmp_path, f"echo '{payload}'")
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=home)
-        endpoint = await adapter.resolve()
-        assert endpoint.target == UnixTarget(Path("/tmp/r.sock"))
+        provider = ManagedRuntimeProvider(codex_bin=script, home=home)
+        endpoint = await provider.resolve_endpoint()
+        assert endpoint.target == UnixSocketTarget(Path("/tmp/r.sock"))
         assert endpoint.runtime_pid == 7
 
     async def test_no_json_means_incompatible_codex(self, tmp_path):
         script = _write_script(tmp_path, "echo 'ancient codex without lifecycle json'")
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.resolve()
+            await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
 
     async def test_missing_socket_path_means_incompatible_codex(self, tmp_path):
         script = _write_script(tmp_path, 'echo \'{"status":"started"}\'')
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.resolve()
+            await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
 
     async def test_nonzero_exit_means_unavailable(self, tmp_path):
         script = _write_script(tmp_path, "echo 'boom' 1>&2\nexit 1")
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.resolve()
+            await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_missing_binary_means_unavailable(self, tmp_path):
-        adapter = ManagedDaemonAdapter(
+        provider = ManagedRuntimeProvider(
             codex_bin=str(tmp_path / "does-not-exist"), home=tmp_path / "home"
         )
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.resolve()
+            await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     def test_codex_bin_from_environment(self, monkeypatch):
         monkeypatch.setenv("CODEXCTL_CODEX_BIN", "/opt/codex/bin/codex")
-        adapter = ManagedDaemonAdapter()
-        assert adapter._codex_bin == "/opt/codex/bin/codex"
+        provider = ManagedRuntimeProvider()
+        assert provider._codex_bin == "/opt/codex/bin/codex"
 
     def test_probe_cli_version_reads_first_output_line(self, tmp_path):
         script = _write_script(tmp_path, "echo 'codex-cli 0.101.0'\necho 'noise'")
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
-        assert adapter.probe_cli_version() == "codex-cli 0.101.0"
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
+        assert provider.probe_cli_version() == "codex-cli 0.101.0"
 
     def test_probe_cli_version_none_when_binary_missing(self, tmp_path):
-        adapter = ManagedDaemonAdapter(
+        provider = ManagedRuntimeProvider(
             codex_bin=str(tmp_path / "does-not-exist"), home=tmp_path / "home"
         )
-        assert adapter.probe_cli_version() is None
+        assert provider.probe_cli_version() is None
 
     def test_probe_cli_version_none_on_nonzero_exit(self, tmp_path):
         script = _write_script(tmp_path, "exit 1")
-        adapter = ManagedDaemonAdapter(codex_bin=script, home=tmp_path / "home")
-        assert adapter.probe_cli_version() is None
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
+        assert provider.probe_cli_version() is None
 
 
-class TestExternalEndpointAdapter:
+class TestExternalRuntimeProvider:
     async def test_missing_socket_is_unavailable(self, tmp_path):
-        adapter = ExternalEndpointAdapter(f"unix://{tmp_path / 'missing.sock'}")
+        provider = ExternalRuntimeProvider(f"unix://{tmp_path / 'missing.sock'}")
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.resolve()
+            await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_existing_socket_resolves_without_lifecycle(self, tmp_path):
         socket_path = tmp_path / "external.sock"
         socket_path.touch()
-        adapter = ExternalEndpointAdapter(f"unix://{socket_path}")
-        endpoint = await adapter.resolve()
-        assert endpoint.target == UnixTarget(socket_path)
+        provider = ExternalRuntimeProvider(f"unix://{socket_path}")
+        endpoint = await provider.resolve_endpoint()
+        assert endpoint.target == UnixSocketTarget(socket_path)
         assert endpoint.runtime_pid is None
-        assert adapter.mode == "external"
+        assert provider.mode == "external"
 
     def test_probe_cli_version_is_none(self, tmp_path):
-        adapter = ExternalEndpointAdapter(f"unix://{tmp_path / 'external.sock'}")
-        assert adapter.probe_cli_version() is None
+        provider = ExternalRuntimeProvider(f"unix://{tmp_path / 'external.sock'}")
+        assert provider.probe_cli_version() is None
 
     async def test_tcp_endpoint_preserves_path_query_and_defers_token_read(
         self, tmp_path
     ):
         token_file = tmp_path / "token"
-        adapter = ExternalEndpointAdapter(
+        provider = ExternalRuntimeProvider(
             "ws://127.0.0.1:7777/app?version=1", token_file
         )
-        endpoint = await adapter.resolve()
-        assert endpoint.target == TcpTarget(
+        endpoint = await provider.resolve_endpoint()
+        assert endpoint.target == WebSocketTarget(
             "ws://127.0.0.1:7777/app?version=1", token_file
         )
 
@@ -178,7 +178,7 @@ class TestExternalEndpointAdapter:
     )
     def test_invalid_endpoint_is_usage_error(self, value):
         with pytest.raises(CodexCtlError) as excinfo:
-            ExternalEndpointAdapter(value)
+            ExternalRuntimeProvider(value)
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
 
     @pytest.mark.parametrize(
@@ -197,47 +197,47 @@ class TestExternalEndpointAdapter:
     )
     def test_ws_endpoint_rejects_url_credentials_without_reflecting_them(self, query):
         with pytest.raises(CodexCtlError) as excinfo:
-            ExternalEndpointAdapter(f"ws://127.0.0.1:7777/app?{query}")
+            ExternalRuntimeProvider(f"ws://127.0.0.1:7777/app?{query}")
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
         assert "secret" not in excinfo.value.message
 
     def test_ws_endpoint_keeps_ordinary_query_parameters(self):
-        endpoint = ExternalEndpointAdapter(
+        endpoint = ExternalRuntimeProvider(
             "ws://127.0.0.1:7777/app?client=codexctl&trace=1"
         )._endpoint
-        assert endpoint.target == TcpTarget(
+        assert endpoint.target == WebSocketTarget(
             "ws://127.0.0.1:7777/app?client=codexctl&trace=1", None
         )
 
     def test_token_file_is_rejected_for_unix_endpoint(self, tmp_path):
         with pytest.raises(CodexCtlError) as excinfo:
-            ExternalEndpointAdapter("unix:///tmp/app-server.sock", tmp_path / "token")
+            ExternalRuntimeProvider("unix:///tmp/app-server.sock", tmp_path / "token")
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
 
 
-class TestStdioEndpointAdapter:
+class TestStdioRuntimeProvider:
     async def test_resolves_exact_argv_without_starting_a_process(self):
-        adapter = StdioEndpointAdapter("app-server", ("--flag", "--", "value"))
+        provider = StdioRuntimeProvider("app-server", ("--flag", "--", "value"))
 
-        endpoint = await adapter.resolve()
+        endpoint = await provider.resolve_endpoint()
 
         assert endpoint.display == "stdio"
         assert endpoint.target == StdioTarget(
-            ("app-server", "--flag", "--", "value"), StdioProtocol.JSONL
+            ("app-server", "--flag", "--", "value"), StdioFraming.JSONL
         )
         assert endpoint.runtime_pid is None
-        assert adapter.mode == "stdio"
-        assert adapter.probe_cli_version() is None
+        assert provider.mode == "stdio"
+        assert provider.probe_cli_version() is None
 
     async def test_resolves_websocket_protocol_without_starting_a_process(self):
-        adapter = StdioEndpointAdapter(
-            "codex", ("app-server", "proxy"), StdioProtocol.WEBSOCKET
+        provider = StdioRuntimeProvider(
+            "codex", ("app-server", "proxy"), StdioFraming.WEBSOCKET
         )
 
-        endpoint = await adapter.resolve()
+        endpoint = await provider.resolve_endpoint()
 
         assert endpoint.target == StdioTarget(
-            ("codex", "app-server", "proxy"), StdioProtocol.WEBSOCKET
+            ("codex", "app-server", "proxy"), StdioFraming.WEBSOCKET
         )
 
 

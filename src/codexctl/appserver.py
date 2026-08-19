@@ -1,4 +1,4 @@
-"""Codex app-server adapter: transport, JSON-RPC routing, and projection.
+"""Codex app-server client: transport, JSON-RPC routing, and projection.
 
 This is the compatibility firewall between the Codex wire protocol and the
 rest of ``codexctl``. Raw protocol messages stay inside this module; callers
@@ -227,7 +227,7 @@ type AppServerResponse = (
 
 
 @runtime_checkable
-class AppServerPort(Protocol):
+class AppServerClient(Protocol):
     """Typed app-server operations used by the orchestration layer."""
 
     user_agent: str | None
@@ -510,7 +510,7 @@ class _RawByteStream:
         self._process.write_nowait(data)
 
 
-class StdioWebSocketConnection:
+class WebSocketOverStdioConnection:
     """Sans-I/O WebSocket client running over an owned stdio byte stream."""
 
     _HTTP_RESPONSE_LIMIT = 64 * 1024
@@ -535,7 +535,9 @@ class StdioWebSocketConnection:
         self._closed = False
 
     @classmethod
-    async def connect(cls, process: _OwnedStdioProcess) -> "StdioWebSocketConnection":
+    async def connect(
+        cls, process: _OwnedStdioProcess
+    ) -> "WebSocketOverStdioConnection":
         connection = cls(process)
         try:
             await connection._handshake()
@@ -638,11 +640,11 @@ class StdioWebSocketConnection:
         await self._process.close()
 
 
-class JsonRpcAppServerSession:
+class AppServerSession:
     """Shared JSON-RPC session over a transport-specific message stream.
 
     Transport setup is intentionally outside this session implementation so
-    Unix and TCP endpoints share reader routing, projection, and the
+    Unix-socket and WebSocket endpoints share reader routing, projection, and the
     unattended interaction policy.
     """
 
@@ -1000,19 +1002,24 @@ class JsonRpcAppServerSession:
         )
 
 
-async def connect_endpoint(
+async def connect_app_server(
     endpoint: "AppServerEndpoint", timeout: float = 15.0
-) -> AppServerPort:
+) -> AppServerClient:
     """Connect one resolved endpoint without exposing transport to callers."""
     # Delayed import avoids an endpoint -> appserver import cycle during
     # managed-runtime probing.
-    from .endpoint import StdioProtocol, StdioTarget, TcpTarget, UnixTarget
+    from .endpoint import (
+        StdioFraming,
+        StdioTarget,
+        UnixSocketTarget,
+        WebSocketTarget,
+    )
 
     target = endpoint.target
-    adapter: JsonRpcAppServerSession | None = None
+    app_server: AppServerSession | None = None
     try:
         async with asyncio.timeout(timeout):
-            if isinstance(target, UnixTarget):
+            if isinstance(target, UnixSocketTarget):
                 from websockets.asyncio.client import unix_connect
 
                 # Codex's Unix transport rejects the client's default
@@ -1021,7 +1028,7 @@ async def connect_endpoint(
                     str(target.path), max_size=None, compression=None
                 )
                 transport: _AppServerMessageTransport = WebSocketMessageTransport(conn)
-            elif isinstance(target, TcpTarget):
+            elif isinstance(target, WebSocketTarget):
                 from websockets.asyncio.client import connect
 
                 headers: dict[str, str] | None = None
@@ -1037,40 +1044,40 @@ async def connect_endpoint(
                 transport = WebSocketMessageTransport(conn)
             elif isinstance(target, StdioTarget):
                 process = await _launch_stdio_process(target.argv)
-                if target.protocol is StdioProtocol.WEBSOCKET:
+                if target.framing is StdioFraming.WEBSOCKET:
                     transport = WebSocketMessageTransport(
-                        await StdioWebSocketConnection.connect(process)
+                        await WebSocketOverStdioConnection.connect(process)
                     )
                 else:
                     transport = JsonlStdioMessageTransport(process)
             else:  # pragma: no cover - targets are a closed endpoint vocabulary
                 raise RuntimeError("unknown app-server endpoint target")
 
-            adapter = JsonRpcAppServerSession(transport, endpoint.display)
-            adapter._reader_task = asyncio.create_task(adapter._reader())
-            await adapter._initialize()
+            app_server = AppServerSession(transport, endpoint.display)
+            app_server._reader_task = asyncio.create_task(app_server._reader())
+            await app_server._initialize()
     except asyncio.CancelledError:
-        if adapter is not None:
-            await adapter.close()
+        if app_server is not None:
+            await app_server.close()
         raise
     except asyncio.TimeoutError as exc:
-        if adapter is not None:
-            await adapter.close()
+        if app_server is not None:
+            await app_server.close()
         raise CodexCtlError(
             ErrorCode.APP_SERVER_UNAVAILABLE,
             f"app-server startup or initialize timed out after {timeout:g}s",
             cause=exc,
         ) from exc
     except CodexCtlError:
-        if adapter is not None:
-            await adapter.close()
+        if app_server is not None:
+            await app_server.close()
         raise
     except Exception as exc:  # noqa: BLE001 - mapped to application error
-        if adapter is not None:
-            await adapter.close()
+        if app_server is not None:
+            await app_server.close()
         raise _unavailable(endpoint.display, exc) from exc
-    assert adapter is not None
-    return adapter
+    assert app_server is not None
+    return app_server
 
 
 async def _launch_stdio_process(argv: tuple[str, ...]) -> _OwnedStdioProcess:
@@ -1227,7 +1234,7 @@ def _is_missing_method_error(exc: JsonRpcError) -> bool:
 
 
 def project_response(method: str, response: Any) -> AppServerResponse:
-    """Project one JSON-RPC result into the adapter's typed interface."""
+    """Project one JSON-RPC result into the client's typed interface."""
     payload = response if isinstance(response, dict) else {}
     if method == "initialize":
         return InitializeResponse(

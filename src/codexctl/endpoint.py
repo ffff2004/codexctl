@@ -2,11 +2,11 @@
 
 Three real production behaviors justify this seam:
 
-- ``ManagedDaemonAdapter`` may start the experimental Codex daemon lifecycle
+- ``ManagedRuntimeProvider`` may start the experimental Codex daemon lifecycle
   to make a compatible shared app-server available.
-- ``ExternalEndpointAdapter`` honors ``--endpoint`` and performs no lifecycle
+- ``ExternalRuntimeProvider`` honors ``--endpoint`` and performs no lifecycle
   mutation at all.
-- ``StdioEndpointAdapter`` records one caller-supplied process invocation;
+- ``StdioRuntimeProvider`` records one caller-supplied process invocation;
   process ownership begins when the app-server transport connects.
 
 Core execution only ever sees an :class:`AppServerEndpoint`.
@@ -31,24 +31,24 @@ class AppServerEndpoint:
     """A resolved app-server location, opaque outside transport code."""
 
     display: str
-    target: "UnixTarget | TcpTarget | StdioTarget" = field(repr=False)
+    target: "UnixSocketTarget | WebSocketTarget | StdioTarget" = field(repr=False)
     runtime_pid: int | None = None
     runtime_version: str | None = None
 
 
 @dataclass(frozen=True)
-class UnixTarget:
+class UnixSocketTarget:
     path: Path
 
 
 @dataclass(frozen=True)
-class TcpTarget:
+class WebSocketTarget:
     url: str
     token_file: Path | None
 
 
-class StdioProtocol(StrEnum):
-    """Wire protocol spoken over a child process's stdin/stdout pipes."""
+class StdioFraming(StrEnum):
+    """Message framing carried over a child process's stdin/stdout pipes."""
 
     JSONL = "jsonl"
     WEBSOCKET = "websocket"
@@ -59,7 +59,7 @@ class StdioTarget:
     """Exact argv for a one-shot stdio app-server process."""
 
     argv: tuple[str, ...]
-    protocol: StdioProtocol = StdioProtocol.JSONL
+    framing: StdioFraming = StdioFraming.JSONL
 
 
 # Endpoint URLs are locations, never credential carriers. Keep this closed
@@ -78,10 +78,10 @@ _CREDENTIAL_QUERY_KEYS = frozenset(
 
 
 @runtime_checkable
-class EndpointPort(Protocol):
+class RuntimeProvider(Protocol):
     mode: str
 
-    async def resolve(self) -> AppServerEndpoint: ...
+    async def resolve_endpoint(self) -> AppServerEndpoint: ...
 
     def probe_cli_version(self) -> str | None:
         """Best-effort codex CLI version probe; never raises."""
@@ -102,7 +102,7 @@ def _pid_from_pidfile(home: Path | None = None) -> int | None:
         return None
 
 
-class ManagedDaemonAdapter:
+class ManagedRuntimeProvider:
     """Resolves the managed shared app-server, starting the daemon if needed.
 
     All daemon lifecycle knowledge (command spelling, pidfile layout, socket
@@ -116,7 +116,7 @@ class ManagedDaemonAdapter:
         self._codex_bin = codex_bin or os.environ.get("CODEXCTL_CODEX_BIN", "codex")
         self._home = home
 
-    async def resolve(self) -> AppServerEndpoint:
+    async def resolve_endpoint(self) -> AppServerEndpoint:
         socket_path = default_control_socket_path(self._home)
         probed = await self._probe(socket_path)
         if probed is not None:
@@ -126,20 +126,20 @@ class ManagedDaemonAdapter:
     async def _probe(self, socket_path: Path) -> AppServerEndpoint | None:
         if not socket_path.exists():
             return None
-        from .appserver import connect_endpoint
+        from .appserver import connect_app_server
 
         try:
-            adapter = await connect_endpoint(
-                AppServerEndpoint(str(socket_path), UnixTarget(socket_path)),
+            app_server = await connect_app_server(
+                AppServerEndpoint(str(socket_path), UnixSocketTarget(socket_path)),
                 timeout=5.0,
             )
         except CodexCtlError:
             return None
-        version = adapter.app_server_version
-        await adapter.close()
+        version = app_server.app_server_version
+        await app_server.close()
         return AppServerEndpoint(
             display=str(socket_path),
-            target=UnixTarget(socket_path),
+            target=UnixSocketTarget(socket_path),
             runtime_pid=_pid_from_pidfile(self._home),
             runtime_version=version,
         )
@@ -182,7 +182,7 @@ class ManagedDaemonAdapter:
         pid = payload.get("pid")
         return AppServerEndpoint(
             display=str(socket_path),
-            target=UnixTarget(Path(socket_path)),
+            target=UnixSocketTarget(Path(socket_path)),
             runtime_pid=int(pid) if pid is not None else None,
             runtime_version=payload.get("appServerVersion"),
         )
@@ -219,7 +219,7 @@ def _last_json_object(text: str) -> dict | None:
     return None
 
 
-class ExternalEndpointAdapter:
+class ExternalRuntimeProvider:
     """Resolves a caller-supplied endpoint; never manages its lifecycle."""
 
     mode = "external"
@@ -227,9 +227,9 @@ class ExternalEndpointAdapter:
     def __init__(self, endpoint: str, token_file: Path | None = None) -> None:
         self._endpoint = parse_external_endpoint(endpoint, token_file)
 
-    async def resolve(self) -> AppServerEndpoint:
+    async def resolve_endpoint(self) -> AppServerEndpoint:
         target = self._endpoint.target
-        if isinstance(target, UnixTarget) and not target.path.exists():
+        if isinstance(target, UnixSocketTarget) and not target.path.exists():
             raise CodexCtlError(
                 ErrorCode.APP_SERVER_UNAVAILABLE,
                 f"external app-server socket does not exist: {target.path}",
@@ -241,7 +241,7 @@ class ExternalEndpointAdapter:
         return None
 
 
-class StdioEndpointAdapter:
+class StdioRuntimeProvider:
     """Resolves a caller-configured, one-shot stdio app-server process."""
 
     mode = "stdio"
@@ -250,12 +250,12 @@ class StdioEndpointAdapter:
         self,
         executable: str,
         args: tuple[str, ...] = (),
-        protocol: StdioProtocol = StdioProtocol.JSONL,
+        framing: StdioFraming = StdioFraming.JSONL,
     ) -> None:
-        self._target = StdioTarget((executable, *args), protocol)
+        self._target = StdioTarget((executable, *args), framing)
 
-    async def resolve(self) -> AppServerEndpoint:
-        # Resolution is deliberately side-effect free. The connection adapter
+    async def resolve_endpoint(self) -> AppServerEndpoint:
+        # Resolution is deliberately side-effect free. The connection layer
         # owns spawning and cleanup so every operation gets one fresh process.
         return AppServerEndpoint(display="stdio", target=self._target)
 
@@ -269,7 +269,7 @@ def parse_external_endpoint(
 ) -> AppServerEndpoint:
     """Parse the deliberately small external endpoint vocabulary.
 
-    Tokens are represented only by their file path and are read by the TCP
+    Tokens are represented only by their file path and are read by the WebSocket
     transport immediately before it opens a connection.
     """
     try:
@@ -298,7 +298,7 @@ def parse_external_endpoint(
         path = Path(unquote(parsed.path))
         if not path.is_absolute():  # Defensive: keep URI validation explicit.
             raise UsageError("--endpoint unix URI must be unix:///absolute/path")
-        return AppServerEndpoint(display=endpoint, target=UnixTarget(path))
+        return AppServerEndpoint(display=endpoint, target=UnixSocketTarget(path))
 
     if parsed.scheme != "ws":
         raise UsageError("--endpoint must use unix:///absolute/path or ws://host:port")
@@ -319,4 +319,6 @@ def parse_external_endpoint(
         raise UsageError(
             "--endpoint must not carry credentials; use --endpoint-token-file"
         )
-    return AppServerEndpoint(display=endpoint, target=TcpTarget(endpoint, token_file))
+    return AppServerEndpoint(
+        display=endpoint, target=WebSocketTarget(endpoint, token_file)
+    )

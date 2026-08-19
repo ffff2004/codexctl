@@ -14,10 +14,10 @@ from typing import Any, Iterable, cast
 from .appserver import CLIENT_VERSION
 from .core import CodexCtl, history_to_events
 from .endpoint import (
-    ExternalEndpointAdapter,
-    ManagedDaemonAdapter,
-    StdioEndpointAdapter,
-    StdioProtocol,
+    ExternalRuntimeProvider,
+    ManagedRuntimeProvider,
+    StdioFraming,
+    StdioRuntimeProvider,
 )
 from .model import (
     ApprovalPolicy,
@@ -157,14 +157,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         metavar="EXECUTABLE",
         help=(
             "run a one-shot app-server using the child process's "
-            "stdin/stdout for the selected stdio protocol"
+            "stdin/stdout for the selected stdio framing"
         ),
     )
     parser.add_argument(
-        "--stdio-protocol",
-        choices=tuple(protocol.value for protocol in StdioProtocol),
-        default=StdioProtocol.JSONL.value,
-        help="protocol carried by the stdio child pipes (default: jsonl)",
+        "--stdio-framing",
+        choices=tuple(framing.value for framing in StdioFraming),
+        default=StdioFraming.JSONL.value,
+        help="framing carried by the stdio child pipes (default: jsonl)",
     )
     parser.add_argument(
         "--stdio-arg",
@@ -274,14 +274,14 @@ def _split_prompt(argv: list[str]) -> tuple[list[str], str | None]:
     return argv, None
 
 
-def _select_endpoint(args: argparse.Namespace) -> Any:
-    """Apply the mutually exclusive endpoint-mode contract in one place."""
+def _select_runtime_provider(args: argparse.Namespace) -> Any:
+    """Select the runtime provider implied by mutually exclusive CLI modes."""
     stdio_args = tuple(args.stdio_args)
-    stdio_protocol = StdioProtocol(args.stdio_protocol)
+    stdio_framing = StdioFraming(args.stdio_framing)
     has_stdio = (
         args.stdio_exec is not None
         or bool(stdio_args)
-        or stdio_protocol is not StdioProtocol.JSONL
+        or stdio_framing is not StdioFraming.JSONL
     )
     has_external = args.endpoint is not None or args.endpoint_token_file is not None
     if has_stdio and has_external:
@@ -291,15 +291,15 @@ def _select_endpoint(args: argparse.Namespace) -> Any:
         )
     if stdio_args and args.stdio_exec is None:
         raise UsageError("--stdio-arg requires --stdio-exec")
-    if stdio_protocol is StdioProtocol.WEBSOCKET and args.stdio_exec is None:
-        raise UsageError("--stdio-protocol websocket requires --stdio-exec")
+    if stdio_framing is StdioFraming.WEBSOCKET and args.stdio_exec is None:
+        raise UsageError("--stdio-framing websocket requires --stdio-exec")
     if args.stdio_exec is not None:
-        return StdioEndpointAdapter(args.stdio_exec, stdio_args, stdio_protocol)
+        return StdioRuntimeProvider(args.stdio_exec, stdio_args, stdio_framing)
     if args.endpoint is not None:
-        return ExternalEndpointAdapter(args.endpoint, args.endpoint_token_file)
+        return ExternalRuntimeProvider(args.endpoint, args.endpoint_token_file)
     if args.endpoint_token_file is not None:
         raise UsageError("--endpoint-token-file requires --endpoint")
-    return ManagedDaemonAdapter()
+    return ManagedRuntimeProvider()
 
 
 def _require_prompt(prompt: str | None, message: str) -> str:
@@ -438,11 +438,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        endpoint = _select_endpoint(args)
+        runtime = _select_runtime_provider(args)
     except UsageError as exc:
         _emit_error(exc, mode)
         return EXIT_USAGE
-    ctl = CodexCtl(endpoint)
+    ctl = CodexCtl(runtime)
 
     try:
         return asyncio.run(_execute(ctl, command, mode))

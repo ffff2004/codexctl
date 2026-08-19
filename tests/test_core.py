@@ -10,7 +10,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from conftest import FakeAppServer, FakeEndpoint, collect, make_ctl
+from conftest import FakeAppServer, FakeRuntimeProvider, collect, make_ctl
 
 import codexctl.core as core
 from codexctl.appserver import UNSUPPORTED_INTERACTION_METHOD
@@ -1171,7 +1171,7 @@ class TestDoctor:
         assert lifecycle_check.detail == "unavailable: steer turn"
 
     async def test_unreachable_endpoint_reports_incompatible_false(self):
-        endpoint = FakeEndpoint(
+        endpoint = FakeRuntimeProvider(
             resolve_error=CodexCtlError(ErrorCode.APP_SERVER_UNAVAILABLE, "no daemon")
         )
         server = FakeAppServer()
@@ -1180,7 +1180,7 @@ class TestDoctor:
         assert snapshot.checks[0].ok is False
 
     async def test_managed_mode_reports_cli_version_from_endpoint_port(self):
-        endpoint = FakeEndpoint(cli_version="codex-cli 0.101.0", mode="managed")
+        endpoint = FakeRuntimeProvider(cli_version="codex-cli 0.101.0", mode="managed")
         server = FakeAppServer()
         snapshot = await make_ctl(server, endpoint).run(Doctor())
         assert snapshot.codex_cli_version == "codex-cli 0.101.0"
@@ -1189,7 +1189,7 @@ class TestDoctor:
         assert cli_check.detail == "codex-cli 0.101.0"
 
     async def test_external_mode_skips_cli_version_check(self):
-        endpoint = FakeEndpoint(mode="external")
+        endpoint = FakeRuntimeProvider(mode="external")
         server = FakeAppServer()
         snapshot = await make_ctl(server, endpoint).run(Doctor())
         assert snapshot.endpoint_mode == "external"
@@ -1197,7 +1197,7 @@ class TestDoctor:
         assert all(c.name != "codex cli version" for c in snapshot.checks)
 
     async def test_stdio_mode_exposes_only_mode_in_doctor_document(self):
-        endpoint = FakeEndpoint(mode="stdio")
+        endpoint = FakeRuntimeProvider(mode="stdio")
         snapshot = await make_ctl(FakeAppServer(), endpoint).run(Doctor())
 
         document = snapshot_document(snapshot)

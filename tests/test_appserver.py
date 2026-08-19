@@ -19,9 +19,9 @@ from websockets.asyncio.server import serve, unix_serve
 from codexctl.appserver import (
     REQUIRED_LIFECYCLE_OPERATIONS,
     UNSUPPORTED_INTERACTION_METHOD,
+    AppServerSession,
     AppServerTurn,
     JsonlStdioMessageTransport,
-    JsonRpcAppServerSession,
     JsonRpcError,
     ThreadListResponse,
     ThreadResponse,
@@ -29,7 +29,7 @@ from codexctl.appserver import (
     _decode_message,
     _launch_stdio_process,
     _OwnedStdioProcess,
-    connect_endpoint,
+    connect_app_server,
     parse_user_agent_version,
     project_item,
     project_notification,
@@ -38,10 +38,10 @@ from codexctl.appserver import (
 )
 from codexctl.endpoint import (
     AppServerEndpoint,
-    StdioProtocol,
+    StdioFraming,
     StdioTarget,
-    TcpTarget,
-    UnixTarget,
+    UnixSocketTarget,
+    WebSocketTarget,
 )
 from codexctl.model import (
     ApprovalPolicy,
@@ -227,14 +227,14 @@ class TestProjectResponse:
 
 class TestTypedOperations:
     async def test_start_thread_serializes_upstream_sandbox_enum(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
             calls.append((method, params))
             return project_response(method, {"thread": {"id": "t1"}})
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
         for policy, wire_value in (
             (None, "workspace-write"),
@@ -242,24 +242,26 @@ class TestTypedOperations:
             (SandboxPolicy.workspaceWrite, "workspace-write"),
             (SandboxPolicy.dangerFullAccess, "danger-full-access"),
         ):
-            assert (await adapter.start_thread(StartConfig(sandbox=policy))).id == "t1"
+            assert (
+                await app_server.start_thread(StartConfig(sandbox=policy))
+            ).id == "t1"
             assert calls[-1] == (
                 "thread/start",
                 {"approvalPolicy": "never", "sandbox": wire_value},
             )
 
     async def test_start_thread_rejects_unsupported_sandbox_policy(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
             calls.append((method, params))
             return project_response(method, {"thread": {"id": "t1"}})
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter.start_thread(StartConfig(sandbox="not-a-policy"))  # type: ignore[arg-type]
+            await app_server.start_thread(StartConfig(sandbox="not-a-policy"))  # type: ignore[arg-type]
 
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
         assert "unsupported sandbox policy 'not-a-policy'" in excinfo.value.message
@@ -268,17 +270,17 @@ class TestTypedOperations:
     async def test_start_thread_serializes_approval_policy_and_reviewer(
         self, monkeypatch
     ):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
             calls.append((method, params))
             return project_response(method, {"thread": {"id": "t1"}})
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
         # Default unattended start: never, reviewer omitted.
-        await adapter.start_thread(StartConfig())
+        await app_server.start_thread(StartConfig())
         assert calls[-1] == (
             "thread/start",
             {"approvalPolicy": "never", "sandbox": "workspace-write"},
@@ -286,7 +288,7 @@ class TestTypedOperations:
         assert "approvalsReviewer" not in calls[-1][1]
 
         # Auto review: on-request + auto_review reviewer.
-        await adapter.start_thread(
+        await app_server.start_thread(
             StartConfig(
                 approval_policy=ApprovalPolicy.onRequest,
                 approvals_reviewer=ApprovalsReviewer.autoReview,
@@ -302,25 +304,27 @@ class TestTypedOperations:
         )
 
     async def test_start_thread_serializes_each_approval_policy(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         calls = []
 
         async def request(method, params=None):
             calls.append((method, params))
             return project_response(method, {"thread": {"id": "t1"}})
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
         for policy, wire_value in (
             (ApprovalPolicy.untrusted, "untrusted"),
             (ApprovalPolicy.onRequest, "on-request"),
             (ApprovalPolicy.never, "never"),
         ):
-            await adapter.start_thread(StartConfig(approval_policy=policy))
+            await app_server.start_thread(StartConfig(approval_policy=policy))
             assert calls[-1][1]["approvalPolicy"] == wire_value
 
-    async def test_operations_keep_wire_requests_inside_the_adapter(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+    async def test_operations_keep_wire_requests_inside_the_app_server(
+        self, monkeypatch
+    ):
+        app_server = AppServerSession(None, "/fake.sock")
         calls = []
         responses = {
             "thread/start": {"thread": {"id": "t1"}},
@@ -336,19 +340,19 @@ class TestTypedOperations:
             calls.append((method, params))
             return project_response(method, responses[method])
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
         assert (
-            await adapter.start_thread(
+            await app_server.start_thread(
                 StartConfig(cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly)
             )
         ).id == "t1"
-        assert await adapter.start_turn("t1", "hello", effort="high") == "u1"
-        assert (await adapter.read_thread("t1")).id == "t1"
-        assert (await adapter.resume_thread("t1")).id == "t1"
-        assert await adapter.steer_turn("t1", "more", "u1") == "u1"
-        await adapter.interrupt_turn("t1", "u1")
-        assert (await adapter.list_threads("c1", cwd="/tmp")).next_cursor == "next"
+        assert await app_server.start_turn("t1", "hello", effort="high") == "u1"
+        assert (await app_server.read_thread("t1")).id == "t1"
+        assert (await app_server.resume_thread("t1")).id == "t1"
+        assert await app_server.steer_turn("t1", "more", "u1") == "u1"
+        await app_server.interrupt_turn("t1", "u1")
+        assert (await app_server.list_threads("c1", cwd="/tmp")).next_cursor == "next"
 
         assert calls == [
             (
@@ -381,10 +385,10 @@ class TestTypedOperations:
             ("turn/interrupt", {"threadId": "t1", "turnId": "u1"}),
             ("thread/list", {"limit": 100, "cursor": "c1", "cwd": "/tmp"}),
         ]
-        assert not hasattr(adapter, "request")
+        assert not hasattr(app_server, "request")
 
     async def test_lifecycle_probe_checks_each_required_operation(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         responses = {
             "thread/start": {"thread": {"id": "probe"}},
             "thread/resume": {"thread": {"id": "probe", "status": "idle"}},
@@ -400,9 +404,9 @@ class TestTypedOperations:
             calls.append((method, params))
             return project_response(method, responses[method])
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
-        assert await adapter.check_lifecycle_operations() == ()
+        assert await app_server.check_lifecycle_operations() == ()
         assert len(calls) == len(REQUIRED_LIFECYCLE_OPERATIONS)
         assert [method for method, _ in calls] == [
             "thread/start",
@@ -416,7 +420,7 @@ class TestTypedOperations:
         assert calls[0][1] == {"ephemeral": True, "historyMode": "paginated"}
 
     async def test_lifecycle_probe_reports_method_not_found(self, monkeypatch):
-        adapter = JsonRpcAppServerSession(None, "/fake.sock")
+        app_server = AppServerSession(None, "/fake.sock")
         missing = "steer turn"
 
         async def request(method, params=None):
@@ -424,9 +428,9 @@ class TestTypedOperations:
                 raise JsonRpcError(-32601, "method not found")
             return project_response(method, {})
 
-        monkeypatch.setattr(adapter, "_request", request)
+        monkeypatch.setattr(app_server, "_request", request)
 
-        assert await adapter.check_lifecycle_operations() == (missing,)
+        assert await app_server.check_lifecycle_operations() == (missing,)
 
 
 class TestStrictFraming:
@@ -482,12 +486,12 @@ class TestStrictFraming:
                 self.closed = True
 
         transport = Transport()
-        adapter = JsonRpcAppServerSession(transport, "stdio")
-        adapter._reader_task = asyncio.create_task(adapter._reader())
+        app_server = AppServerSession(transport, "stdio")
+        app_server._reader_task = asyncio.create_task(app_server._reader())
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await adapter._request("unknown")
-        await adapter._reader_task
+            await app_server._request("unknown")
+        await app_server._reader_task
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         assert transport.closed
@@ -511,23 +515,23 @@ class TestStrictFraming:
                 await release_cleanup.wait()
 
         transport = Transport()
-        adapter = JsonRpcAppServerSession(transport, "stdio")
-        adapter._reader_task = asyncio.create_task(adapter._reader())
+        app_server = AppServerSession(transport, "stdio")
+        app_server._reader_task = asyncio.create_task(app_server._reader())
 
         await cleanup_started.wait()
-        close_task = asyncio.create_task(adapter.close())
+        close_task = asyncio.create_task(app_server.close())
         await asyncio.sleep(0)
 
         assert not close_task.done()
-        assert not adapter._reader_task.done()
-        assert adapter._lifecycle == "CLOSING"
+        assert not app_server._reader_task.done()
+        assert app_server._lifecycle == "CLOSING"
 
         release_cleanup.set()
-        await adapter._reader_task
+        await app_server._reader_task
         await close_task
 
         assert transport.close_calls == 1
-        assert adapter._lifecycle == "CLOSED"
+        assert app_server._lifecycle == "CLOSED"
 
     async def test_concurrent_and_repeated_close_calls_share_cleanup(self):
         cleanup_started = asyncio.Event()
@@ -542,8 +546,8 @@ class TestStrictFraming:
                 await release_cleanup.wait()
 
         transport = Transport()
-        adapter = JsonRpcAppServerSession(transport, "stdio")
-        close_tasks = [asyncio.create_task(adapter.close()) for _ in range(3)]
+        app_server = AppServerSession(transport, "stdio")
+        close_tasks = [asyncio.create_task(app_server.close()) for _ in range(3)]
 
         await cleanup_started.wait()
         await asyncio.sleep(0)
@@ -551,10 +555,10 @@ class TestStrictFraming:
 
         release_cleanup.set()
         await asyncio.gather(*close_tasks)
-        await adapter.close()
+        await app_server.close()
 
         assert transport.close_calls == 1
-        assert adapter._lifecycle == "CLOSED"
+        assert app_server._lifecycle == "CLOSED"
 
     async def test_close_cancellation_waits_for_cleanup_completion(self):
         cleanup_started = asyncio.Event()
@@ -565,8 +569,8 @@ class TestStrictFraming:
                 cleanup_started.set()
                 await release_cleanup.wait()
 
-        adapter = JsonRpcAppServerSession(Transport(), "stdio")
-        close_task = asyncio.create_task(adapter.close())
+        app_server = AppServerSession(Transport(), "stdio")
+        close_task = asyncio.create_task(app_server.close())
         await cleanup_started.wait()
 
         close_task.cancel()
@@ -580,7 +584,7 @@ class TestStrictFraming:
         release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await close_task
-        assert adapter._lifecycle == "CLOSED"
+        assert app_server._lifecycle == "CLOSED"
 
     async def test_stdio_connects_with_ndjson_and_inherits_process_setup(
         self, stdio_endpoint
@@ -596,11 +600,11 @@ class TestStrictFraming:
             filename="stdio-initialize.py",
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
-            assert adapter.app_server_version == "1.0"
+            assert app_server.app_server_version == "1.0"
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_websocket_proxy_upgrades_and_routes_messages(
         self, tmp_path, stdio_endpoint
@@ -705,15 +709,15 @@ while True:
 """,
             str(pong),
             filename="stdio-websocket-proxy.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
-            assert adapter.app_server_version == "2.0"
-            assert (await adapter.list_threads()).threads == []
+            assert app_server.app_server_version == "2.0"
+            assert (await app_server.list_threads()).threads == []
         finally:
-            await adapter.close()
+            await app_server.close()
 
         assert pong.read_text(encoding="utf-8") == "seen"
 
@@ -726,11 +730,11 @@ while True:
             "sys.stdout.buffer.write(b'not an HTTP response')\n"
             "sys.stdout.buffer.flush()\n",
             filename="stdio-websocket-bad-upgrade.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint, timeout=0.5)
+            await connect_app_server(endpoint, timeout=0.5)
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
@@ -746,31 +750,31 @@ while True:
                 initialized_action=f"send_frame({opcode}, {payload!r})"
             ),
             filename="stdio-websocket-invalid-message.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await adapter.list_threads()
+                await app_server.list_threads()
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_websocket_eof_is_runtime_protocol_error(self, stdio_endpoint):
         endpoint = stdio_endpoint(
             _stdio_websocket_proxy_source(initialized_action="raise SystemExit(0)"),
             filename="stdio-websocket-eof.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await adapter.list_threads()
+                await app_server.list_threads()
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_websocket_runtime_failure_cleans_up_descendants(
         self, tmp_path, stdio_endpoint, monkeypatch
@@ -808,17 +812,17 @@ while True:
             str(descendant_pid),
             str(tmp_path / "websocket-runtime-parent.terminated"),
             filename="stdio-websocket-runtime-descendant.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await adapter.list_threads()
+                await app_server.list_threads()
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
-            await adapter._reader_task
+            await app_server._reader_task
 
             pid = int(descendant_pid.read_text(encoding="utf-8"))
             for _ in range(100):
@@ -830,7 +834,7 @@ while True:
             else:
                 pytest.fail("WebSocket stdio descendant survived process-group cleanup")
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_websocket_close_cancellation_cleans_up_established_process_group(
         self, tmp_path, stdio_endpoint, monkeypatch
@@ -866,12 +870,12 @@ while True:
             str(descendant_pid),
             str(tmp_path / "websocket-cancel-parent.terminated"),
             filename="stdio-websocket-cancel-established.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
 
-        adapter = await connect_endpoint(endpoint)
-        transport = adapter._transport
+        app_server = await connect_app_server(endpoint)
+        transport = app_server._transport
         assert transport is not None
         close_started = asyncio.Event()
         release_close = asyncio.Event()
@@ -883,7 +887,7 @@ while True:
             await original_close()
 
         transport.close = delayed_close
-        close_task = asyncio.create_task(adapter.close())
+        close_task = asyncio.create_task(app_server.close())
         try:
             await close_started.wait()
             close_task.cancel()
@@ -909,7 +913,7 @@ while True:
                 pytest.fail("WebSocket stdio descendant survived process-group cleanup")
         finally:
             if not close_task.done():
-                await adapter.close()
+                await app_server.close()
 
     async def test_stdio_websocket_framing_failure_is_protocol_error(
         self, stdio_endpoint
@@ -921,16 +925,16 @@ while True:
                 )
             ),
             filename="stdio-websocket-framing-failure.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await asyncio.wait_for(adapter.list_threads(), timeout=0.5)
+                await asyncio.wait_for(app_server.list_threads(), timeout=0.5)
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_websocket_startup_timeout_cleans_up_child(
         self, tmp_path, stdio_endpoint, monkeypatch
@@ -948,13 +952,13 @@ while True:
             str(ready),
             str(terminated),
             filename="stdio-websocket-timeout.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint, timeout=0.5)
+            await connect_app_server(endpoint, timeout=0.5)
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
         assert ready.read_text(encoding="utf-8") == "ready"
@@ -980,12 +984,12 @@ while True:
             str(ready),
             str(terminated),
             filename="stdio-websocket-cancel.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
-        task = asyncio.create_task(connect_endpoint(endpoint, timeout=5.0))
+        task = asyncio.create_task(connect_app_server(endpoint, timeout=5.0))
         for _ in range(100):
             if ready.exists():
                 break
@@ -1014,13 +1018,13 @@ while True:
             str(tmp_path / "unused"),
             str(terminated),
             filename="stdio-websocket-cleanup.py",
-            protocol=StdioProtocol.WEBSOCKET,
+            framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
-        adapter = await connect_endpoint(endpoint)
-        await asyncio.wait_for(adapter.close(), timeout=0.5)
+        app_server = await connect_app_server(endpoint)
+        await asyncio.wait_for(app_server.close(), timeout=0.5)
 
         for _ in range(100):
             if terminated.exists():
@@ -1032,7 +1036,7 @@ while True:
         endpoint = stdio_endpoint("raise SystemExit(0)\n", filename="stdio-exit.py")
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint)
+            await connect_app_server(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_stdio_executable_failure_is_unavailable(self, tmp_path):
@@ -1041,7 +1045,7 @@ while True:
         )
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint)
+            await connect_app_server(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     @pytest.mark.parametrize("payload", ["{malformed", "[]", '{"value": NaN}'])
@@ -1061,13 +1065,13 @@ while True:
             filename="stdio-invalid.py",
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await adapter.start_thread(StartConfig())
+                await app_server.start_thread(StartConfig())
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_ignores_valid_unknown_json_rpc_messages(self, stdio_endpoint):
         endpoint = stdio_endpoint(
@@ -1086,12 +1090,12 @@ while True:
             filename="stdio-unknown.py",
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
-            assert (await adapter.list_threads()).threads == []
-            assert adapter.interaction_count == 0
+            assert (await app_server.list_threads()).threads == []
+            assert app_server.interaction_count == 0
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_routes_operations_notifications_and_interactions(
         self, tmp_path, stdio_endpoint, monkeypatch, capfd
@@ -1149,20 +1153,20 @@ while True:
             filename="stdio-routes.py",
         )
 
-        adapter = await connect_endpoint(endpoint)
-        notifications = adapter.notifications()
+        app_server = await connect_app_server(endpoint)
+        notifications = app_server.notifications()
         try:
-            thread = await adapter.start_thread(StartConfig())
+            thread = await app_server.start_thread(StartConfig())
             assert thread is not None and thread.id == "t1"
-            assert await adapter.start_turn("t1", "hello") == "u1"
-            assert (await adapter.list_threads()).threads == []
+            assert await app_server.start_turn("t1", "hello") == "u1"
+            assert (await app_server.list_threads()).threads == []
 
             events = [
                 await asyncio.wait_for(anext(notifications), timeout=1.0)
                 for _ in range(6)
             ]
         finally:
-            await adapter.close()
+            await app_server.close()
 
         assert [event.type for event in events] == [
             "item/started",
@@ -1200,13 +1204,13 @@ while True:
             filename="stdio-runtime-exit.py",
         )
 
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await asyncio.wait_for(adapter.list_threads(), timeout=1.0)
+                await asyncio.wait_for(app_server.list_threads(), timeout=1.0)
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
 
     async def test_stdio_startup_timeout_cleans_up_child(
         self, stdio_endpoint, monkeypatch
@@ -1218,7 +1222,7 @@ while True:
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint, timeout=0.05)
+            await connect_app_server(endpoint, timeout=0.05)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_stdio_cleanup_waits_for_process_exit(
@@ -1237,11 +1241,11 @@ while True:
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
-        adapter = await connect_endpoint(endpoint)
-        transport = adapter._transport
+        app_server = await connect_app_server(endpoint)
+        transport = app_server._transport
         assert isinstance(transport, JsonlStdioMessageTransport)
         process = transport._process
-        await adapter.close()
+        await app_server.close()
 
         assert process.returncode is not None
 
@@ -1279,8 +1283,8 @@ while True:
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
-        adapter = await connect_endpoint(endpoint)
-        await adapter.close()
+        app_server = await connect_app_server(endpoint)
+        await app_server.close()
 
         for _ in range(100):
             if marker.exists():
@@ -1435,14 +1439,14 @@ while True:
         async def launch(_argv, _state):
             return transport
 
-        async def initialize(_adapter):
+        async def initialize(_app_server):
             initialized.set()
             await asyncio.Future()
 
         monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
-        monkeypatch.setattr(JsonRpcAppServerSession, "_initialize", initialize)
+        monkeypatch.setattr(AppServerSession, "_initialize", initialize)
         endpoint = AppServerEndpoint("stdio", StdioTarget(("app-server",)))
-        task = asyncio.create_task(connect_endpoint(endpoint))
+        task = asyncio.create_task(connect_app_server(endpoint))
         await initialized.wait()
         task.cancel()
 
@@ -1500,7 +1504,7 @@ class TestUnixSocketConnection:
             await writer.drain()
 
             # Consume the client's initialize and initialized frames, then
-            # complete the close handshake when the adapter is cleaned up.
+            # complete the close handshake when the app_server is cleaned up.
             while True:
                 first, second = await reader.readexactly(2)
                 frame_length = second & 0x7F
@@ -1517,18 +1521,18 @@ class TestUnixSocketConnection:
                     break
 
         server = await asyncio.start_unix_server(handle, path=socket_path)
-        adapter = None
+        app_server = None
         try:
-            adapter = await connect_endpoint(
-                AppServerEndpoint(str(socket_path), UnixTarget(socket_path))
+            app_server = await connect_app_server(
+                AppServerEndpoint(str(socket_path), UnixSocketTarget(socket_path))
             )
         finally:
-            if adapter is not None:
-                await adapter.close()
+            if app_server is not None:
+                await app_server.close()
             server.close()
             await server.wait_closed()
 
-        assert adapter.user_agent == "codex-app-server/0.147.0"
+        assert app_server.user_agent == "codex-app-server/0.147.0"
 
     async def test_connects_over_unix_socket_and_completes_initialization(
         self, tmp_path
@@ -1559,20 +1563,20 @@ class TestUnixSocketConnection:
                     initialized.set()
 
         server = await unix_serve(handle, str(socket_path))
-        adapter = None
+        app_server = None
         try:
-            adapter = await connect_endpoint(
-                AppServerEndpoint(str(socket_path), UnixTarget(socket_path))
+            app_server = await connect_app_server(
+                AppServerEndpoint(str(socket_path), UnixSocketTarget(socket_path))
             )
             await asyncio.wait_for(initialized.wait(), timeout=1.0)
         finally:
-            if adapter is not None:
-                await adapter.close()
+            if app_server is not None:
+                await app_server.close()
             server.close()
             await server.wait_closed()
 
-        assert adapter.user_agent == "codex-app-server/0.101.0"
-        assert adapter.server_codex_home == str(tmp_path / "codex-home")
+        assert app_server.user_agent == "codex-app-server/0.101.0"
+        assert app_server.server_codex_home == str(tmp_path / "codex-home")
         assert [message["method"] for message in received] == [
             "initialize",
             "initialized",
@@ -1619,23 +1623,25 @@ class TestUnixSocketConnection:
 
         server = await serve(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        adapter = None
+        app_server = None
         try:
-            adapter = await connect_endpoint(
+            app_server = await connect_app_server(
                 AppServerEndpoint(
                     f"ws://127.0.0.1:{port}/app-server?client=test",
-                    TcpTarget(f"ws://127.0.0.1:{port}/app-server?client=test", None),
+                    WebSocketTarget(
+                        f"ws://127.0.0.1:{port}/app-server?client=test", None
+                    ),
                 )
             )
             await asyncio.wait_for(initialized.wait(), timeout=1.0)
-            assert (await adapter.list_threads()).threads == []
+            assert (await app_server.list_threads()).threads == []
         finally:
-            if adapter is not None:
-                await adapter.close()
+            if app_server is not None:
+                await app_server.close()
             server.close()
             await server.wait_closed()
 
-        assert adapter.user_agent == "codex-app-server/0.101.0"
+        assert app_server.user_agent == "codex-app-server/0.101.0"
         assert [message["method"] for message in received] == [
             "initialize",
             "initialized",
@@ -1671,26 +1677,26 @@ class TestUnixSocketConnection:
         port = server.sockets[0].getsockname()[1]
         endpoint = AppServerEndpoint(
             f"ws://127.0.0.1:{port}",
-            TcpTarget(f"ws://127.0.0.1:{port}", None),
+            WebSocketTarget(f"ws://127.0.0.1:{port}", None),
         )
-        adapter = await connect_endpoint(endpoint)
+        app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
-                await asyncio.wait_for(adapter.list_threads(), timeout=1.0)
+                await asyncio.wait_for(app_server.list_threads(), timeout=1.0)
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
         finally:
-            await adapter.close()
+            await app_server.close()
             server.close()
             await server.wait_closed()
 
     async def test_tcp_immediate_connection_failure_is_unavailable(self):
         endpoint = AppServerEndpoint(
             "ws://127.0.0.1:1",
-            TcpTarget("ws://127.0.0.1:1", None),
+            WebSocketTarget("ws://127.0.0.1:1", None),
         )
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint, timeout=0.2)
+            await connect_app_server(endpoint, timeout=0.2)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_tcp_connect_passes_token_path_query_and_no_compression(
@@ -1719,16 +1725,16 @@ class TestUnixSocketConnection:
         import websockets.asyncio.client
 
         monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
-        monkeypatch.setattr(JsonRpcAppServerSession, "_initialize", initialize)
+        monkeypatch.setattr(AppServerSession, "_initialize", initialize)
         token_file = tmp_path / "token"
         endpoint = AppServerEndpoint(
             "ws://127.0.0.1:7777/app-server?client=test",
-            TcpTarget("ws://127.0.0.1:7777/app-server?client=test", token_file),
+            WebSocketTarget("ws://127.0.0.1:7777/app-server?client=test", token_file),
         )
         # The file intentionally does not exist until connection time.
         token_file.write_text("  secret-token\n", encoding="utf-8")
-        adapter = await connect_endpoint(endpoint)
-        await adapter.close()
+        app_server = await connect_app_server(endpoint)
+        await app_server.close()
 
         assert captured["url"] == "ws://127.0.0.1:7777/app-server?client=test"
         assert captured["additional_headers"] == {
@@ -1741,19 +1747,19 @@ class TestUnixSocketConnection:
         token_file = tmp_path / "token"
         token_file.write_text(contents, encoding="utf-8")
         endpoint = AppServerEndpoint(
-            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+            "ws://127.0.0.1:1", WebSocketTarget("ws://127.0.0.1:1", token_file)
         )
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint)
+            await connect_app_server(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_missing_tcp_token_is_unavailable(self, tmp_path):
         token_file = tmp_path / "missing-token"
         endpoint = AppServerEndpoint(
-            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+            "ws://127.0.0.1:1", WebSocketTarget("ws://127.0.0.1:1", token_file)
         )
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint)
+            await connect_app_server(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_unreadable_tcp_token_is_unavailable_without_exposing_path_or_contents(
@@ -1761,7 +1767,7 @@ class TestUnixSocketConnection:
     ):
         token_file = tmp_path / "token"
         endpoint = AppServerEndpoint(
-            "ws://127.0.0.1:1", TcpTarget("ws://127.0.0.1:1", token_file)
+            "ws://127.0.0.1:1", WebSocketTarget("ws://127.0.0.1:1", token_file)
         )
         original_read_text = Path.read_text
 
@@ -1772,7 +1778,7 @@ class TestUnixSocketConnection:
 
         monkeypatch.setattr(Path, "read_text", unreadable_read_text)
         with pytest.raises(CodexCtlError) as excinfo:
-            await connect_endpoint(endpoint)
+            await connect_app_server(endpoint)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
         assert "secret-token" not in excinfo.value.message
         assert str(token_file) not in excinfo.value.message

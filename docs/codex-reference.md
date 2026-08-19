@@ -47,10 +47,6 @@ from Codex's line-delimited stdio app-server transport.
 - [codex-rs/cli/src/main.rs](../vendor/codex/codex-rs/cli/src/main.rs) — exposes the `app-server proxy` command and its socket option.
 - [codex-rs/app-server-transport/src/transport/unix_socket.rs](../vendor/codex/codex-rs/app-server-transport/src/transport/unix_socket.rs) — performs the WebSocket Upgrade on the Unix socket side of the transparent relay.
 
-This distinction is why `codexctl` launches one proxy child and performs the
-Upgrade over its pipes when `--stdio-protocol websocket` is selected, while
-the default stdio protocol remains the upstream line-delimited JSON transport.
-
 ### JSON-RPC protocol surface
 
 Consulted for method names, parameter shapes, and handshake order.

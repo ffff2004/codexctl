@@ -25,14 +25,14 @@ from codexctl.cli import (
     EXIT_USAGE,
     _build_command,
     _execute,
-    _select_endpoint,
+    _select_runtime_provider,
     _split_prompt,
     build_parser,
     exit_code_for,
     main,
 )
 from codexctl.core import CodexCtl
-from codexctl.endpoint import StdioEndpointAdapter, StdioProtocol, StdioTarget
+from codexctl.endpoint import StdioFraming, StdioRuntimeProvider, StdioTarget
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -86,8 +86,10 @@ for line in sys.stdin:
 
 
 class TestStdioExecution:
-    async def test_start_preserves_text_rendering(self, stdio_adapter, capsys):
-        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="render.py")
+    async def test_start_preserves_text_rendering(self, stdio_runtime_provider, capsys):
+        endpoint = stdio_runtime_provider(
+            _SUCCESSFUL_STDIO_SERVER, filename="render.py"
+        )
 
         code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
 
@@ -100,9 +102,11 @@ class TestStdioExecution:
         assert "Turn completed\n" in output
 
     async def test_detach_returns_the_existing_json_document(
-        self, stdio_adapter, capsys
+        self, stdio_runtime_provider, capsys
     ):
-        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="detach.py")
+        endpoint = stdio_runtime_provider(
+            _SUCCESSFUL_STDIO_SERVER, filename="detach.py"
+        )
 
         code = await _execute(
             CodexCtl(endpoint), Start(prompt="hello", detach=True), "json"
@@ -116,9 +120,11 @@ class TestStdioExecution:
         }
 
     async def test_cleanup_failure_does_not_replace_successful_result(
-        self, stdio_adapter, capsys, monkeypatch
+        self, stdio_runtime_provider, capsys, monkeypatch
     ):
-        endpoint = stdio_adapter(_SUCCESSFUL_STDIO_SERVER, filename="cleanup.py")
+        endpoint = stdio_runtime_provider(
+            _SUCCESSFUL_STDIO_SERVER, filename="cleanup.py"
+        )
         original_close = JsonlStdioMessageTransport.close
 
         async def close_then_fail(transport):
@@ -368,9 +374,9 @@ class TestUsageErrors:
             ]
         )
 
-        endpoint = _select_endpoint(args)
+        endpoint = _select_runtime_provider(args)
 
-        assert isinstance(endpoint, StdioEndpointAdapter)
+        assert isinstance(endpoint, StdioRuntimeProvider)
         assert endpoint.mode == "stdio"
         assert endpoint._target == StdioTarget(("app-server", "--child-flag", "value"))
 
@@ -380,7 +386,7 @@ class TestUsageErrors:
                 "list",
                 "--stdio-exec",
                 "codex",
-                "--stdio-protocol",
+                "--stdio-framing",
                 "websocket",
                 "--stdio-arg",
                 "app-server",
@@ -389,14 +395,14 @@ class TestUsageErrors:
             ]
         )
 
-        endpoint = _select_endpoint(args)
+        endpoint = _select_runtime_provider(args)
 
         assert endpoint._target == StdioTarget(
-            ("codex", "app-server", "proxy"), StdioProtocol.WEBSOCKET
+            ("codex", "app-server", "proxy"), StdioFraming.WEBSOCKET
         )
 
     def test_stdio_websocket_protocol_requires_an_executable(self, capsys):
-        assert main(["list", "--stdio-protocol", "websocket"]) == EXIT_USAGE
+        assert main(["list", "--stdio-framing", "websocket"]) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
 
     def test_stdio_websocket_protocol_is_not_silently_external(self, capsys):
@@ -404,7 +410,7 @@ class TestUsageErrors:
             main(
                 [
                     "list",
-                    "--stdio-protocol",
+                    "--stdio-framing",
                     "websocket",
                     "--endpoint",
                     "ws://localhost:1",
@@ -418,14 +424,14 @@ class TestUsageErrors:
         with pytest.raises(SystemExit):
             build_parser().parse_args(["list", "--help"])
         help_text = capsys.readouterr().out
-        assert "selected stdio protocol" in help_text
+        assert "selected stdio framing" in help_text
         assert "newline-delimited JSON" not in help_text
 
     def test_stdio_literal_double_dash_can_precede_prompt_delimiter(self):
         args = build_parser().parse_args(
             ["start", "--stdio-exec", "app", "--stdio-arg=--"]
         )
-        endpoint = _select_endpoint(args)
+        endpoint = _select_runtime_provider(args)
         assert endpoint._target == StdioTarget(("app", "--"))
 
         argv, prompt = _split_prompt(
@@ -500,7 +506,7 @@ class TestUsageErrors:
             pytest.fail("empty stdin attempted to connect to the app-server")
 
         monkeypatch.setattr(
-            "codexctl.cli._select_endpoint", endpoint_must_not_be_selected
+            "codexctl.cli._select_runtime_provider", endpoint_must_not_be_selected
         )
 
         assert main(argv) == EXIT_USAGE

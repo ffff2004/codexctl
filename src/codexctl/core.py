@@ -13,13 +13,13 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from . import rollout
 from .appserver import (
-    AppServerPort,
+    AppServerClient,
     AppServerThread,
     AppServerTurn,
     JsonRpcError,
-    connect_endpoint,
+    connect_app_server,
 )
-from .endpoint import AppServerEndpoint, EndpointPort
+from .endpoint import AppServerEndpoint, RuntimeProvider
 from .model import (
     CodexCtlError,
     Command,
@@ -54,7 +54,7 @@ from .model import (
 INTERRUPT_WAIT_SECONDS = 120.0
 INTERRUPT_POLL_INTERVAL = 0.5
 
-ConnectFactory = Callable[[AppServerEndpoint], Awaitable[AppServerPort]]
+ConnectFactory = Callable[[AppServerEndpoint], Awaitable[AppServerClient]]
 
 
 class CodexCtl:
@@ -62,10 +62,10 @@ class CodexCtl:
 
     def __init__(
         self,
-        endpoint: EndpointPort,
+        runtime: RuntimeProvider,
         connect: ConnectFactory | None = None,
     ) -> None:
-        self._endpoint = endpoint
+        self._runtime = runtime
         self._connect: ConnectFactory = connect or _default_connect
 
     async def run(self, command: Command) -> Any:
@@ -94,8 +94,8 @@ class CodexCtl:
 
     # -- plumbing -------------------------------------------------------------
 
-    async def _open(self) -> AppServerPort:
-        endpoint = await self._endpoint.resolve()
+    async def _open(self) -> AppServerClient:
+        endpoint = await self._runtime.resolve_endpoint()
         return await self._connect(endpoint)
 
     @staticmethod
@@ -106,11 +106,13 @@ class CodexCtl:
         return None
 
     @staticmethod
-    async def _read_thread(adapter: AppServerPort, thread_id: str) -> AppServerThread:
+    async def _read_thread(
+        app_server: AppServerClient, thread_id: str
+    ) -> AppServerThread:
         try:
-            thread = await adapter.read_thread(thread_id)
+            thread = await app_server.read_thread(thread_id)
         except JsonRpcError as exc:
-            await adapter.close()
+            await app_server.close()
             raise _map_rpc_error(
                 exc, default=ErrorCode.THREAD_NOT_FOUND, thread_id=thread_id
             ) from exc
@@ -122,10 +124,10 @@ class CodexCtl:
         config = command.config
         if config.cwd is None:
             config = replace(config, cwd=str(Path.cwd()))
-        adapter = await self._open()
+        app_server = await self._open()
         try:
             try:
-                thread = await adapter.start_thread(config)
+                thread = await app_server.start_thread(config)
             except JsonRpcError as exc:
                 raise _map_rpc_error(
                     exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR
@@ -137,26 +139,26 @@ class CodexCtl:
                     "thread/start returned no thread id",
                 )
             turn_id = await self._turn_start(
-                adapter, thread_id, command.prompt, effort=config.effort
+                app_server, thread_id, command.prompt, effort=config.effort
             )
         except Exception:
-            await adapter.close()
+            await app_server.close()
             raise
         if command.detach:
             # Disconnecting never interrupts the turn.
-            await adapter.close()
+            await app_server.close()
             return DetachedTurnStarted(thread_id=thread_id, turn_id=turn_id)
-        return self._follow_live(adapter, thread_id, turn_id)
+        return self._follow_live(app_server, thread_id, turn_id)
 
     async def _turn_start(
         self,
-        adapter: AppServerPort,
+        app_server: AppServerClient,
         thread_id: str,
         prompt: str,
         effort: str | None = None,
     ) -> str:
         try:
-            turn_id = await adapter.start_turn(thread_id, prompt, effort)
+            turn_id = await app_server.start_turn(thread_id, prompt, effort)
         except JsonRpcError as exc:
             # The actual start-turn result is authoritative for races.
             raise _map_rpc_error(
@@ -173,10 +175,10 @@ class CodexCtl:
     # -- resume ---------------------------------------------------------------
 
     async def _resume(self, command: Resume) -> Any:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
             try:
-                thread = await adapter.resume_thread(command.thread_id)
+                thread = await app_server.resume_thread(command.thread_id)
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
             thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
@@ -187,19 +189,21 @@ class CodexCtl:
                     thread_id=command.thread_id,
                 )
             # Resume never queues and never becomes steer: one start-turn, or fail.
-            turn_id = await self._turn_start(adapter, command.thread_id, command.prompt)
+            turn_id = await self._turn_start(
+                app_server, command.thread_id, command.prompt
+            )
         except Exception:
-            await adapter.close()
+            await app_server.close()
             raise
         if command.detach:
-            await adapter.close()
+            await app_server.close()
             return DetachedTurnStarted(thread_id=command.thread_id, turn_id=turn_id)
-        return self._follow_live(adapter, command.thread_id, turn_id)
+        return self._follow_live(app_server, command.thread_id, turn_id)
 
     # -- foreground streaming --------------------------------------------------
 
     def _follow_live(
-        self, adapter: AppServerPort, thread_id: str, turn_id: str
+        self, app_server: AppServerClient, thread_id: str, turn_id: str
     ) -> EventStreamOutcome:
         async def started(seen: set[tuple]) -> AsyncIterator[ProjectedEvent]:
             ev = ProjectedEvent(
@@ -208,11 +212,11 @@ class CodexCtl:
             seen.add(ev.dedup_key())
             yield ev
 
-        return self._stream_turn(adapter, thread_id, turn_id, started)
+        return self._stream_turn(app_server, thread_id, turn_id, started)
 
     def _stream_turn(
         self,
-        adapter: AppServerPort,
+        app_server: AppServerClient,
         thread_id: str,
         turn_id: str | None,
         prelude: Callable[[set[tuple]], AsyncIterator[ProjectedEvent]] | None = None,
@@ -247,7 +251,7 @@ class CodexCtl:
                 if prelude is not None:
                     async for ev in prelude(seen):
                         yield ev
-                async for notification in adapter.notifications():
+                async for notification in app_server.notifications():
                     notif_thread = notification.thread_id
                     if notif_thread is not None and notif_thread != thread_id:
                         continue
@@ -301,8 +305,8 @@ class CodexCtl:
                 cancelled = True
                 raise
             finally:
-                await adapter.unsubscribe(thread_id)
-                await adapter.close()
+                await app_server.unsubscribe(thread_id)
+                await app_server.close()
                 if not result.done():
                     if persist:
                         if cancelled:
@@ -345,12 +349,12 @@ class CodexCtl:
     # -- status ---------------------------------------------------------------
 
     async def _status(self, command: Status) -> StatusSnapshot:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
             # Strictly read-only: never recover or start a thread for status.
-            thread = await self._read_thread(adapter, command.thread_id)
+            thread = await self._read_thread(app_server, command.thread_id)
         finally:
-            await adapter.close()
+            await app_server.close()
         status, flags = thread.status, thread.active_flags
         active = self._find_active_turn(thread)
         context = rollout.lookup_context_usage(command.thread_id)
@@ -365,11 +369,11 @@ class CodexCtl:
     # -- history ----------------------------------------------------------------
 
     async def _history(self, command: History) -> HistorySnapshot:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
-            thread = await self._read_thread(adapter, command.thread_id)
+            thread = await self._read_thread(app_server, command.thread_id)
         finally:
-            await adapter.close()
+            await app_server.close()
         turns = thread.turns
         try:
             selected = apply_turn_selector(turns, command.selector)
@@ -397,20 +401,20 @@ class CodexCtl:
     # -- follow -----------------------------------------------------------------
 
     async def _follow(self, command: Follow) -> Any:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
             try:
-                thread = await adapter.resume_thread(command.thread_id)
+                thread = await app_server.resume_thread(command.thread_id)
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
             thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
         except Exception:
-            await adapter.close()
+            await app_server.close()
             raise
         active = self._find_active_turn(thread)
         if active is None and not command.persist:
-            await adapter.unsubscribe(command.thread_id)
-            await adapter.close()
+            await app_server.unsubscribe(command.thread_id)
+            await app_server.close()
             raise CodexCtlError(
                 ErrorCode.NO_ACTIVE_TURN,
                 "thread has no active turn to follow",
@@ -477,15 +481,19 @@ class CodexCtl:
                     yield started
 
         return self._stream_turn(
-            adapter, command.thread_id, active_turn_id, replay, persist=command.persist
+            app_server,
+            command.thread_id,
+            active_turn_id,
+            replay,
+            persist=command.persist,
         )
 
     # -- steer ------------------------------------------------------------------
 
     async def _steer(self, command: Steer) -> SteerAcknowledged:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
-            thread = await self._read_thread(adapter, command.thread_id)
+            thread = await self._read_thread(app_server, command.thread_id)
             active = self._find_active_turn(thread)
             if active is None:
                 raise CodexCtlError(
@@ -495,7 +503,7 @@ class CodexCtl:
                 )
             expected_turn_id = active.id
             try:
-                turn_id = await adapter.steer_turn(
+                turn_id = await app_server.steer_turn(
                     command.thread_id, command.input, expected_turn_id
                 )
             except JsonRpcError as exc:
@@ -505,14 +513,14 @@ class CodexCtl:
                 turn_id=turn_id or expected_turn_id,
             )
         finally:
-            await adapter.close()
+            await app_server.close()
 
     # -- interrupt ----------------------------------------------------------------
 
     async def _interrupt(self, command: Interrupt) -> InterruptResult:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
-            thread = await self._read_thread(adapter, command.thread_id)
+            thread = await self._read_thread(app_server, command.thread_id)
             active = self._find_active_turn(thread)
             if active is None:
                 raise CodexCtlError(
@@ -522,14 +530,14 @@ class CodexCtl:
                 )
             turn_id = active.id
             try:
-                await adapter.interrupt_turn(command.thread_id, turn_id)
+                await app_server.interrupt_turn(command.thread_id, turn_id)
             except JsonRpcError as exc:
                 # A rejected interrupt means the target turn changed or ended;
                 # never retry against a different turn.
                 raise _map_interrupt_error(exc, command.thread_id) from exc
             deadline = time.monotonic() + INTERRUPT_WAIT_SECONDS
             while True:
-                current = await self._read_thread(adapter, command.thread_id)
+                current = await self._read_thread(app_server, command.thread_id)
                 target = next(
                     (turn for turn in current.turns if turn.id == turn_id), None
                 )
@@ -548,19 +556,19 @@ class CodexCtl:
                     )
                 await asyncio.sleep(INTERRUPT_POLL_INTERVAL)
         finally:
-            await adapter.close()
+            await app_server.close()
 
     # -- list ---------------------------------------------------------------------
 
     async def _list(self, command: ListThreads) -> ThreadListSnapshot:
-        adapter = await self._open()
+        app_server = await self._open()
         try:
             records: list[ThreadRecord] = []
             cursor: str | None = None
             cwd = None if command.all_threads else str(Path.cwd())
             for _ in range(25):  # pagination safety cap
                 try:
-                    page = await adapter.list_threads(cursor, cwd=cwd)
+                    page = await app_server.list_threads(cursor, cwd=cwd)
                 except JsonRpcError as exc:
                     raise _map_rpc_error(
                         exc, default=ErrorCode.APP_SERVER_PROTOCOL_ERROR
@@ -579,7 +587,7 @@ class CodexCtl:
                     break
             return ThreadListSnapshot(threads=records)
         finally:
-            await adapter.close()
+            await app_server.close()
 
     # -- doctor ---------------------------------------------------------------------
 
@@ -589,9 +597,9 @@ class CodexCtl:
         checks: list[DoctorCheck] = []
         compatible = False
         app_server_version: str | None = None
-        endpoint_mode = getattr(self._endpoint, "mode", "managed")
+        endpoint_mode = getattr(self._runtime, "mode", "managed")
         try:
-            endpoint = await self._endpoint.resolve()
+            endpoint = await self._runtime.resolve_endpoint()
             checks.append(DoctorCheck("endpoint reachable", True, endpoint.display))
             if endpoint.runtime_pid is not None:
                 checks.append(
@@ -606,14 +614,14 @@ class CodexCtl:
                 compatible=False,
             )
         try:
-            adapter = await self._connect(endpoint)
+            app_server = await self._connect(endpoint)
         except CodexCtlError as exc:
             checks.append(DoctorCheck("initialize handshake", False, exc.message))
         else:
             checks.append(DoctorCheck("initialize handshake", True, None))
-            app_server_version = getattr(adapter, "app_server_version", None)
+            app_server_version = getattr(app_server, "app_server_version", None)
             try:
-                missing = await adapter.check_lifecycle_operations()
+                missing = await app_server.check_lifecycle_operations()
             except JsonRpcError as exc:
                 checks.append(
                     DoctorCheck("required lifecycle operations", False, exc.message)
@@ -631,8 +639,8 @@ class CodexCtl:
                 )
                 compatible = lifecycle_ok
             finally:
-                await adapter.close()
-        codex_cli_version = self._endpoint.probe_cli_version()
+                await app_server.close()
+        codex_cli_version = self._runtime.probe_cli_version()
         if endpoint_mode == "managed":
             checks.append(
                 DoctorCheck(
@@ -665,8 +673,8 @@ class CodexCtl:
 # ---------------------------------------------------------------------------
 
 
-async def _default_connect(endpoint: AppServerEndpoint) -> AppServerPort:
-    return await connect_endpoint(endpoint)
+async def _default_connect(endpoint: AppServerEndpoint) -> AppServerClient:
+    return await connect_app_server(endpoint)
 
 
 # Lowercase message markers that identify a missing thread. Shared by the

@@ -81,7 +81,7 @@ class SandboxPolicy(Enum):
     """Domain sandbox presets accepted by ``start --sandbox``.
 
     These values are deliberately independent of the app-server wire enum;
-    serialization belongs to the app-server adapter.
+    serialization belongs to the app-server compatibility layer.
     """
 
     readOnly = auto()
@@ -96,7 +96,7 @@ class ApprovalPolicy(Enum):
     """Domain approval policy accepted by ``start``.
 
     These values are deliberately independent of the app-server wire enum;
-    serialization belongs to the app-server adapter.
+    serialization belongs to the app-server compatibility layer.
     """
 
     untrusted = auto()
@@ -108,7 +108,7 @@ class ApprovalsReviewer(Enum):
     """Domain reviewer that resolves escalated approval requests.
 
     Independent of the app-server wire enum; serialization belongs to the
-    app-server adapter.
+    app-server compatibility layer.
     """
 
     user = auto()
