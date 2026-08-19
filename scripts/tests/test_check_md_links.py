@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def _load_checker():
-    path = Path(__file__).parents[1] / "scripts" / "check_md_links.py"
+    path = Path(__file__).parents[1] / "check_md_links.py"
     spec = importlib.util.spec_from_file_location("check_md_links", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
