@@ -51,6 +51,12 @@ indent-style = "space"
 
 [tool.pyright]
 include = ["src", "examples/impl-review-orchestrator"]
-exclude = ["vendor", ".venv", "dist", "tests"]
+exclude = [
+    "vendor",
+    ".venv",
+    "dist",
+    "tests",
+    "**/test_*.py",
+]
 pythonVersion = "3.14"
 typeCheckingMode = "standard"

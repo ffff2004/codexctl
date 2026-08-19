@@ -20,7 +20,8 @@ repos:
         entry: uv run --locked pyright
         language: system
         pass_filenames: false
-        always_run: true
+        files: ^(?:src/.*\.pyi?|examples/impl-review-orchestrator/.*\.pyi?|pyproject\.toml|uv\.lock)$
+        exclude: (?:^|/)test_.*\.py$
         stages: [pre-commit]
 
       - id: check-md-links
