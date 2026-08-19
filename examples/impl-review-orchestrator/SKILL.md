@@ -16,7 +16,6 @@ Orchestrate the following workflow:
 
    ```sh
    python impl_review.py \
-     --json \
      --cwd <checkout-root> \
      --spec <spec-file> \
      [--issue <github-issue-uri>] \

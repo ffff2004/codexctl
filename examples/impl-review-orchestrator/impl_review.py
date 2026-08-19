@@ -672,7 +672,7 @@ class CodexctlAdapter:
         round: int,
     ) -> AgentRun:
         del round
-        sandbox = "read-only" if role.startswith("reviewer") else "workspace-write"
+        sandbox = "workspace-write"
         output_mode = "text" if role == "worker" else "jsonl"
         if thread_id:
             argv = [

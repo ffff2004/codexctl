@@ -15,4 +15,4 @@ Review this unstaged diff as part of the checkout:
 
 {{unstaged_diff}}
 
-Do not edit the checkout.
+Do not edit the checkout. Do not spawn sub-agents.
