@@ -338,7 +338,12 @@ class WebSocketMessageTransport:
 
 
 class _OwnedStdioProcess:
-    """Own one child process and its bounded process-group cleanup."""
+    """Own one child process and its bounded process-group cleanup.
+
+    Cleanup escalates from stdin EOF to SIGTERM and SIGKILL under finite
+    waits. OS-level process-table disappearance isn't part of the contract;
+    callers get bounded cleanup rather than an unbounded reap guarantee.
+    """
 
     _GRACEFUL_WAIT_SECONDS = 1.0
     _TERMINATE_WAIT_SECONDS = 1.0
@@ -1081,7 +1086,11 @@ async def connect_app_server(
 
 
 async def _launch_stdio_process(argv: tuple[str, ...]) -> _OwnedStdioProcess:
-    """Launch stdio without making cancellation wait for process creation."""
+    """Launch stdio while keeping cancellation bounded.
+
+    If subprocess creation can't be drained promptly after cancellation,
+    cleanup of any captured child may finish asynchronously.
+    """
     state = _StdioLaunchState()
     launch_task = asyncio.create_task(_OwnedStdioProcess.launch(argv, state))
     try:

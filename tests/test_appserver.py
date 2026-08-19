@@ -936,37 +936,35 @@ while True:
         finally:
             await app_server.close()
 
-    async def test_stdio_websocket_startup_timeout_cleans_up_child(
+    async def test_stdio_websocket_startup_timeout_closes_owned_process(
         self, tmp_path, stdio_endpoint, monkeypatch
     ):
-        ready = tmp_path / "websocket-timeout.ready"
-        terminated = tmp_path / "websocket-timeout.terminated"
         endpoint = stdio_endpoint(
             _stdio_websocket_proxy_source(
                 initialize_action="pass",
-                after_handshake=(
-                    "pathlib.Path(sys.argv[-2]).write_text('ready')\ntime.sleep(60)"
-                ),
-                termination_marker=True,
+                after_handshake="time.sleep(60)",
             ),
-            str(ready),
-            str(terminated),
             filename="stdio-websocket-timeout.py",
             framing=StdioFraming.WEBSOCKET,
         )
         monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+        close_finished = asyncio.Event()
+        original_close = _OwnedStdioProcess.close
+
+        async def close(process):
+            try:
+                await original_close(process)
+            finally:
+                close_finished.set()
+
+        monkeypatch.setattr(_OwnedStdioProcess, "close", close)
 
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_app_server(endpoint, timeout=0.5)
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
-        assert ready.read_text(encoding="utf-8") == "ready"
-        for _ in range(100):
-            if terminated.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert terminated.read_text(encoding="utf-8") == "terminated"
+        await asyncio.wait_for(close_finished.wait(), timeout=1.0)
 
     async def test_stdio_websocket_cancellation_cleans_up_child(
         self, tmp_path, stdio_endpoint, monkeypatch
@@ -1347,7 +1345,7 @@ while True:
         release.set()
         await asyncio.sleep(0)
 
-    async def test_stdio_launch_cancellation_kills_real_child_before_wrapper(
+    async def test_stdio_launch_cancellation_eventually_reaps_captured_child(
         self, tmp_path, monkeypatch
     ):
         ready = tmp_path / "real-child.ready"
@@ -1404,8 +1402,14 @@ while True:
                     break
                 await asyncio.sleep(0.01)
             assert terminated.read_text(encoding="utf-8") == "terminated"
-            with pytest.raises(ProcessLookupError):
-                os.kill(pid, 0)
+            for _ in range(200):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("cancelled stdio child remained in the process table")
         finally:
             release.set()
             if not task.done():

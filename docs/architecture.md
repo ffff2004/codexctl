@@ -132,6 +132,11 @@ detail and is opaque to [core.py](../src/codexctl/core.py):
   WebSocket stdio transports share that lifecycle. Their externally visible
   mode contract is defined in
   [reference.md — Runtime resolution](reference.md#runtime-resolution).
+  Child cleanup is deliberately bounded: it escalates from stdin close to
+  SIGTERM and SIGKILL under finite waits. Cancellation during stalled process
+  creation does not wait indefinitely, so cleanup may finish asynchronously;
+  immediate PID disappearance from the process table is not part of the
+  internal contract.
 
 The runtime-provider interface also carries a best-effort `probe_cli_version()` used by doctor;
 each provider owns the policy for that probe.
