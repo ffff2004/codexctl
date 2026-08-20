@@ -7,6 +7,14 @@ interrupting Codex threads through a shared Codex app-server runtime.
 object that survives process exits, terminal closures, and machine restarts,
 and it never queues, forks, or silently replaces threads.
 
+## Install
+
+Install the latest version directly from GitHub as a `uv` tool:
+
+```sh
+uv tool install git+https://github.com/ffff2004/codexctl.git
+```
+
 ## Quick start
 
 Requires Python 3.14+ and a local `codex` CLI with app-server support.

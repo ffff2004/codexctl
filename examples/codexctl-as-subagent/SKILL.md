@@ -4,6 +4,13 @@ description: Run Codex workers through codexctl
 disable-model-invocation: true
 ---
 
+Install `codexctl` from GitHub as a `uv` tool when it is not already
+available:
+
+```sh
+uv tool install git+https://github.com/ffff2004/codexctl.git
+```
+
 Use `codexctl` to delegate an independent, bounded task to a persistent Codex
 thread. A worker shares the checkout and runtime, but has its own context.
 

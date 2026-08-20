@@ -4,6 +4,13 @@ description: Orchestrate a design-implementation-review workflow
 disable-model-invocation: true
 ---
 
+Install `codexctl` from GitHub as a `uv` tool when it is not already
+available:
+
+```sh
+uv tool install git+https://github.com/ffff2004/codexctl.git
+```
+
 Orchestrate the following workflow:
 
 1. If the requirements are ambiguous, use `grilling` to question the user until the spec is clear. Make the in-scope and out-of-scope behavior explicit so the implementation does not expand beyond the request. After reaching agreement, pause and wait for the user's confirmation.
