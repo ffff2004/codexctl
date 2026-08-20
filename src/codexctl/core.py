@@ -569,15 +569,19 @@ class CodexCtl:
     # -- list ---------------------------------------------------------------------
 
     async def _list(self, command: ListThreads) -> ThreadListSnapshot:
+        if command.all_threads and command.cwd is not None:
+            # ``--all`` ignores the scope on the wire, but still validate an
+            # explicitly supplied remote path before opening the runtime.
+            self._runtime.policy.resolve_cwd(command.cwd)
+        cwd = (
+            None
+            if command.all_threads
+            else self._runtime.policy.resolve_cwd(command.cwd)
+        )
         app_server = await self._open()
         try:
             records: list[ThreadRecord] = []
             cursor: str | None = None
-            cwd = (
-                None
-                if command.all_threads
-                else self._runtime.policy.resolve_cwd(command.cwd)
-            )
             for _ in range(25):  # pagination safety cap
                 try:
                     page = await app_server.list_threads(cursor, cwd=cwd)
@@ -611,6 +615,7 @@ class CodexCtl:
         app_server_version: str | None = None
         endpoint_mode = getattr(self._runtime, "mode", "managed")
         policy = self._runtime.policy
+        lifecycle_ownership = policy.lifecycle.value
         try:
             endpoint = await self._runtime.resolve_endpoint()
             checks.append(DoctorCheck("endpoint reachable", True, endpoint.display))
@@ -623,6 +628,7 @@ class CodexCtl:
             return DoctorSnapshot(
                 codexctl_version=CLIENT_VERSION,
                 endpoint_mode=endpoint_mode,
+                lifecycle_ownership=lifecycle_ownership,
                 checks=checks,
                 compatible=False,
             )
@@ -679,6 +685,12 @@ class CodexCtl:
         return DoctorSnapshot(
             codexctl_version=CLIENT_VERSION,
             endpoint_mode=endpoint_mode,
+            lifecycle_ownership=lifecycle_ownership,
+            remote_socket=(
+                str(endpoint.socket_path) if endpoint.socket_path is not None else None
+            )
+            if endpoint_mode == "ssh"
+            else None,
             checks=checks,
             codex_cli_version=codex_cli_version,
             app_server_version=app_server_version or endpoint.runtime_version,

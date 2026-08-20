@@ -52,6 +52,10 @@ Every command accepts:
 | `--stdio-exec <executable>` | Run one caller-selected app-server process; its stdin/stdout carry the selected stdio framing |
 | `--stdio-framing {jsonl,websocket}` | Select newline-delimited JSON (default) or the Codex-compatible WebSocket-over-stdio framing |
 | `--stdio-arg <arg>` | Repeatable; append this exact argument, in order, to `--stdio-exec` |
+| `--ssh <destination>` | Connect to a remote shared app-server through OpenSSH |
+| `--ssh-arg <token>` | Repeatable; append one complete OpenSSH option token |
+| `--remote-codex <executable>` | Remote Codex executable for SSH mode (default: `codex`) |
+| `--remote-socket <absolute-path>` | Use an externally managed remote socket in SSH mode |
 
 `--stdio-exec` and `--stdio-arg` select `stdio` mode. Stdio mode is mutually
 exclusive with `--endpoint` and `--endpoint-token-file`; `--stdio-arg` and
@@ -65,6 +69,49 @@ replace codexctl's own stdin/stdout; the child's stderr is forwarded to
 codexctl's stderr.
 Dash-prefixed values are accepted; use the attached spelling
 `--stdio-arg=--` when passing a literal `--` before the prompt delimiter.
+
+### SSH runtime
+
+SSH mode uses OpenSSH to reach the remote shared Codex runtime. SSH
+v1 supports POSIX remotes only. The destination is opaque to codexctl: it does
+not parse user, host, or port fields, resolve DNS, or expand SSH config.
+
+Without `--remote-socket`, each invocation runs `codex app-server daemon start`
+once on the remote and strictly consumes its single JSON lifecycle response.
+The accepted statuses are `started` and `alreadyRunning`; the response must
+contain a non-empty absolute POSIX `socketPath`. The remote proxy is then run
+against that socket. `daemon bootstrap` is never run implicitly.
+
+`--remote-socket` selects externally managed lifecycle ownership. It skips
+`daemon start` and connects directly to the specified absolute POSIX socket.
+It cannot be combined with `--remote-codex`; the external socket is not
+assumed to belong to a particular executable. `--remote-codex` accepts one
+executable name without `/` or one absolute POSIX path. It does not accept
+relative paths, `~`, or extra command arguments.
+
+Each `--ssh-arg` is one complete OpenSSH option token. Options that need a
+value must attach it to that token, for example `-Jbastion`, `-p2222`,
+`-i/home/me/.ssh/key`, or `-oConnectTimeout=10`. Session-shaping options are
+rejected; codexctl owns non-interactive binary operation by enforcing `-T` and
+`BatchMode=yes`. Connection, authentication, routing, and multiplexing
+policy remains in OpenSSH and `~/.ssh/config`; codexctl does not manage
+ControlMaster, ControlPersist, or ControlPath.
+
+Remote cwd is never inferred from local cwd. `start` requires an explicit
+absolute POSIX `--cwd`; `list` requires one unless `--all` is used. No remote
+directory preflight is performed. Ctrl+C or disconnect closes the proxy and
+SSH process, but does not send `turn/interrupt` or stop the shared daemon.
+
+Examples:
+
+```sh
+codexctl start --ssh devbox --cwd /srv/repos/foo --detach -- "run tests"
+codexctl status --ssh devbox THREAD_ID
+codexctl follow --ssh devbox THREAD_ID
+codexctl list --ssh devbox --cwd /srv/repos/foo
+codexctl list --ssh devbox --all
+codexctl list --ssh devbox --remote-socket /run/user/1000/codex.sock --all
+```
 
 ### start
 
@@ -86,6 +133,8 @@ the complete prompt from standard input.
 - The sandbox defaults to `workspace-write` when `--sandbox` is omitted.
 - When `--cwd` is omitted, `codexctl` passes its current directory explicitly
   as the new thread's cwd.
+- SSH mode requires `--cwd` to be an explicit absolute POSIX path; it never
+  infers a remote cwd from the local directory.
 - `--detach` returns as soon as the turn has started and disconnects; the
   turn keeps running in the shared runtime.
 
@@ -125,7 +174,7 @@ Context: 83k / 200k (38%) | -
 
 Context usage is best-effort enrichment from the Codex runtime or rollout
 store for runtimes that support local enrichment; `-` means unavailable.
-External and stdio runtimes do not read the local rollout store, so their
+External, stdio, and SSH runtimes do not read the local rollout store, so their
 status context is unavailable. `usedTokens` is the latest context size, not a
 cumulative session total. `ratio` is the effective context usage fraction
 after reserving 12,000 tokens for the system prompt, fixed tool instructions,
@@ -220,11 +269,13 @@ against a different turn.
 ### list
 
 ```sh
-codexctl list [--all]
+codexctl list [--cwd DIR] [--all]
 ```
 
-By default, lists stored threads whose workspace is the current directory,
-newest activity first. `--all` lists threads across all workspaces:
+By default, lists stored threads whose workspace is the selected cwd, newest
+activity first. Local runtimes default that cwd to the current directory.
+SSH mode requires an explicit absolute POSIX `--cwd`; `--all` lists threads
+across all workspaces without a cwd:
 
 ```text
 <thread-id>  idle  <preview>
@@ -368,7 +419,9 @@ non-empty.
 ```json
 {
   "codexctlVersion": "0.1.0",
-  "endpointMode": "managed|external|stdio",
+  "endpointMode": "managed|external|stdio|ssh",
+  "lifecycleOwnership": "managed|external",
+  "remoteSocket": "/run/user/1000/codex.sock",
   "codexCliVersion": "codex-cli 0.101.0",
   "appServerVersion": "0.101.0",
   "compatible": true,
@@ -439,8 +492,9 @@ permission failures, pre-initialize child exits, and startup timeouts are
 
 On normal cleanup codexctl closes stdin, waits briefly, terminates the child
 process group, and uses a final kill fallback when necessary. Cleanup status
-does not replace a successful command result. `doctor` reports only
-`endpointMode: "stdio"`; it does not expose the executable or argument list.
+does not replace a successful command result. `doctor` reports the endpoint
+mode and lifecycle ownership; it does not expose the stdio executable or
+argument list.
 As with other modes, local Ctrl+C returns 130 and sends no turn interrupt;
 with stdio, the caller must not assume a detached or interrupted command's
 active turn survives termination of the child process.

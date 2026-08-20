@@ -11,12 +11,14 @@ from codexctl.endpoint import (
     LifecycleOwnership,
     ManagedRuntimeProvider,
     RuntimePolicy,
+    SshRuntimeProvider,
     StdioFraming,
     StdioRuntimeProvider,
     StdioTarget,
     UnixSocketTarget,
     WebSocketTarget,
     _last_json_object,
+    _run_bounded_ssh,
     default_control_socket_path,
 )
 from codexctl.model import CodexCtlError, ErrorCode
@@ -260,6 +262,162 @@ class TestStdioRuntimeProvider:
         assert endpoint.target == StdioTarget(
             ("codex", "app-server", "proxy"), StdioFraming.WEBSOCKET
         )
+
+
+class TestSshRuntimeProvider:
+    async def test_managed_lifecycle_builds_quoted_proxy_argv(
+        self, tmp_path, monkeypatch
+    ):
+        args_file = tmp_path / "args"
+        script = _write_script(
+            tmp_path,
+            'printf \'%s\\n\' "$@" > "$SSH_ARGS_FILE"\n'
+            'printf \'%s\' \'{"status":"started","socketPath":"/run/codex path/daemon;socket","pid":42,"cliVersion":"remote-cli","extra":true}\'',
+        )
+        provider = SshRuntimeProvider(
+            "dev box",
+            ("-Jbastion", "-p2222"),
+            remote_codex="/opt/codex bin/codex",
+            ssh_bin=script,
+        )
+
+        # The fake shell reads this through the inherited environment rather
+        # than changing the provider's process contract.
+        monkeypatch.setenv("SSH_ARGS_FILE", str(args_file))
+        endpoint = await provider.resolve_endpoint()
+
+        assert endpoint.display == "ssh:dev box"
+        assert endpoint.target == StdioTarget(
+            (
+                script,
+                "-T",
+                "-oBatchMode=yes",
+                "-Jbastion",
+                "-p2222",
+                "dev box",
+                "'/opt/codex bin/codex' app-server proxy --sock '/run/codex path/daemon;socket'",
+            ),
+            StdioFraming.WEBSOCKET,
+        )
+        assert endpoint.runtime_pid == 42
+        assert endpoint.cli_version == "remote-cli"
+        assert endpoint.socket_path == Path("/run/codex path/daemon;socket")
+        assert args_file.read_text(encoding="utf-8").splitlines() == [
+            "-T",
+            "-oBatchMode=yes",
+            "-Jbastion",
+            "-p2222",
+            "dev box",
+            "'/opt/codex bin/codex' app-server daemon start",
+        ]
+
+    async def test_lifecycle_stdout_is_one_strict_json_object(self, tmp_path):
+        script = _write_script(
+            tmp_path,
+            'printf \'%s\\n\' \'{"status":"started","socketPath":"/one.sock"}\''
+            '\'{"status":"started","socketPath":"/two.sock"}\'',
+        )
+        with pytest.raises(CodexCtlError) as excinfo:
+            await SshRuntimeProvider("host", ssh_bin=script).resolve_endpoint()
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
+
+    async def test_managed_cli_version_falls_back_to_remote_probe(self, tmp_path):
+        script = _write_script(
+            tmp_path,
+            "last=''\n"
+            'for value do last="$value"; done\n'
+            'case "$last" in\n'
+            "  *--version) echo 'codex-cli remote' ;;\n"
+            '  *) echo \'{"status":"alreadyRunning","socketPath":"/run/codex.sock"}\' ;;\n'
+            "esac",
+        )
+        provider = SshRuntimeProvider("host", ssh_bin=script)
+
+        endpoint = await provider.resolve_endpoint()
+
+        assert endpoint.cli_version is None
+        assert await provider.probe_cli_version() == "codex-cli remote"
+        assert provider.policy.lifecycle is LifecycleOwnership.MANAGED
+
+    async def test_ssh_lifecycle_timeout_is_bounded_and_unavailable(self, tmp_path):
+        script = _write_script(tmp_path, "sleep 30")
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await _run_bounded_ssh((script,), timeout=0.05)
+
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "-t",
+            "-tt",
+            "-n",
+            "-N",
+            "-s",
+            "-Wlocalhost:1",
+            "-f",
+            "-J",
+            "-oRequestTTY=force",
+            "-oStdinNull=yes",
+            "-oRemoteCommand=echo nope",
+            "-oSessionType=none",
+            "-oBatchMode=no",
+        ],
+    )
+    def test_rejects_session_shaping_or_split_ssh_args(self, arg):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider("host", (arg,))
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    @pytest.mark.parametrize("destination", ["", "-host", "host\x00name"])
+    def test_destination_has_only_minimal_validation(self, destination):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider(destination)
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    @pytest.mark.parametrize(
+        "executable", ["./codex", "bin/codex", "~/bin/codex", "codex --version"]
+    )
+    def test_remote_codex_accepts_only_one_name_or_absolute_path(self, executable):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider("host", remote_codex=executable)
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    async def test_external_socket_skips_lifecycle_and_uses_socket(self, tmp_path):
+        provider = SshRuntimeProvider(
+            "host", remote_socket="/run/user/1000/codex.sock", ssh_bin="missing-ssh"
+        )
+
+        endpoint = await provider.resolve_endpoint()
+
+        assert endpoint.target == StdioTarget(
+            (
+                "missing-ssh",
+                "-T",
+                "-oBatchMode=yes",
+                "host",
+                "codex app-server proxy --sock /run/user/1000/codex.sock",
+            ),
+            StdioFraming.WEBSOCKET,
+        )
+        assert provider.policy.lifecycle is LifecycleOwnership.EXTERNAL
+        assert await provider.probe_cli_version() is None
+
+    @pytest.mark.parametrize(
+        "path", ["relative.sock", "~/codex.sock", "", "sock\x00path"]
+    )
+    def test_remote_socket_requires_absolute_posix_path(self, path):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider("host", remote_socket=path)
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    def test_remote_codex_and_socket_are_mutually_exclusive(self):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider(
+                "host", remote_codex="/opt/codex", remote_socket="/run/codex.sock"
+            )
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
 
 
 class TestDefaultControlSocketPath:

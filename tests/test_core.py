@@ -1268,6 +1268,7 @@ class TestDoctor:
         server = FakeAppServer()
         snapshot = await make_ctl(server, endpoint).run(Doctor())
         assert snapshot.endpoint_mode == "external"
+        assert snapshot.lifecycle_ownership == "external"
         assert snapshot.codex_cli_version is None
         assert all(c.name != "codex cli version" for c in snapshot.checks)
         assert all(c.name != "context usage enrichment" for c in snapshot.checks)

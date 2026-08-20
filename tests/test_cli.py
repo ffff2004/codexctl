@@ -32,7 +32,12 @@ from codexctl.cli import (
     main,
 )
 from codexctl.core import CodexCtl
-from codexctl.endpoint import StdioFraming, StdioRuntimeProvider, StdioTarget
+from codexctl.endpoint import (
+    SshRuntimeProvider,
+    StdioFraming,
+    StdioRuntimeProvider,
+    StdioTarget,
+)
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -339,6 +344,79 @@ class TestUsageErrors:
         args = build_parser().parse_args(["list", "--all"])
 
         assert _build_command(args, None) == ListThreads(all_threads=True)
+
+    def test_ssh_list_accepts_explicit_remote_cwd(self):
+        args = build_parser().parse_args(
+            ["list", "--ssh", "devbox", "--cwd", "/srv/repos/foo"]
+        )
+
+        assert _build_command(args, None) == ListThreads(cwd="/srv/repos/foo")
+        assert isinstance(_select_runtime_provider(args), SshRuntimeProvider)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["start", "--ssh", "devbox", "--", "run tests"],
+            ["list", "--ssh", "devbox"],
+            ["start", "--ssh", "devbox", "--cwd", "relative", "--", "run"],
+            [
+                "list",
+                "--ssh",
+                "devbox",
+                "--cwd",
+                "~/repo",
+                "--all",
+            ],
+        ],
+    )
+    def test_ssh_cwd_rules_are_usage_errors_before_connecting(self, argv, capsys):
+        assert main(argv) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_ssh_list_all_does_not_require_cwd(self):
+        args = build_parser().parse_args(["list", "--ssh", "devbox", "--all"])
+
+        assert _build_command(args, None) == ListThreads(all_threads=True)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["list", "--ssh-arg=-J"],
+            ["list", "--remote-codex", "codex"],
+            ["list", "--remote-socket", "/run/codex.sock"],
+            ["list", "--ssh", "devbox", "--endpoint", "unix:///tmp/app.sock"],
+            [
+                "list",
+                "--ssh",
+                "devbox",
+                "--remote-codex",
+                "/opt/codex",
+                "--remote-socket",
+                "/run/codex.sock",
+            ],
+        ],
+    )
+    def test_ssh_selector_and_argument_combinations_are_usage_errors(
+        self, argv, capsys
+    ):
+        assert main(argv) == EXIT_USAGE
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
+    def test_ssh_args_preserve_one_token_order(self):
+        args = build_parser().parse_args(
+            [
+                "list",
+                "--ssh",
+                "devbox",
+                "--ssh-arg=-Jbastion",
+                "--ssh-arg=-p2222",
+            ]
+        )
+
+        provider = _select_runtime_provider(args)
+
+        assert isinstance(provider, SshRuntimeProvider)
+        assert provider._ssh_args == ("-Jbastion", "-p2222")
 
     def test_usage_errors_do_not_reuse_output_mode_code(self, capsys):
         # OUTPUT_MODE_NOT_SUPPORTED is reserved for the output-mode matrix;

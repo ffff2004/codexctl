@@ -25,8 +25,8 @@ side of it:
 - `CodexCtl.run` vs the runtime, so the core vocabulary
   ([model.py](#modelpy--the-closed-vocabulary)) never mentions JSON-RPC,
   sockets, or Codex wire types.
-- Core vs endpoint resolution, because managed, external, and one-shot stdio
-  runtimes have different lifecycle responsibilities.
+- Core vs endpoint resolution, because managed, external, one-shot stdio, and
+  SSH runtimes have different lifecycle responsibilities.
 - Core vs protocol, because Codex protocol churn must be absorbed in one
   place (the projection layer).
 
@@ -37,7 +37,7 @@ side of it:
 | [cli.py](../src/codexctl/cli.py) | argv parsing, output-mode validation, signals, exit codes |
 | [model.py](../src/codexctl/model.py) | The closed vocabulary: commands, outcomes, projected events, selectors, error codes |
 | [core.py](../src/codexctl/core.py) | `CodexCtl`: command dispatch, orchestration, race handling, follow frontier, error mapping |
-| [endpoint.py](../src/codexctl/endpoint.py) | Endpoint resolution: managed daemon, external endpoint, and stdio process target |
+| [endpoint.py](../src/codexctl/endpoint.py) | Endpoint resolution: managed daemon, external endpoint, stdio process target, and SSH remote provider |
 | [appserver.py](../src/codexctl/appserver.py) | Transport framing, JSON-RPC routing, initialize handshake, unattended interaction policy, projection |
 | [rollout.py](../src/codexctl/rollout.py) | Read-only, narrow, best-effort reader of Codex rollout files |
 | [render.py](../src/codexctl/render.py) | text/json/jsonl renderers; single source of structured JSON documents |
@@ -143,6 +143,13 @@ core. `target` is a closed transport detail and is opaque to
   creation does not wait indefinitely, so cleanup may finish asynchronously;
   immediate PID disappearance from the process table is not part of the
   internal contract.
+- `SshRuntimeProvider` manages the remote daemon lifecycle when no external
+  socket is supplied, strictly parses its one JSON lifecycle response, and
+  resolves the proxy to the existing WebSocket-over-stdio `StdioTarget`.
+  External SSH socket mode skips lifecycle management. SSH-specific policy
+  requires explicit absolute POSIX cwd values and disables local rollout
+  enrichment; public behavior is defined in
+  [reference.md — SSH runtime](reference.md#ssh-runtime).
 
 The runtime-provider interface also carries an asynchronous, best-effort
 `probe_cli_version()` used by doctor. Managed providers use an asyncio child

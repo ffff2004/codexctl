@@ -10,9 +10,8 @@ and it never queues, forks, or silently replaces threads.
 ## Quick start
 
 Requires Python 3.14+ and a local `codex` CLI with app-server support
-(managed mode starts
-the shared daemon automatically), or an externally managed endpoint via
-`--endpoint`.
+(managed mode starts the shared daemon automatically), an externally managed
+endpoint via `--endpoint`, or a POSIX remote reached with `--ssh`.
 
 ```sh
 codexctl start -- fix the failing test in src/

@@ -16,6 +16,7 @@ from .core import CodexCtl, history_to_events
 from .endpoint import (
     ExternalRuntimeProvider,
     ManagedRuntimeProvider,
+    SshRuntimeProvider,
     StdioFraming,
     StdioRuntimeProvider,
 )
@@ -95,14 +96,12 @@ class _CliUsageError(Exception):
     pass
 
 
-def _protect_stdio_args(argv: list[str]) -> list[str]:
-    """Make repeatable stdio values safe for argparse.
+def _protect_repeatable_args(argv: list[str]) -> list[str]:
+    """Make repeatable process-option values safe for argparse.
 
     ``argparse`` treats a value beginning with ``-`` as another option. The
     attached form preserves the exact value while leaving the first bare
-    ``--`` available as the existing prompt delimiter. A literal ``--`` used
-    as a stdio value can be written as ``--stdio-arg=--`` when a prompt also
-    follows the options.
+    ``--`` available as the existing prompt delimiter.
     """
     protected: list[str] = []
     index = 0
@@ -112,15 +111,15 @@ def _protect_stdio_args(argv: list[str]) -> list[str]:
         if token == "--":
             protected.extend(argv[index + 1 :])
             break
-        if token == "--stdio-arg" and index + 1 < len(argv):
-            protected[-1] = f"--stdio-arg={argv[index + 1]}"
+        if token in {"--stdio-arg", "--ssh-arg"} and index + 1 < len(argv):
+            protected[-1] = f"{token}={argv[index + 1]}"
             index += 1
         index += 1
     return protected
 
 
 class _CodexArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser that accepts dash-prefixed ``--stdio-arg`` values."""
+    """ArgumentParser that accepts dash-prefixed process-option values."""
 
     def parse_args(  # type: ignore[override]
         self,
@@ -128,7 +127,7 @@ class _CodexArgumentParser(argparse.ArgumentParser):
         namespace: Any = None,
     ) -> argparse.Namespace:
         if args is not None:
-            args = _protect_stdio_args(list(args))
+            args = _protect_repeatable_args(list(args))
         return cast(argparse.Namespace, super().parse_args(args, namespace))
 
 
@@ -173,6 +172,32 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="ARG",
         help="append one exact argument to --stdio-exec",
+    )
+    parser.add_argument(
+        "--ssh",
+        default=None,
+        metavar="DESTINATION",
+        help="connect to a remote app-server through OpenSSH",
+    )
+    parser.add_argument(
+        "--ssh-arg",
+        dest="ssh_args",
+        action="append",
+        default=[],
+        metavar="TOKEN",
+        help="append one complete OpenSSH option token",
+    )
+    parser.add_argument(
+        "--remote-codex",
+        default=None,
+        metavar="EXECUTABLE",
+        help="remote Codex executable used with --ssh (default: codex)",
+    )
+    parser.add_argument(
+        "--remote-socket",
+        default=None,
+        metavar="ABSOLUTE_PATH",
+        help="use an externally managed remote socket with --ssh",
     )
 
 
@@ -243,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("list", help="list stored threads")
     _add_common(p)
+    p.add_argument("--cwd", default=None)
     p.add_argument("--all", action="store_true", dest="all_threads")
 
     p = sub.add_parser("doctor", help="diagnose runtime compatibility")
@@ -267,7 +293,7 @@ def _split_prompt(argv: list[str]) -> tuple[list[str], str | None]:
         token = argv[index]
         if token == "--":
             return argv[:index], " ".join(argv[index + 1 :])
-        if token == "--stdio-arg":
+        if token in {"--stdio-arg", "--ssh-arg"}:
             index += 2
             continue
         index += 1
@@ -284,17 +310,34 @@ def _select_runtime_provider(args: argparse.Namespace) -> Any:
         or stdio_framing is not StdioFraming.JSONL
     )
     has_external = args.endpoint is not None or args.endpoint_token_file is not None
-    if has_stdio and has_external:
-        raise UsageError(
-            "stdio options are mutually exclusive with --endpoint and "
-            "--endpoint-token-file"
-        )
+    has_ssh = (
+        args.ssh is not None
+        or bool(args.ssh_args)
+        or args.remote_codex is not None
+        or args.remote_socket is not None
+    )
+    if sum((has_stdio, has_external, has_ssh)) > 1:
+        modes = "stdio, external endpoint, and SSH"
+        raise UsageError(f"runtime selectors are mutually exclusive ({modes})")
     if stdio_args and args.stdio_exec is None:
         raise UsageError("--stdio-arg requires --stdio-exec")
     if stdio_framing is StdioFraming.WEBSOCKET and args.stdio_exec is None:
         raise UsageError("--stdio-framing websocket requires --stdio-exec")
     if args.stdio_exec is not None:
         return StdioRuntimeProvider(args.stdio_exec, stdio_args, stdio_framing)
+    if has_ssh:
+        if args.ssh is None:
+            raise UsageError(
+                "--ssh-arg, --remote-codex, and --remote-socket require --ssh"
+            )
+        if args.remote_socket is not None and args.remote_codex is not None:
+            raise UsageError("--remote-codex cannot be used with --remote-socket")
+        return SshRuntimeProvider(
+            args.ssh,
+            tuple(args.ssh_args),
+            args.remote_codex,
+            args.remote_socket,
+        )
     if args.endpoint is not None:
         return ExternalRuntimeProvider(args.endpoint, args.endpoint_token_file)
     if args.endpoint_token_file is not None:
@@ -365,7 +408,7 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
     if args.command == "interrupt":
         return Interrupt(thread_id=args.thread_id)
     if args.command == "list":
-        return ListThreads(all_threads=args.all_threads)
+        return ListThreads(all_threads=args.all_threads, cwd=args.cwd)
     if args.command == "doctor":
         return Doctor()
     raise _CliUsageError(f"unknown command: {args.command}")
@@ -407,7 +450,7 @@ async def _execute(ctl: CodexCtl, command: Any, mode: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    argv = _protect_stdio_args(argv)
+    argv = _protect_repeatable_args(argv)
     argv, prompt = _split_prompt(argv)
     parser = build_parser()
     try:

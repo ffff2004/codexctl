@@ -92,6 +92,8 @@ def snapshot_document(outcome: Any) -> dict:
         return {
             "codexctlVersion": outcome.codexctl_version,
             "endpointMode": outcome.endpoint_mode,
+            "lifecycleOwnership": outcome.lifecycle_ownership,
+            "remoteSocket": outcome.remote_socket,
             "codexCliVersion": outcome.codex_cli_version,
             "appServerVersion": outcome.app_server_version,
             "compatible": outcome.compatible,
@@ -310,6 +312,10 @@ class TextRenderer:
             if outcome.app_server_version:
                 self._write(f"app-server:       {outcome.app_server_version}\n")
             self._write(f"endpoint mode:    {outcome.endpoint_mode}\n")
+            if outcome.lifecycle_ownership:
+                self._write(f"lifecycle:        {outcome.lifecycle_ownership}\n")
+            if outcome.remote_socket:
+                self._write(f"remote socket:    {outcome.remote_socket}\n")
             for check in outcome.checks:
                 mark = "ok  " if check.ok else "FAIL"
                 detail = f"  {check.detail}" if check.detail else ""

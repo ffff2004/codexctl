@@ -1,6 +1,6 @@
 """Runtime endpoint resolution.
 
-Three real production behaviors justify this seam:
+Four real production behaviors justify this seam:
 
 - ``ManagedRuntimeProvider`` may start the experimental Codex daemon lifecycle
   to make a compatible shared app-server available.
@@ -8,6 +8,8 @@ Three real production behaviors justify this seam:
   mutation at all.
 - ``StdioRuntimeProvider`` records one caller-supplied process invocation;
   process ownership begins when the app-server transport connects.
+- ``SshRuntimeProvider`` manages a remote daemon lifecycle or connects to an
+  externally managed remote socket, reusing WebSocket-over-stdio transport.
 
 Core execution sees an :class:`AppServerEndpoint` and an immutable
 :class:`RuntimePolicy`; transport targets remain opaque outside this module.
@@ -16,10 +18,12 @@ Core execution sees an :class:`AppServerEndpoint` and an immutable
 import asyncio
 import json
 import os
+import shlex
+import signal
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .model import CodexCtlError, ErrorCode, UsageError
@@ -64,6 +68,109 @@ class StdioTarget:
     framing: StdioFraming = StdioFraming.JSONL
 
 
+SSH_SUBPROCESS_TIMEOUT = 15.0
+
+
+def validate_absolute_posix_path(value: str, option: str = "path") -> str:
+    """Validate a path that will be interpreted by a POSIX remote."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise UsageError(f"--{option} must be a non-empty absolute POSIX path")
+    if not value.startswith("/"):
+        raise UsageError(f"--{option} must be an absolute POSIX path")
+    return value
+
+
+def validate_ssh_destination(destination: str) -> str:
+    """Apply only the local safety checks required for an OpenSSH destination."""
+    if not isinstance(destination, str) or not destination:
+        raise UsageError("--ssh requires a non-empty destination")
+    if "\x00" in destination:
+        raise UsageError("--ssh destination must not contain NUL")
+    if destination.startswith("-"):
+        raise UsageError("--ssh destination must not start with '-'")
+    return destination
+
+
+_SSH_VALUE_OPTIONS = frozenset("B b c D e E F I i J L l m O o p Q R S W w".split())
+_SSH_SESSION_OPTIONS = frozenset(
+    {"batchmode", "requesttty", "stdinnull", "remotecommand", "sessiontype"}
+)
+_SSH_FORBIDDEN_SHORT_OPTIONS = frozenset("tnNsfW")
+
+
+def _ssh_option_setting(token: str) -> tuple[str, str] | None:
+    if not token.startswith("-o"):
+        return None
+    setting = token[2:]
+    if setting.startswith("="):
+        setting = setting[1:]
+    if not setting or "=" not in setting:
+        raise UsageError(
+            "--ssh-arg options requiring a value must attach it to the same token"
+        )
+    key, value = setting.split("=", 1)
+    return key.casefold(), value
+
+
+def validate_ssh_arg(token: str) -> str:
+    """Validate one complete, non-session-shaping OpenSSH option token."""
+    if (
+        not isinstance(token, str)
+        or not token.startswith("-")
+        or token.startswith("--")
+        or token == "-"
+    ):
+        raise UsageError("each --ssh-arg must be one complete OpenSSH option token")
+    if "\x00" in token:
+        raise UsageError("--ssh-arg must not contain NUL")
+
+    setting = _ssh_option_setting(token)
+    if setting is not None:
+        key, _value = setting
+        if key in _SSH_SESSION_OPTIONS:
+            raise UsageError(f"--ssh-arg cannot set SSH session option {key}")
+        return token
+
+    short = token[1:]
+    if short and short[0] in _SSH_FORBIDDEN_SHORT_OPTIONS:
+        raise UsageError("--ssh-arg cannot alter the SSH session or data channel")
+    if short and short[0] in _SSH_VALUE_OPTIONS:
+        if len(short) == 1:
+            raise UsageError(
+                "--ssh-arg options requiring a value must attach it to the same token"
+            )
+        return token
+    if any(option in _SSH_FORBIDDEN_SHORT_OPTIONS for option in short):
+        raise UsageError("--ssh-arg cannot alter the SSH session or data channel")
+    return token
+
+
+def validate_remote_codex(executable: str) -> str:
+    """Validate the single remote executable token supported by SSH v1."""
+    if not isinstance(executable, str) or not executable or "\x00" in executable:
+        raise UsageError("--remote-codex must be one executable name or absolute path")
+    if executable.startswith("~"):
+        raise UsageError("--remote-codex must not use '~'")
+    if not executable.startswith("/") and any(
+        character.isspace() for character in executable
+    ):
+        raise UsageError("--remote-codex must not contain extra arguments")
+    if executable.startswith("/") and any(
+        executable[index + 1 :].lstrip().startswith("-")
+        for index, character in enumerate(executable)
+        if character.isspace()
+    ):
+        raise UsageError("--remote-codex must not contain extra arguments")
+    if "/" in executable and not executable.startswith("/"):
+        raise UsageError("--remote-codex must be an executable name or absolute path")
+    return executable
+
+
+def quote_remote_command(*tokens: str) -> str:
+    """Build one POSIX-shell command for OpenSSH's remote command argument."""
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
 class LifecycleOwnership(StrEnum):
     """Whether a runtime owns the app-server lifecycle."""
 
@@ -85,12 +192,18 @@ class RuntimePolicy:
     lifecycle: LifecycleOwnership
     supports_rollout_enrichment: bool
     require_explicit_cwd: bool = False
+    cwd_validator: Callable[[str], str] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def resolve_cwd(self, requested: str | None) -> str | None:
         """Resolve an optional command cwd using this runtime's policy."""
         if requested is None and self.require_explicit_cwd:
             raise UsageError("this runtime requires an explicit cwd")
-        return self.default_cwd if requested is None else requested
+        resolved = self.default_cwd if requested is None else requested
+        if resolved is not None and self.cwd_validator is not None:
+            return self.cwd_validator(resolved)
+        return resolved
 
     @property
     def lifecycle_ownership(self) -> LifecycleOwnership:
@@ -273,6 +386,287 @@ class ManagedRuntimeProvider:
             return None
         output = (stdout or stderr).decode(errors="replace").strip()
         return output.splitlines()[0] if output else None
+
+
+async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a dedicated subprocess group within a finite deadline."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError, PermissionError, OSError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), 1.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError, PermissionError, OSError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), 1.0)
+    except asyncio.TimeoutError, ProcessLookupError, OSError:
+        pass
+
+
+async def _launch_ssh_process(
+    argv: tuple[str, ...],
+) -> asyncio.subprocess.Process:
+    """Launch SSH while retaining a bounded cancellation cleanup path."""
+    launch_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    )
+    try:
+        return await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        try:
+            proc = await asyncio.wait_for(asyncio.shield(launch_task), 0.1)
+        except asyncio.TimeoutError:
+            launch_task.add_done_callback(_cleanup_late_ssh_process)
+        except BaseException:
+            pass
+        else:
+            await asyncio.shield(_terminate_subprocess(proc))
+        raise
+
+
+def _cleanup_late_ssh_process(
+    launch_task: asyncio.Task[asyncio.subprocess.Process],
+) -> None:
+    try:
+        proc = launch_task.result()
+    except BaseException:
+        return
+    cleanup_task = asyncio.create_task(_terminate_subprocess(proc))
+    cleanup_task.add_done_callback(_consume_ssh_task)
+
+
+def _consume_ssh_task(task: asyncio.Task[object]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _run_bounded_ssh(
+    argv: tuple[str, ...], *, timeout: float | None = None
+) -> tuple[int, bytes, bytes]:
+    """Run a finite SSH command with stdout/stderr kept as separate streams."""
+    timeout = SSH_SUBPROCESS_TIMEOUT if timeout is None else timeout
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        async with asyncio.timeout(timeout):
+            proc = await _launch_ssh_process(argv)
+            stdout, stderr = await proc.communicate()
+    except asyncio.TimeoutError as exc:
+        if proc is not None:
+            await _terminate_subprocess(proc)
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_UNAVAILABLE,
+            "SSH command timed out",
+            cause=exc,
+        ) from exc
+    except asyncio.CancelledError:
+        if proc is not None:
+            await asyncio.shield(_terminate_subprocess(proc))
+        raise
+    except (OSError, ValueError) as exc:
+        if proc is not None and proc.returncode is None:
+            await _terminate_subprocess(proc)
+        raise CodexCtlError(
+            ErrorCode.APP_SERVER_UNAVAILABLE,
+            "cannot start SSH command",
+            cause=exc,
+        ) from exc
+    assert proc is not None
+    return proc.returncode or 0, stdout, stderr
+
+
+class SshRuntimeProvider:
+    """Resolves a remote shared runtime through OpenSSH and stdio WebSockets."""
+
+    mode = "ssh"
+
+    def __init__(
+        self,
+        destination: str,
+        ssh_args: tuple[str, ...] = (),
+        remote_codex: str | None = None,
+        remote_socket: str | None = None,
+        ssh_bin: str = "ssh",
+    ) -> None:
+        self._destination = validate_ssh_destination(destination)
+        self._ssh_args = tuple(validate_ssh_arg(arg) for arg in ssh_args)
+        if remote_socket is not None and remote_codex is not None:
+            raise UsageError("--remote-codex cannot be used with --remote-socket")
+        self._remote_codex = validate_remote_codex(remote_codex or "codex")
+        self._remote_socket = (
+            validate_absolute_posix_path(remote_socket, "remote-socket")
+            if remote_socket is not None
+            else None
+        )
+        if not ssh_bin or "\x00" in ssh_bin:
+            raise UsageError(
+                "SSH executable must be non-empty and must not contain NUL"
+            )
+        self._ssh_bin = ssh_bin
+        self._policy = RuntimePolicy(
+            default_cwd=None,
+            lifecycle=(
+                LifecycleOwnership.EXTERNAL
+                if self._remote_socket is not None
+                else LifecycleOwnership.MANAGED
+            ),
+            supports_rollout_enrichment=False,
+            require_explicit_cwd=True,
+            cwd_validator=lambda value: validate_absolute_posix_path(value, "cwd"),
+        )
+
+    @property
+    def policy(self) -> RuntimePolicy:
+        return self._policy
+
+    @property
+    def destination(self) -> str:
+        return self._destination
+
+    @property
+    def remote_socket(self) -> str | None:
+        return self._remote_socket
+
+    def _ssh_argv(self, remote_command: str) -> tuple[str, ...]:
+        # Keep codexctl's invariants first. Duplicate explicit forms are
+        # harmless, but removing them keeps the generated invocation exact.
+        user_args = tuple(
+            arg
+            for arg in self._ssh_args
+            if arg != "-T" and arg.casefold() != "-obatchmode=yes"
+        )
+        return (
+            self._ssh_bin,
+            "-T",
+            "-oBatchMode=yes",
+            *user_args,
+            self._destination,
+            remote_command,
+        )
+
+    async def _run_remote(self, *remote_tokens: str) -> tuple[int, bytes, bytes]:
+        return await _run_bounded_ssh(
+            self._ssh_argv(quote_remote_command(*remote_tokens))
+        )
+
+    async def resolve_endpoint(self) -> AppServerEndpoint:
+        lifecycle_pid: int | None = None
+        runtime_version: str | None = None
+        cli_version: str | None = None
+        if self._remote_socket is None:
+            return_code, stdout, stderr = await self._run_remote(
+                self._remote_codex, "app-server", "daemon", "start"
+            )
+            if return_code != 0:
+                detail = stderr.decode(errors="replace").strip()
+                raise CodexCtlError(
+                    ErrorCode.APP_SERVER_UNAVAILABLE,
+                    "remote codex app-server daemon start failed"
+                    + (f": {detail}" if detail else ""),
+                )
+            payload = _parse_ssh_lifecycle_json(stdout)
+            socket_text = payload["socketPath"]
+            socket_path = Path(socket_text)
+            raw_pid = payload.get("pid")
+            if isinstance(raw_pid, int) and not isinstance(raw_pid, bool):
+                lifecycle_pid = raw_pid
+            raw_runtime_version = payload.get("appServerVersion")
+            if isinstance(raw_runtime_version, str) and raw_runtime_version:
+                runtime_version = raw_runtime_version
+            raw_cli_version = payload.get("cliVersion")
+            if isinstance(raw_cli_version, str) and raw_cli_version:
+                cli_version = raw_cli_version
+        else:
+            socket_text = self._remote_socket
+            socket_path = Path(socket_text)
+
+        proxy_command = quote_remote_command(
+            self._remote_codex,
+            "app-server",
+            "proxy",
+            "--sock",
+            socket_text,
+        )
+        return AppServerEndpoint(
+            display=f"ssh:{self._destination}",
+            target=StdioTarget(self._ssh_argv(proxy_command), StdioFraming.WEBSOCKET),
+            runtime_pid=lifecycle_pid,
+            runtime_version=runtime_version,
+            cli_version=cli_version,
+            socket_path=socket_path,
+        )
+
+    async def probe_cli_version(self) -> str | None:
+        """Best-effort version probe for managed SSH lifecycle ownership."""
+        if self._remote_socket is not None:
+            return None
+        try:
+            return_code, stdout, stderr = await self._run_remote(
+                self._remote_codex, "--version"
+            )
+        except CodexCtlError, OSError:
+            return None
+        if return_code != 0:
+            return None
+        output = (stdout or stderr).decode(errors="replace").strip()
+        return output.splitlines()[0] if output else None
+
+
+def _parse_ssh_lifecycle_json(stdout: bytes) -> dict[str, Any]:
+    """Parse the complete, single-object SSH daemon lifecycle response."""
+
+    def reject_json_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        parsed = json.loads(
+            stdout.decode(errors="strict"), parse_constant=reject_json_constant
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CodexCtlError(
+            ErrorCode.INCOMPATIBLE_CODEX,
+            "remote codex daemon start did not produce one JSON object",
+            cause=exc,
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise CodexCtlError(
+            ErrorCode.INCOMPATIBLE_CODEX,
+            "remote codex daemon start did not produce one JSON object",
+        )
+    status = parsed.get("status")
+    if status not in {"started", "alreadyRunning"}:
+        raise CodexCtlError(
+            ErrorCode.INCOMPATIBLE_CODEX,
+            "remote codex daemon lifecycle response has an unsupported status",
+        )
+    socket_path = parsed.get("socketPath")
+    if not isinstance(socket_path, str):
+        raise CodexCtlError(
+            ErrorCode.INCOMPATIBLE_CODEX,
+            "remote codex daemon lifecycle response has an invalid socketPath",
+        )
+    try:
+        validate_absolute_posix_path(socket_path, "socketPath")
+    except UsageError as exc:
+        raise CodexCtlError(
+            ErrorCode.INCOMPATIBLE_CODEX,
+            "remote codex daemon lifecycle response has an invalid socketPath",
+            cause=exc,
+        ) from exc
+    return parsed
 
 
 def _last_json_object(text: str) -> dict | None:
