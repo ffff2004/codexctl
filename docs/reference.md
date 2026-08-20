@@ -100,7 +100,8 @@ ControlMaster, ControlPersist, or ControlPath.
 Remote cwd is never inferred from local cwd. `start` requires an explicit
 absolute POSIX `--cwd`; `list` requires one unless `--all` is used. No remote
 directory preflight is performed. Ctrl+C or disconnect closes the proxy and
-SSH process, but does not send `turn/interrupt` or stop the shared daemon.
+SSH process, but does not send `turn/interrupt` or stop the shared daemon. SSH
+v1 provides no automatic reconnect or resume after a connection is lost.
 
 Examples:
 

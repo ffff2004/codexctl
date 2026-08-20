@@ -219,9 +219,11 @@ class FakeRuntimeProvider:
         cli_version: str | None = None,
         mode: str | None = None,
         policy: RuntimePolicy | None = None,
+        endpoint: AppServerEndpoint | None = None,
     ) -> None:
         self._resolve_error = resolve_error
         self._cli_version = cli_version
+        self._endpoint = endpoint
         if mode is not None:
             self.mode = mode
         if policy is None:
@@ -244,6 +246,8 @@ class FakeRuntimeProvider:
     async def resolve_endpoint(self) -> AppServerEndpoint:
         if self._resolve_error is not None:
             raise self._resolve_error
+        if self._endpoint is not None:
+            return self._endpoint
         return AppServerEndpoint(
             display="/fake.sock", target=UnixSocketTarget(Path("/fake.sock"))
         )

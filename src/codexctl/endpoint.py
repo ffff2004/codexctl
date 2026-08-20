@@ -151,18 +151,23 @@ def validate_remote_codex(executable: str) -> str:
         raise UsageError("--remote-codex must be one executable name or absolute path")
     if executable.startswith("~"):
         raise UsageError("--remote-codex must not use '~'")
-    if not executable.startswith("/") and any(
-        character.isspace() for character in executable
-    ):
-        raise UsageError("--remote-codex must not contain extra arguments")
-    if executable.startswith("/") and any(
+    if "/" in executable and not executable.startswith("/"):
+        raise UsageError("--remote-codex must be an executable name or absolute path")
+    if not executable.startswith("/"):
+        if any(character.isspace() for character in executable):
+            raise UsageError("--remote-codex must not contain extra arguments")
+        return executable
+
+    # An absolute POSIX path is one opaque value, so spaces and shell
+    # metacharacters in its components are valid and quote_remote_command()
+    # protects them.  An option-looking token after whitespace is instead an
+    # unambiguous command-string suffix (for example ``/opt/codex --version``).
+    if any(
         executable[index + 1 :].lstrip().startswith("-")
         for index, character in enumerate(executable)
         if character.isspace()
     ):
         raise UsageError("--remote-codex must not contain extra arguments")
-    if "/" in executable and not executable.startswith("/"):
-        raise UsageError("--remote-codex must be an executable name or absolute path")
     return executable
 
 
@@ -185,13 +190,15 @@ class RuntimePolicy:
     ``default_cwd`` is captured by local providers when they are created. A
     remote provider can leave it unset (or provide a remote-specific value)
     without making core infer a local working directory. ``lifecycle`` is
-    intentionally independent from the provider's public ``mode`` identity.
+    intentionally independent from the provider's public ``mode`` identity;
+    the capability fields likewise describe behavior without naming a mode.
     """
 
     default_cwd: str | None
     lifecycle: LifecycleOwnership
     supports_rollout_enrichment: bool
     require_explicit_cwd: bool = False
+    supports_remote_socket_metadata: bool = False
     cwd_validator: Callable[[str], str] | None = field(
         default=None, compare=False, repr=False
     )
@@ -505,7 +512,9 @@ class SshRuntimeProvider:
         self._ssh_args = tuple(validate_ssh_arg(arg) for arg in ssh_args)
         if remote_socket is not None and remote_codex is not None:
             raise UsageError("--remote-codex cannot be used with --remote-socket")
-        self._remote_codex = validate_remote_codex(remote_codex or "codex")
+        self._remote_codex = validate_remote_codex(
+            "codex" if remote_codex is None else remote_codex
+        )
         self._remote_socket = (
             validate_absolute_posix_path(remote_socket, "remote-socket")
             if remote_socket is not None
@@ -525,6 +534,7 @@ class SshRuntimeProvider:
             ),
             supports_rollout_enrichment=False,
             require_explicit_cwd=True,
+            supports_remote_socket_metadata=True,
             cwd_validator=lambda value: validate_absolute_posix_path(value, "cwd"),
         )
 

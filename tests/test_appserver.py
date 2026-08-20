@@ -38,6 +38,7 @@ from codexctl.appserver import (
 )
 from codexctl.endpoint import (
     AppServerEndpoint,
+    SshRuntimeProvider,
     StdioFraming,
     StdioTarget,
     UnixSocketTarget,
@@ -720,6 +721,97 @@ while True:
             await app_server.close()
 
         assert pong.read_text(encoding="utf-8") == "seen"
+
+    async def test_ssh_runtime_connects_websocket_proxy_and_isolates_stderr(
+        self, tmp_path, capfd
+    ):
+        proxy = tmp_path / "ssh-proxy.py"
+        proxy.write_text(
+            _stdio_websocket_proxy_source(
+                after_handshake=(
+                    "print('remote proxy diagnostic', file=sys.stderr, flush=True)"
+                ),
+                thread_list_action=(
+                    "send_text(json.dumps({'id': value['id'], 'result': {'data': []}}))"
+                ),
+            ),
+            encoding="utf-8",
+        )
+        ssh = tmp_path / "fake-ssh.py"
+        ssh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "print('ssh diagnostic', file=sys.stderr, flush=True)\n"
+            f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(proxy)!r}])\n",
+            encoding="utf-8",
+        )
+        ssh.chmod(0o755)
+
+        provider = SshRuntimeProvider(
+            "opaque destination",
+            remote_socket="/run/codex.sock",
+            ssh_bin=str(ssh),
+        )
+        endpoint = await provider.resolve_endpoint()
+        app_server = await connect_app_server(endpoint)
+        try:
+            assert (await app_server.list_threads()).threads == []
+        finally:
+            await app_server.close()
+
+        captured = capfd.readouterr()
+        assert "ssh diagnostic" in captured.err
+        assert "remote proxy diagnostic" in captured.err
+        assert "diagnostic" not in captured.out
+
+    async def test_ssh_runtime_cancellation_cleans_up_process_group(
+        self, tmp_path, monkeypatch
+    ):
+        ready = tmp_path / "ssh-websocket.ready"
+        terminated = tmp_path / "ssh-websocket.terminated"
+        proxy = tmp_path / "ssh-proxy-cancel.py"
+        proxy.write_text(
+            _stdio_websocket_proxy_source(
+                initialize_action="pass",
+                after_handshake=(
+                    "pathlib.Path(sys.argv[-2]).write_text('ready')\ntime.sleep(60)"
+                ),
+                termination_marker=True,
+            ),
+            encoding="utf-8",
+        )
+        ssh = tmp_path / "fake-ssh-cancel.py"
+        ssh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(proxy)!r}, "
+            f"{str(ready)!r}, {str(terminated)!r}])\n",
+            encoding="utf-8",
+        )
+        ssh.chmod(0o755)
+        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
+
+        provider = SshRuntimeProvider(
+            "devbox", remote_socket="/run/codex.sock", ssh_bin=str(ssh)
+        )
+        endpoint = await provider.resolve_endpoint()
+        task = asyncio.create_task(connect_app_server(endpoint, timeout=5.0))
+        for _ in range(100):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert ready.read_text(encoding="utf-8") == "ready"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(100):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_websocket_malformed_upgrade_is_unavailable(
         self, stdio_endpoint

@@ -14,7 +14,12 @@ from conftest import FakeAppServer, FakeRuntimeProvider, collect, make_ctl
 
 import codexctl.core as core
 from codexctl.appserver import UNSUPPORTED_INTERACTION_METHOD
-from codexctl.endpoint import LifecycleOwnership, RuntimePolicy
+from codexctl.endpoint import (
+    AppServerEndpoint,
+    LifecycleOwnership,
+    RuntimePolicy,
+    UnixSocketTarget,
+)
 from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
@@ -1299,3 +1304,33 @@ class TestDoctor:
         assert snapshot.codex_cli_version == "codex-cli 0.101.0"
         assert any(c.name == "codex cli version" for c in snapshot.checks)
         assert all(c.name != "context usage enrichment" for c in snapshot.checks)
+
+    @pytest.mark.parametrize(
+        ("mode", "supports_remote_socket_metadata", "expected_socket"),
+        [
+            ("not-ssh", True, "/remote/codex.sock"),
+            ("ssh", False, None),
+        ],
+    )
+    async def test_remote_socket_metadata_uses_runtime_policy(
+        self, mode, supports_remote_socket_metadata, expected_socket
+    ):
+        policy = RuntimePolicy(
+            default_cwd=None,
+            lifecycle=LifecycleOwnership.EXTERNAL,
+            supports_rollout_enrichment=False,
+            supports_remote_socket_metadata=supports_remote_socket_metadata,
+        )
+        endpoint = FakeRuntimeProvider(
+            mode=mode,
+            policy=policy,
+            endpoint=AppServerEndpoint(
+                display="runtime",
+                target=UnixSocketTarget(Path("/remote/codex.sock")),
+                socket_path=Path("/remote/codex.sock"),
+            ),
+        )
+
+        snapshot = await make_ctl(FakeAppServer(), endpoint).run(Doctor())
+
+        assert snapshot.remote_socket == expected_socket

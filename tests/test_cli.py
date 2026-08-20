@@ -402,6 +402,22 @@ class TestUsageErrors:
         assert main(argv) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
 
+    def test_explicit_empty_remote_codex_is_not_the_default(self, capsys):
+        assert (
+            main(
+                [
+                    "list",
+                    "--ssh",
+                    "devbox",
+                    "--remote-codex",
+                    "",
+                    "--all",
+                ]
+            )
+            == EXIT_USAGE
+        )
+        assert "USAGE_ERROR" in capsys.readouterr().err
+
     def test_ssh_args_preserve_one_token_order(self):
         args = build_parser().parse_args(
             [

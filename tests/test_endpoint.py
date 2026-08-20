@@ -302,6 +302,7 @@ class TestSshRuntimeProvider:
         assert endpoint.runtime_pid == 42
         assert endpoint.cli_version == "remote-cli"
         assert endpoint.socket_path == Path("/run/codex path/daemon;socket")
+        assert provider.policy.supports_remote_socket_metadata is True
         assert args_file.read_text(encoding="utf-8").splitlines() == [
             "-T",
             "-oBatchMode=yes",
@@ -338,6 +339,27 @@ class TestSshRuntimeProvider:
         assert endpoint.cli_version is None
         assert await provider.probe_cli_version() == "codex-cli remote"
         assert provider.policy.lifecycle is LifecycleOwnership.MANAGED
+
+    async def test_managed_lifecycle_failure_is_not_retried_or_bootstrapped(
+        self, tmp_path, monkeypatch
+    ):
+        calls = tmp_path / "ssh-calls"
+        script = _write_script(
+            tmp_path,
+            'printf "%s\\n" "$*" >> "$SSH_CALLS"\n'
+            "echo 'remote daemon failed' >&2\n"
+            "exit 1",
+        )
+        monkeypatch.setenv("SSH_CALLS", str(calls))
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await SshRuntimeProvider("host", ssh_bin=script).resolve_endpoint()
+
+        assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+        recorded = calls.read_text(encoding="utf-8").splitlines()
+        assert len(recorded) == 1
+        assert "daemon start" in recorded[0]
+        assert "bootstrap" not in recorded[0]
 
     async def test_ssh_lifecycle_timeout_is_bounded_and_unavailable(self, tmp_path):
         script = _write_script(tmp_path, "sleep 30")
@@ -383,6 +405,24 @@ class TestSshRuntimeProvider:
         with pytest.raises(CodexCtlError) as excinfo:
             SshRuntimeProvider("host", remote_codex=executable)
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    @pytest.mark.parametrize(
+        "executable",
+        ["", "/opt/codex --version"],
+    )
+    def test_remote_codex_rejects_empty_and_absolute_command_strings(self, executable):
+        with pytest.raises(CodexCtlError) as excinfo:
+            SshRuntimeProvider("host", remote_codex=executable)
+        assert excinfo.value.code == ErrorCode.USAGE_ERROR
+
+    @pytest.mark.parametrize(
+        "executable",
+        ["codex", "/opt/codex bin/codex", "/opt/codex;v1/bin/codex"],
+    )
+    def test_remote_codex_accepts_names_and_opaque_absolute_paths(self, executable):
+        provider = SshRuntimeProvider("host", remote_codex=executable)
+
+        assert provider._remote_codex == executable
 
     async def test_external_socket_skips_lifecycle_and_uses_socket(self, tmp_path):
         provider = SshRuntimeProvider(

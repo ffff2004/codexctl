@@ -114,7 +114,7 @@ Selector parsing is pure and follows Python semantics exactly
 `resolve_endpoint() -> AppServerEndpoint(display, target, runtime_pid,
 runtime_version, cli_version, socket_path)`. The policy carries the default
 cwd, lifecycle ownership, explicit-cwd requirements, and whether local rollout
-enrichment is supported;
+enrichment or remote-socket diagnostic metadata is supported;
 the public `mode` remains an identity and is not used to select behavior in
 core. `target` is a closed transport detail and is opaque to
 [core.py](../src/codexctl/core.py):

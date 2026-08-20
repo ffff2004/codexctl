@@ -689,7 +689,7 @@ class CodexCtl:
             remote_socket=(
                 str(endpoint.socket_path) if endpoint.socket_path is not None else None
             )
-            if endpoint_mode == "ssh"
+            if policy.supports_remote_socket_metadata
             else None,
             checks=checks,
             codex_cli_version=codex_cli_version,
