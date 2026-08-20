@@ -330,8 +330,6 @@ def _select_runtime_provider(args: argparse.Namespace) -> Any:
             raise UsageError(
                 "--ssh-arg, --remote-codex, and --remote-socket require --ssh"
             )
-        if args.remote_socket is not None and args.remote_codex is not None:
-            raise UsageError("--remote-codex cannot be used with --remote-socket")
         return SshRuntimeProvider(
             args.ssh,
             tuple(args.ssh_args),

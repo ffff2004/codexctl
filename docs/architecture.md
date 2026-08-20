@@ -144,11 +144,8 @@ core. `target` is a closed transport detail and is opaque to
   immediate PID disappearance from the process table is not part of the
   internal contract.
 - `SshRuntimeProvider` manages the remote daemon lifecycle when no external
-  socket is supplied, strictly parses its one JSON lifecycle response, and
-  resolves the proxy to the existing WebSocket-over-stdio `StdioTarget`.
-  External SSH socket mode skips lifecycle management. SSH-specific policy
-  requires explicit absolute POSIX cwd values and disables local rollout
-  enrichment; public behavior is defined in
+  socket is supplied and resolves SSH to the existing WebSocket-over-stdio
+  `StdioTarget`; public behavior is defined in
   [reference.md — SSH runtime](reference.md#ssh-runtime).
 
 The runtime-provider interface also carries an asynchronous, best-effort
