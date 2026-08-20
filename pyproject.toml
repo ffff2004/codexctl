@@ -31,6 +31,7 @@ packages = ["src/codexctl"]
 [tool.hatch.build.targets.sdist]
 exclude = [
     "/vendor/codex",
+    "/examples",
 ]
 
 [tool.pytest.ini_options]
