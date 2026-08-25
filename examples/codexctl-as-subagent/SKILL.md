@@ -22,12 +22,12 @@ thread. A worker shares the checkout and runtime, but has its own context.
    Start the worker detached and save the returned `threadId`:
 
    ```sh
-   codexctl start --detach --json --cwd "$PWD" --sandbox workspace-write -- \
+   codexctl start --detach --json --cwd "$PWD" --approve-for-me -- \
      "Implement <bounded task>. You own <files or area>. <constraints>. Run <checks>. At handoff, summarize changes, checks, assumptions, and friction."
    ```
 
-   Use `--sandbox read-only` for investigation-only work. Start separate
-   threads only when their responsibilities cannot conflict.
+   Use `--sandbox read-only` instead of `--approve-for-me` for investigation-only work.
+   Start separate threads only when their responsibilities cannot conflict.
 
 2. Continue work that does not overlap the worker. Inspect its state only when
    an answer is useful:
