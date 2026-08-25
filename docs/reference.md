@@ -2,9 +2,7 @@
 
 The public interface and behavior of `codexctl` v1. This document is the
 single source of truth for anything observable from the outside: commands,
-flags, output modes, output shapes, error codes, and exit codes. Internal
-structure lives in [architecture.md](architecture.md), which links here
-instead of repeating these facts.
+flags, output modes, output shapes, error codes, and exit codes.
 
 ## Overview
 
