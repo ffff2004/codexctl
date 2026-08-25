@@ -19,17 +19,17 @@ thread. A worker shares the checkout and runtime, but has its own context.
    the handoff expected. Tell it that other agents may change the checkout, so
    it must preserve unrelated changes and report any friction or assumptions.
 
-   Start the worker detached and save the returned `threadId`:
+   Start the worker and save the returned `threadId`:
 
    ```sh
-   codexctl start --detach --json --cwd "$PWD" --approve-for-me -- \
+   codexctl start --cwd "$PWD" --approve-for-me -- \
      "Implement <bounded task>. You own <files or area>. <constraints>. Run <checks>. At handoff, summarize changes, checks, assumptions, and friction."
    ```
 
    Use `--sandbox read-only` instead of `--approve-for-me` for investigation-only work.
    Start separate threads only when their responsibilities cannot conflict.
 
-2. Continue work that does not overlap the worker. Inspect its state only when
+2. Wait until it ends, or continue work that does not overlap the worker if the user asks so. Inspect its state only when
    an answer is useful:
 
    ```sh
@@ -46,15 +46,13 @@ thread. A worker shares the checkout and runtime, but has its own context.
    ```sh
    codexctl history --json --turns -1 THREAD_ID \
      | jq -r '.turns[0].items | map(select(.type == "agentMessage")) | last | .text // empty'
-   git diff -- <owned paths>
    ```
 
    Verify the claimed checks yourself before accepting the work. If follow-up
    is needed, resume the same idle thread with a precise request:
 
    ```sh
-   codexctl resume --detach --json THREAD_ID -- \
-     <specific follow-up>
+   codexctl resume THREAD_ID -- "<specific follow-up>"
    ```
 
 4. Treat a failed, interrupted, or unsupported-interaction turn as a handoff
