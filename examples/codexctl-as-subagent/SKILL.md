@@ -61,3 +61,5 @@ thread. A worker shares the checkout and runtime, but has its own context.
    failure. Read its history, resolve the blocker in the parent task, then
    resume the same thread only when a new turn is appropriate. Never replace a
    failed thread with a new one merely to hide the failure.
+
+See [Reference](https://github.com/ffff2004/codexctl/blob/main/docs/reference.md) for details.
