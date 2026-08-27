@@ -31,14 +31,11 @@ It stores nothing locally; threads live in the shared runtime.
 - Reference repository files and directories with Markdown links, not inline
   code paths.
 
-## Commit messages
+## Commit and PR
 
 - Use Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `build:`,
   `chore:`, ...).
-- If a commit closes an issue, add a `Closes #N` line to the
-  commit message.
-- If a commit is related to an issue, the reference belong in commit message,
-  not source files, comments, or docs. 
+- If a PR closes an issue, add a `Closes #N` line to the body.
 
 ## Commands
 
