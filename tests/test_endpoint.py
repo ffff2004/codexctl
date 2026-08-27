@@ -17,8 +17,6 @@ from codexctl.endpoint import (
     StdioTarget,
     UnixSocketTarget,
     WebSocketTarget,
-    _last_json_object,
-    _run_bounded_ssh,
     default_control_socket_path,
 )
 from codexctl.model import CodexCtlError, ErrorCode
@@ -31,26 +29,43 @@ def _write_script(tmp_path: Path, body: str) -> str:
     return str(script)
 
 
-class TestLastJsonObject:
-    def test_picks_last_json_line(self):
-        text = (
-            "starting daemon...\n"
-            '{"status":"ignored"}\n'
-            "some log noise\n"
-            '{"status":"started","socketPath":"/x.sock","pid":42}\n'
+class TestManagedRuntimeLifecycle:
+    async def test_picks_last_json_line(self, tmp_path):
+        script = _write_script(
+            tmp_path,
+            "echo 'starting daemon... '\n"
+            'echo \'{"status":"ignored"}\'\n'
+            "echo 'some log noise'\n"
+            'echo \'{"status":"started","socketPath":"/x.sock","pid":42}\'',
         )
-        assert _last_json_object(text) == {
-            "status": "started",
-            "socketPath": "/x.sock",
-            "pid": 42,
-        }
 
-    def test_none_when_no_json(self):
-        assert _last_json_object("just logs\n") is None
-        assert _last_json_object("") is None
+        endpoint = await ManagedRuntimeProvider(
+            codex_bin=script, home=tmp_path / "home"
+        ).resolve_endpoint()
 
-    def test_skips_malformed_json(self):
-        assert _last_json_object("{broken\n" + '{"ok": true}\n') == {"ok": True}
+        assert endpoint.target == UnixSocketTarget(Path("/x.sock"))
+        assert endpoint.runtime_pid == 42
+
+    async def test_none_when_no_json(self, tmp_path):
+        script = _write_script(tmp_path, "echo 'just logs'")
+        provider = ManagedRuntimeProvider(codex_bin=script, home=tmp_path / "home")
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await provider.resolve_endpoint()
+
+        assert excinfo.value.code == ErrorCode.INCOMPATIBLE_CODEX
+
+    async def test_skips_malformed_json(self, tmp_path):
+        script = _write_script(
+            tmp_path,
+            'echo \'{broken\'\necho \'{"status":"started","socketPath":"/x.sock"}\'',
+        )
+
+        endpoint = await ManagedRuntimeProvider(
+            codex_bin=script, home=tmp_path / "home"
+        ).resolve_endpoint()
+
+        assert endpoint.target == UnixSocketTarget(Path("/x.sock"))
 
 
 class TestManagedRuntimeProvider:
@@ -122,10 +137,11 @@ class TestManagedRuntimeProvider:
             await provider.resolve_endpoint()
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
-    def test_codex_bin_from_environment(self, monkeypatch):
-        monkeypatch.setenv("CODEXCTL_CODEX_BIN", "/opt/codex/bin/codex")
+    async def test_codex_bin_from_environment(self, monkeypatch, tmp_path):
+        script = _write_script(tmp_path, "echo 'codex-cli from environment'")
+        monkeypatch.setenv("CODEXCTL_CODEX_BIN", script)
         provider = ManagedRuntimeProvider()
-        assert provider._codex_bin == "/opt/codex/bin/codex"
+        assert await provider.probe_cli_version() == "codex-cli from environment"
 
     async def test_probe_cli_version_reads_first_output_line(self, tmp_path):
         script = _write_script(tmp_path, "echo 'codex-cli 0.101.0'\necho 'noise'")
@@ -222,10 +238,11 @@ class TestExternalRuntimeProvider:
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
         assert "secret" not in excinfo.value.message
 
-    def test_ws_endpoint_keeps_ordinary_query_parameters(self):
-        endpoint = ExternalRuntimeProvider(
+    async def test_ws_endpoint_keeps_ordinary_query_parameters(self):
+        provider = ExternalRuntimeProvider(
             "ws://127.0.0.1:7777/app?client=codexctl&trace=1"
-        )._endpoint
+        )
+        endpoint = await provider.resolve_endpoint()
         assert endpoint.target == WebSocketTarget(
             "ws://127.0.0.1:7777/app?client=codexctl&trace=1", None
         )
@@ -361,11 +378,14 @@ class TestSshRuntimeProvider:
         assert "daemon start" in recorded[0]
         assert "bootstrap" not in recorded[0]
 
-    async def test_ssh_lifecycle_timeout_is_bounded_and_unavailable(self, tmp_path):
+    async def test_ssh_lifecycle_timeout_is_bounded_and_unavailable(
+        self, tmp_path, monkeypatch
+    ):
         script = _write_script(tmp_path, "sleep 30")
+        monkeypatch.setattr("codexctl.endpoint.SSH_SUBPROCESS_TIMEOUT", 0.05)
 
         with pytest.raises(CodexCtlError) as excinfo:
-            await _run_bounded_ssh((script,), timeout=0.05)
+            await SshRuntimeProvider("host", ssh_bin=script).resolve_endpoint()
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
@@ -419,10 +439,19 @@ class TestSshRuntimeProvider:
         "executable",
         ["codex", "/opt/codex bin/codex", "/opt/codex;v1/bin/codex"],
     )
-    def test_remote_codex_accepts_names_and_opaque_absolute_paths(self, executable):
-        provider = SshRuntimeProvider("host", remote_codex=executable)
+    async def test_remote_codex_accepts_names_and_opaque_absolute_paths(
+        self, executable, tmp_path, monkeypatch
+    ):
+        record = tmp_path / "ssh-args"
+        script = _write_script(
+            tmp_path,
+            'printf "%s\\n" "$@" > "$SSH_ARGS_FILE"\necho \'codex-cli remote\'',
+        )
+        monkeypatch.setenv("SSH_ARGS_FILE", str(record))
+        provider = SshRuntimeProvider("host", remote_codex=executable, ssh_bin=script)
 
-        assert provider._remote_codex == executable
+        assert await provider.probe_cli_version() == "codex-cli remote"
+        assert executable in record.read_text(encoding="utf-8")
 
     async def test_external_socket_skips_lifecycle_and_uses_socket(self, tmp_path):
         provider = SshRuntimeProvider(

@@ -79,6 +79,8 @@ uv build         # build dist/ artifacts
 - Core behaviors are pinned by tests in [tests/](tests/) driven through
   `FakeAppServer` (see [tests/conftest.py](tests/conftest.py)); update them together with
   behavior changes, and keep [docs/reference.md](docs/reference.md) in sync.
+  Tests should verify behavior through public interfaces of each module, not private helpers.
+  Mock real system boundaries, not project-private helpers.
 
 ## Agent skills
 

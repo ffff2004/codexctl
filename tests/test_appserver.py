@@ -10,8 +10,6 @@ import signal
 import struct
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
 from websockets.asyncio.server import serve, unix_serve
@@ -19,16 +17,11 @@ from websockets.asyncio.server import serve, unix_serve
 from codexctl.appserver import (
     REQUIRED_LIFECYCLE_OPERATIONS,
     UNSUPPORTED_INTERACTION_METHOD,
-    AppServerSession,
     AppServerTurn,
-    JsonlStdioMessageTransport,
     JsonRpcError,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
-    _decode_message,
-    _launch_stdio_process,
-    _OwnedStdioProcess,
     connect_app_server,
     parse_user_agent_version,
     project_item,
@@ -64,13 +57,15 @@ def _stdio_websocket_proxy_source(
     thread_list_action: str | None = None,
     after_handshake: str = "pass",
     termination_marker: bool = False,
+    termination_action: str = "raise SystemExit(0)",
 ) -> str:
     signal_setup = ""
     if termination_marker:
+        indented_termination_action = termination_action.replace("\n", "\n    ")
         signal_setup = (
             "def stop(signum, frame):\n"
             "    pathlib.Path(sys.argv[-1]).write_text('terminated')\n"
-            "    raise SystemExit(0)\n"
+            f"    {indented_termination_action}\n"
             "signal.signal(signal.SIGTERM, stop)\n"
         )
     return (
@@ -155,6 +150,55 @@ def _stdio_websocket_proxy_source(
     )
 
 
+@contextlib.asynccontextmanager
+async def _wire_app_server(handlers):
+    """Run a minimal JSON-RPC peer over the public WebSocket boundary."""
+    received: list[dict] = []
+
+    async def handle(connection):
+        async for frame in connection:
+            message = json.loads(frame)
+            received.append(message)
+            method = message.get("method")
+            if method == "initialize":
+                reply: dict = {
+                    "id": message["id"],
+                    "result": {"userAgent": "fake-app-server/1.0"},
+                }
+            elif "id" not in message:
+                continue
+            else:
+                handler = handlers.get(method)
+                result = (
+                    JsonRpcError(-32601, f"method not found: {method}")
+                    if handler is None
+                    else handler(message.get("params"))
+                )
+                if isinstance(result, JsonRpcError):
+                    reply = {
+                        "id": message["id"],
+                        "error": {"code": result.code, "message": result.message},
+                    }
+                else:
+                    reply = {"id": message["id"], "result": result}
+            await connection.send(json.dumps(reply))
+
+    server = await serve(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    endpoint = AppServerEndpoint(
+        f"ws://127.0.0.1:{port}", WebSocketTarget(f"ws://127.0.0.1:{port}", None)
+    )
+    app_server = None
+    try:
+        app_server = await connect_app_server(endpoint)
+        yield app_server, received
+    finally:
+        if app_server is not None:
+            await app_server.close()
+        server.close()
+        await server.wait_closed()
+
+
 class TestProjectThreadStatus:
     def test_tagged_union_forms(self):
         assert project_thread_status({"type": "notLoaded"}) == ("notLoaded", [])
@@ -227,106 +271,73 @@ class TestProjectResponse:
 
 
 class TestTypedOperations:
-    async def test_start_thread_serializes_upstream_sandbox_enum(self, monkeypatch):
-        app_server = AppServerSession(None, "/fake.sock")
-        calls = []
+    async def test_start_thread_serializes_upstream_sandbox_enum(self):
+        async with _wire_app_server(
+            {"thread/start": lambda _params: {"thread": {"id": "t1"}}}
+        ) as (app_server, received):
+            for policy, wire_value in (
+                (None, "workspace-write"),
+                (SandboxPolicy.readOnly, "read-only"),
+                (SandboxPolicy.workspaceWrite, "workspace-write"),
+                (SandboxPolicy.dangerFullAccess, "danger-full-access"),
+            ):
+                assert (
+                    await app_server.start_thread(StartConfig(sandbox=policy))
+                ).id == "t1"
+                assert received[-1] == {
+                    "method": "thread/start",
+                    "id": received[-1]["id"],
+                    "params": {"approvalPolicy": "never", "sandbox": wire_value},
+                }
 
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, {"thread": {"id": "t1"}})
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        for policy, wire_value in (
-            (None, "workspace-write"),
-            (SandboxPolicy.readOnly, "read-only"),
-            (SandboxPolicy.workspaceWrite, "workspace-write"),
-            (SandboxPolicy.dangerFullAccess, "danger-full-access"),
-        ):
-            assert (
-                await app_server.start_thread(StartConfig(sandbox=policy))
-            ).id == "t1"
-            assert calls[-1] == (
-                "thread/start",
-                {"approvalPolicy": "never", "sandbox": wire_value},
-            )
-
-    async def test_start_thread_rejects_unsupported_sandbox_policy(self, monkeypatch):
-        app_server = AppServerSession(None, "/fake.sock")
-        calls = []
-
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, {"thread": {"id": "t1"}})
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        with pytest.raises(CodexCtlError) as excinfo:
-            await app_server.start_thread(StartConfig(sandbox="not-a-policy"))  # type: ignore[arg-type]
+    async def test_start_thread_rejects_unsupported_sandbox_policy(self):
+        async with _wire_app_server(
+            {"thread/start": lambda _params: {"thread": {"id": "t1"}}}
+        ) as (app_server, received):
+            with pytest.raises(CodexCtlError) as excinfo:
+                await app_server.start_thread(
+                    StartConfig(sandbox="not-a-policy")  # type: ignore[arg-type]
+                )
 
         assert excinfo.value.code == ErrorCode.USAGE_ERROR
         assert "unsupported sandbox policy 'not-a-policy'" in excinfo.value.message
-        assert calls == []
+        assert all(message.get("method") != "thread/start" for message in received)
 
-    async def test_start_thread_serializes_approval_policy_and_reviewer(
-        self, monkeypatch
-    ):
-        app_server = AppServerSession(None, "/fake.sock")
-        calls = []
+    async def test_start_thread_serializes_approval_policy_and_reviewer(self):
+        async with _wire_app_server(
+            {"thread/start": lambda _params: {"thread": {"id": "t1"}}}
+        ) as (app_server, received):
+            await app_server.start_thread(StartConfig())
+            assert received[-1]["params"] == {
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            }
 
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, {"thread": {"id": "t1"}})
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        # Default unattended start: never, reviewer omitted.
-        await app_server.start_thread(StartConfig())
-        assert calls[-1] == (
-            "thread/start",
-            {"approvalPolicy": "never", "sandbox": "workspace-write"},
-        )
-        assert "approvalsReviewer" not in calls[-1][1]
-
-        # Auto review: on-request + auto_review reviewer.
-        await app_server.start_thread(
-            StartConfig(
-                approval_policy=ApprovalPolicy.onRequest,
-                approvals_reviewer=ApprovalsReviewer.autoReview,
+            await app_server.start_thread(
+                StartConfig(
+                    approval_policy=ApprovalPolicy.onRequest,
+                    approvals_reviewer=ApprovalsReviewer.autoReview,
+                )
             )
-        )
-        assert calls[-1] == (
-            "thread/start",
-            {
+            assert received[-1]["params"] == {
                 "approvalPolicy": "on-request",
                 "approvalsReviewer": "auto_review",
                 "sandbox": "workspace-write",
-            },
-        )
+            }
 
-    async def test_start_thread_serializes_each_approval_policy(self, monkeypatch):
-        app_server = AppServerSession(None, "/fake.sock")
-        calls = []
+    async def test_start_thread_serializes_each_approval_policy(self):
+        async with _wire_app_server(
+            {"thread/start": lambda _params: {"thread": {"id": "t1"}}}
+        ) as (app_server, received):
+            for policy, wire_value in (
+                (ApprovalPolicy.untrusted, "untrusted"),
+                (ApprovalPolicy.onRequest, "on-request"),
+                (ApprovalPolicy.never, "never"),
+            ):
+                await app_server.start_thread(StartConfig(approval_policy=policy))
+                assert received[-1]["params"]["approvalPolicy"] == wire_value
 
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, {"thread": {"id": "t1"}})
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        for policy, wire_value in (
-            (ApprovalPolicy.untrusted, "untrusted"),
-            (ApprovalPolicy.onRequest, "on-request"),
-            (ApprovalPolicy.never, "never"),
-        ):
-            await app_server.start_thread(StartConfig(approval_policy=policy))
-            assert calls[-1][1]["approvalPolicy"] == wire_value
-
-    async def test_operations_keep_wire_requests_inside_the_app_server(
-        self, monkeypatch
-    ):
-        app_server = AppServerSession(None, "/fake.sock")
-        calls = []
+    async def test_operations_keep_wire_requests_inside_the_app_server(self):
         responses = {
             "thread/start": {"thread": {"id": "t1"}},
             "turn/start": {"turn": {"id": "u1"}},
@@ -336,25 +347,33 @@ class TestTypedOperations:
             "turn/interrupt": {},
             "thread/list": {"data": [], "nextCursor": "next"},
         }
+        async with _wire_app_server(
+            {
+                method: lambda _params, value=value: value
+                for method, value in responses.items()
+            }
+        ) as (app_server, received):
+            assert (
+                await app_server.start_thread(
+                    StartConfig(
+                        cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly
+                    )
+                )
+            ).id == "t1"
+            assert await app_server.start_turn("t1", "hello", effort="high") == "u1"
+            assert (await app_server.read_thread("t1")).id == "t1"
+            assert (await app_server.resume_thread("t1")).id == "t1"
+            assert await app_server.steer_turn("t1", "more", "u1") == "u1"
+            await app_server.interrupt_turn("t1", "u1")
+            assert (
+                await app_server.list_threads("c1", cwd="/tmp")
+            ).next_cursor == "next"
 
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, responses[method])
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        assert (
-            await app_server.start_thread(
-                StartConfig(cwd="/tmp", model="o4-mini", sandbox=SandboxPolicy.readOnly)
-            )
-        ).id == "t1"
-        assert await app_server.start_turn("t1", "hello", effort="high") == "u1"
-        assert (await app_server.read_thread("t1")).id == "t1"
-        assert (await app_server.resume_thread("t1")).id == "t1"
-        assert await app_server.steer_turn("t1", "more", "u1") == "u1"
-        await app_server.interrupt_turn("t1", "u1")
-        assert (await app_server.list_threads("c1", cwd="/tmp")).next_cursor == "next"
-
+        calls = [
+            (message["method"], message.get("params"))
+            for message in received
+            if message.get("method") not in {"initialize", "initialized"}
+        ]
         assert calls == [
             (
                 "thread/start",
@@ -386,10 +405,8 @@ class TestTypedOperations:
             ("turn/interrupt", {"threadId": "t1", "turnId": "u1"}),
             ("thread/list", {"limit": 100, "cursor": "c1", "cwd": "/tmp"}),
         ]
-        assert not hasattr(app_server, "request")
 
-    async def test_lifecycle_probe_checks_each_required_operation(self, monkeypatch):
-        app_server = AppServerSession(None, "/fake.sock")
+    async def test_lifecycle_probe_checks_each_required_operation(self):
         responses = {
             "thread/start": {"thread": {"id": "probe"}},
             "thread/resume": {"thread": {"id": "probe", "status": "idle"}},
@@ -399,15 +416,19 @@ class TestTypedOperations:
             "turn/steer": {"turnId": "probe"},
             "turn/interrupt": {},
         }
-        calls = []
+        async with _wire_app_server(
+            {
+                method: lambda _params, value=value: value
+                for method, value in responses.items()
+            }
+        ) as (app_server, received):
+            assert await app_server.check_lifecycle_operations() == ()
 
-        async def request(method, params=None):
-            calls.append((method, params))
-            return project_response(method, responses[method])
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        assert await app_server.check_lifecycle_operations() == ()
+        calls = [
+            (message["method"], message.get("params"))
+            for message in received
+            if message.get("method") not in {"initialize", "initialized"}
+        ]
         assert len(calls) == len(REQUIRED_LIFECYCLE_OPERATIONS)
         assert [method for method, _ in calls] == [
             "thread/start",
@@ -420,172 +441,183 @@ class TestTypedOperations:
         ]
         assert calls[0][1] == {"ephemeral": True, "historyMode": "paginated"}
 
-    async def test_lifecycle_probe_reports_method_not_found(self, monkeypatch):
-        app_server = AppServerSession(None, "/fake.sock")
-        missing = "steer turn"
-
-        async def request(method, params=None):
-            if method == "turn/steer":
-                raise JsonRpcError(-32601, "method not found")
-            return project_response(method, {})
-
-        monkeypatch.setattr(app_server, "_request", request)
-
-        assert await app_server.check_lifecycle_operations() == (missing,)
+    async def test_lifecycle_probe_reports_method_not_found(self):
+        responses = {
+            "thread/start": {"thread": {"id": "probe"}},
+            "thread/resume": {"thread": {"id": "probe", "status": "idle"}},
+            "thread/read": {"thread": {"id": "probe", "status": "idle"}},
+            "thread/list": {"data": []},
+            "turn/start": {"turn": {"id": "probe"}},
+            "turn/steer": JsonRpcError(-32601, "method not found"),
+            "turn/interrupt": {},
+        }
+        async with _wire_app_server(
+            {
+                method: lambda _params, value=value: value
+                for method, value in responses.items()
+            }
+        ) as (app_server, _received):
+            assert await app_server.check_lifecycle_operations() == ("steer turn",)
 
 
 class TestStrictFraming:
-    @pytest.mark.parametrize(
-        "frame",
-        [
-            b'{"ok": true}',
-            "[1, 2]",
-            "broken",
-            '{"value": NaN}',
-            '{"value": Infinity}',
-            '{"value": -Infinity}',
-        ],
-    )
-    def test_invalid_frames_are_protocol_errors(self, frame):
-        with pytest.raises(CodexCtlError) as excinfo:
-            _decode_message(frame)
-        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
-
-    def test_valid_json_object_does_not_require_jsonrpc_header(self):
-        assert _decode_message('{"method":"initialize","id":1}') == {
-            "method": "initialize",
-            "id": 1,
-        }
-
-    async def test_stdio_framing_skips_blank_lines_and_accepts_crlf_and_eof(self):
-        stdout = asyncio.StreamReader()
-        stdout.feed_data(b'\n  \r\n{"first": 1}\r\n{"last": 2}')
-        stdout.feed_eof()
-        process = _OwnedStdioProcess(
-            cast(asyncio.subprocess.Process, SimpleNamespace(stdout=stdout))
+    async def test_stdio_framing_skips_blank_lines_and_accepts_crlf_and_eof(
+        self, stdio_endpoint
+    ):
+        endpoint = stdio_endpoint(
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('method') == 'initialize':\n"
+            "        sys.stdout.write('\\n  \\r\\n')\n"
+            "        sys.stdout.write(json.dumps({'id': message['id'], 'result': "
+            "{'userAgent': 'stdio/1.0'}}) + '\\r\\n')\n"
+            "        sys.stdout.flush()\n"
+            "    elif message.get('method') == 'thread/list':\n"
+            "        sys.stdout.write(json.dumps({'id': message['id'], 'result': {'data': []}}))\n"
+            "        sys.stdout.flush()\n"
+            "        raise SystemExit(0)\n",
+            filename="stdio-framing.py",
         )
 
-        transport = JsonlStdioMessageTransport(process)
+        app_server = await connect_app_server(endpoint)
+        try:
+            assert (await app_server.list_threads()).threads == []
+        finally:
+            await app_server.close()
 
-        assert [message async for message in transport.messages()] == [
-            '{"first": 1}',
-            '{"last": 2}',
-        ]
+    async def test_runtime_failure_and_concurrent_close_finish_cleanup(
+        self, tmp_path, stdio_endpoint
+    ):
+        cleanup_started = tmp_path / "runtime-failure.cleanup-started"
+        release_cleanup = tmp_path / "runtime-failure.release-cleanup"
+        terminated = tmp_path / "runtime-failure.terminated"
+        endpoint = stdio_endpoint(
+            "import json, pathlib, signal, sys, time\n"
+            "cleanup_started = pathlib.Path(sys.argv[1])\n"
+            "release_cleanup = pathlib.Path(sys.argv[2])\n"
+            "terminated = pathlib.Path(sys.argv[3])\n"
+            "def stop(signum, frame):\n"
+            "    cleanup_started.write_text('started')\n"
+            "    while not release_cleanup.exists():\n"
+            "        time.sleep(0.001)\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "requests = 0\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('method') == 'initialize':\n"
+            "        print(json.dumps({'id': message['id'], 'result': "
+            "{'userAgent': 'stdio/1.0'}}), flush=True)\n"
+            "    elif message.get('method') == 'thread/list':\n"
+            "        requests += 1\n"
+            "        if requests == 2:\n"
+            "            print('{malformed', flush=True)\n"
+            "            time.sleep(60)\n",
+            str(cleanup_started),
+            str(release_cleanup),
+            str(terminated),
+            filename="stdio-runtime-failure.py",
+        )
 
-    async def test_invalid_frame_fails_pending_request_and_closes_transport(self):
-        class Transport:
-            def __init__(self):
-                self.closed = False
+        app_server = await connect_app_server(endpoint)
+        close_tasks: list[asyncio.Task[None]] = []
+        try:
+            results = await asyncio.gather(
+                app_server.list_threads(),
+                app_server.list_threads(),
+                return_exceptions=True,
+            )
+            assert len(results) == 2
+            assert all(isinstance(result, CodexCtlError) for result in results)
+            assert all(
+                result.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
+                for result in results
+                if isinstance(result, CodexCtlError)
+            )
 
-            async def send_text(self, payload):
-                pass
+            # Public callers must join cleanup. Whether that is one task or
+            # several is deliberately not an observable transport contract.
+            close_tasks = [asyncio.create_task(app_server.close()) for _ in range(3)]
+            for _ in range(300):
+                if cleanup_started.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert cleanup_started.read_text(encoding="utf-8") == "started"
+            assert all(not task.done() for task in close_tasks)
 
-            async def messages(self):
-                yield "{malformed"
+            release_cleanup.write_text("release", encoding="utf-8")
+            await asyncio.gather(*close_tasks)
+        finally:
+            release_cleanup.touch()
+            await app_server.close()
 
-            async def close(self):
-                self.closed = True
+        for _ in range(300):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
-        transport = Transport()
-        app_server = AppServerSession(transport, "stdio")
-        app_server._reader_task = asyncio.create_task(app_server._reader())
+    async def test_close_is_idempotent_and_cancellation_waits_for_cleanup(
+        self, tmp_path, stdio_endpoint
+    ):
+        cleanup_started = tmp_path / "close-cancelled.cleanup-started"
+        release_cleanup = tmp_path / "close-cancelled.release-cleanup"
+        terminated = tmp_path / "close-cancelled.terminated"
+        endpoint = stdio_endpoint(
+            "import json, pathlib, signal, sys, time\n"
+            "cleanup_started = pathlib.Path(sys.argv[1])\n"
+            "release_cleanup = pathlib.Path(sys.argv[2])\n"
+            "terminated = pathlib.Path(sys.argv[3])\n"
+            "def stop(signum, frame):\n"
+            "    cleanup_started.write_text('started')\n"
+            "    while not release_cleanup.exists():\n"
+            "        time.sleep(0.001)\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('method') == 'initialize':\n"
+            "        print(json.dumps({'id': message['id'], 'result': "
+            "{'userAgent': 'stdio/1.0'}}), flush=True)\n"
+            "    elif message.get('method') == 'initialized':\n"
+            "        time.sleep(60)\n",
+            str(cleanup_started),
+            str(release_cleanup),
+            str(terminated),
+            filename="stdio-close-cancelled.py",
+        )
 
-        with pytest.raises(CodexCtlError) as excinfo:
-            await app_server._request("unknown")
-        await app_server._reader_task
-
-        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
-        assert transport.closed
-
-    async def test_runtime_failure_and_concurrent_close_share_blocking_cleanup(self):
-        cleanup_started = asyncio.Event()
-        release_cleanup = asyncio.Event()
-
-        class Transport:
-            close_calls = 0
-
-            async def send_text(self, _payload):
-                pass
-
-            async def messages(self):
-                yield "{malformed"
-
-            async def close(self):
-                self.close_calls += 1
-                cleanup_started.set()
-                await release_cleanup.wait()
-
-        transport = Transport()
-        app_server = AppServerSession(transport, "stdio")
-        app_server._reader_task = asyncio.create_task(app_server._reader())
-
-        await cleanup_started.wait()
+        app_server = await connect_app_server(endpoint)
         close_task = asyncio.create_task(app_server.close())
-        await asyncio.sleep(0)
+        try:
+            for _ in range(300):
+                if cleanup_started.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert cleanup_started.read_text(encoding="utf-8") == "started"
 
-        assert not close_task.done()
-        assert not app_server._reader_task.done()
-        assert app_server._lifecycle == "CLOSING"
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert not close_task.done()
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert not close_task.done()
 
-        release_cleanup.set()
-        await app_server._reader_task
-        await close_task
+            release_cleanup.write_text("release", encoding="utf-8")
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(close_task, timeout=3.0)
+        finally:
+            release_cleanup.touch()
+            await app_server.close()
 
-        assert transport.close_calls == 1
-        assert app_server._lifecycle == "CLOSED"
-
-    async def test_concurrent_and_repeated_close_calls_share_cleanup(self):
-        cleanup_started = asyncio.Event()
-        release_cleanup = asyncio.Event()
-
-        class Transport:
-            close_calls = 0
-
-            async def close(self):
-                self.close_calls += 1
-                cleanup_started.set()
-                await release_cleanup.wait()
-
-        transport = Transport()
-        app_server = AppServerSession(transport, "stdio")
-        close_tasks = [asyncio.create_task(app_server.close()) for _ in range(3)]
-
-        await cleanup_started.wait()
-        await asyncio.sleep(0)
-        assert all(not task.done() for task in close_tasks)
-
-        release_cleanup.set()
-        await asyncio.gather(*close_tasks)
-        await app_server.close()
-
-        assert transport.close_calls == 1
-        assert app_server._lifecycle == "CLOSED"
-
-    async def test_close_cancellation_waits_for_cleanup_completion(self):
-        cleanup_started = asyncio.Event()
-        release_cleanup = asyncio.Event()
-
-        class Transport:
-            async def close(self):
-                cleanup_started.set()
-                await release_cleanup.wait()
-
-        app_server = AppServerSession(Transport(), "stdio")
-        close_task = asyncio.create_task(app_server.close())
-        await cleanup_started.wait()
-
-        close_task.cancel()
-        await asyncio.sleep(0)
-        assert not close_task.done()
-
-        close_task.cancel()
-        await asyncio.sleep(0)
-        assert not close_task.done()
-
-        release_cleanup.set()
-        with pytest.raises(asyncio.CancelledError):
-            await close_task
-        assert app_server._lifecycle == "CLOSED"
+        for _ in range(300):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_connects_with_ndjson_and_inherits_process_setup(
         self, stdio_endpoint
@@ -764,9 +796,7 @@ while True:
         assert "remote proxy diagnostic" in captured.err
         assert "diagnostic" not in captured.out
 
-    async def test_ssh_runtime_cancellation_cleans_up_process_group(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_ssh_runtime_cancellation_cleans_up_process_group(self, tmp_path):
         ready = tmp_path / "ssh-websocket.ready"
         terminated = tmp_path / "ssh-websocket.terminated"
         proxy = tmp_path / "ssh-proxy-cancel.py"
@@ -789,15 +819,12 @@ while True:
             encoding="utf-8",
         )
         ssh.chmod(0o755)
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-
         provider = SshRuntimeProvider(
             "devbox", remote_socket="/run/codex.sock", ssh_bin=str(ssh)
         )
         endpoint = await provider.resolve_endpoint()
         task = asyncio.create_task(connect_app_server(endpoint, timeout=5.0))
-        for _ in range(100):
+        for _ in range(300):
             if ready.exists():
                 break
             await asyncio.sleep(0.01)
@@ -869,7 +896,7 @@ while True:
             await app_server.close()
 
     async def test_stdio_websocket_runtime_failure_cleans_up_descendants(
-        self, tmp_path, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
         descendant_ready = tmp_path / "websocket-runtime-descendant.ready"
         descendant_terminated = tmp_path / "websocket-runtime-descendant.terminated"
@@ -906,18 +933,13 @@ while True:
             filename="stdio-websocket-runtime-descendant.py",
             framing=StdioFraming.WEBSOCKET,
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-
         app_server = await connect_app_server(endpoint)
         try:
             with pytest.raises(CodexCtlError) as excinfo:
                 await app_server.list_threads()
             assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
-            await app_server._reader_task
-
             pid = int(descendant_pid.read_text(encoding="utf-8"))
-            for _ in range(100):
+            for _ in range(300):
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
@@ -929,11 +951,14 @@ while True:
             await app_server.close()
 
     async def test_stdio_websocket_close_cancellation_cleans_up_established_process_group(
-        self, tmp_path, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
         descendant_ready = tmp_path / "websocket-cancel-descendant.ready"
         descendant_terminated = tmp_path / "websocket-cancel-descendant.terminated"
         descendant_pid = tmp_path / "websocket-cancel-descendant.pid"
+        cleanup_started = tmp_path / "websocket-cancel.cleanup-started"
+        release_cleanup = tmp_path / "websocket-cancel.release-cleanup"
+        parent_terminated = tmp_path / "websocket-cancel-parent.terminated"
         descendant_source = (
             "import os, pathlib, signal, sys, time\n"
             "ready = pathlib.Path(sys.argv[1])\n"
@@ -951,51 +976,51 @@ while True:
             _stdio_websocket_proxy_source(
                 after_handshake=(
                     "subprocess.Popen([sys.executable, '-c', "
-                    f"{descendant_source!r}, sys.argv[-4], sys.argv[-3], sys.argv[-2]])\n"
-                    "while not pathlib.Path(sys.argv[-4]).exists():\n"
+                    f"{descendant_source!r}, sys.argv[-6], sys.argv[-5], sys.argv[-4]])\n"
+                    "while not pathlib.Path(sys.argv[-6]).exists():\n"
                     "    time.sleep(0.001)"
                 ),
+                initialized_action="time.sleep(60)",
                 termination_marker=True,
+                termination_action=(
+                    "pathlib.Path(sys.argv[-3]).write_text('started')\n"
+                    "while not pathlib.Path(sys.argv[-2]).exists():\n"
+                    "    time.sleep(0.001)\n"
+                    "raise SystemExit(0)"
+                ),
             ),
             str(descendant_ready),
             str(descendant_terminated),
             str(descendant_pid),
-            str(tmp_path / "websocket-cancel-parent.terminated"),
+            str(cleanup_started),
+            str(release_cleanup),
+            str(parent_terminated),
             filename="stdio-websocket-cancel-established.py",
             framing=StdioFraming.WEBSOCKET,
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
 
         app_server = await connect_app_server(endpoint)
-        transport = app_server._transport
-        assert transport is not None
-        close_started = asyncio.Event()
-        release_close = asyncio.Event()
-        original_close = transport.close
-
-        async def delayed_close():
-            close_started.set()
-            await release_close.wait()
-            await original_close()
-
-        transport.close = delayed_close
         close_task = asyncio.create_task(app_server.close())
         try:
-            await close_started.wait()
-            close_task.cancel()
-            await asyncio.sleep(0)
-            assert not close_task.done()
+            for _ in range(300):
+                if cleanup_started.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert cleanup_started.read_text(encoding="utf-8") == "started"
 
             close_task.cancel()
             await asyncio.sleep(0)
             assert not close_task.done()
+            close_task.cancel()
+            await asyncio.sleep(0)
+            assert not close_task.done()
 
-            release_close.set()
+            release_cleanup.write_text("release", encoding="utf-8")
             with pytest.raises(asyncio.CancelledError):
-                await close_task
+                await asyncio.wait_for(close_task, timeout=3.0)
 
             pid = int(descendant_pid.read_text(encoding="utf-8"))
-            for _ in range(100):
+            for _ in range(300):
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
@@ -1004,6 +1029,7 @@ while True:
             else:
                 pytest.fail("WebSocket stdio descendant survived process-group cleanup")
         finally:
+            release_cleanup.touch()
             if not close_task.done():
                 await app_server.close()
 
@@ -1028,38 +1054,33 @@ while True:
         finally:
             await app_server.close()
 
-    async def test_stdio_websocket_startup_timeout_closes_owned_process(
-        self, tmp_path, stdio_endpoint, monkeypatch
+    async def test_stdio_websocket_startup_timeout_closes_child(
+        self, tmp_path, stdio_endpoint
     ):
+        terminated = tmp_path / "websocket-timeout.terminated"
         endpoint = stdio_endpoint(
             _stdio_websocket_proxy_source(
                 initialize_action="pass",
                 after_handshake="time.sleep(60)",
+                termination_marker=True,
             ),
+            str(terminated),
             filename="stdio-websocket-timeout.py",
             framing=StdioFraming.WEBSOCKET,
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-        close_finished = asyncio.Event()
-        original_close = _OwnedStdioProcess.close
-
-        async def close(process):
-            try:
-                await original_close(process)
-            finally:
-                close_finished.set()
-
-        monkeypatch.setattr(_OwnedStdioProcess, "close", close)
 
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_app_server(endpoint, timeout=0.5)
 
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
-        await asyncio.wait_for(close_finished.wait(), timeout=1.0)
+        for _ in range(300):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_websocket_cancellation_cleans_up_child(
-        self, tmp_path, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
         ready = tmp_path / "websocket-cancel.ready"
         terminated = tmp_path / "websocket-cancel.terminated"
@@ -1076,11 +1097,8 @@ while True:
             filename="stdio-websocket-cancel.py",
             framing=StdioFraming.WEBSOCKET,
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-
         task = asyncio.create_task(connect_app_server(endpoint, timeout=5.0))
-        for _ in range(100):
+        for _ in range(300):
             if ready.exists():
                 break
             await asyncio.sleep(0.01)
@@ -1097,7 +1115,7 @@ while True:
         assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_websocket_cleanup_does_not_wait_for_close_handshake(
-        self, tmp_path, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
         terminated = tmp_path / "websocket-cleanup.terminated"
         endpoint = stdio_endpoint(
@@ -1110,13 +1128,10 @@ while True:
             filename="stdio-websocket-cleanup.py",
             framing=StdioFraming.WEBSOCKET,
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-
         app_server = await connect_app_server(endpoint)
-        await asyncio.wait_for(app_server.close(), timeout=0.5)
+        await asyncio.wait_for(app_server.close(), timeout=3.0)
 
-        for _ in range(100):
+        for _ in range(300):
             if terminated.exists():
                 break
             await asyncio.sleep(0.01)
@@ -1303,44 +1318,56 @@ while True:
             await app_server.close()
 
     async def test_stdio_startup_timeout_cleans_up_child(
-        self, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
+        terminated = tmp_path / "stdio-startup-timeout.terminated"
         endpoint = stdio_endpoint(
-            "import time\ntime.sleep(60)\n", filename="stdio-hang.py"
+            "import pathlib, signal, sys, time\n"
+            "terminated = pathlib.Path(sys.argv[1])\n"
+            "def stop(signum, frame):\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "time.sleep(60)\n",
+            str(terminated),
+            filename="stdio-hang.py",
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         with pytest.raises(CodexCtlError) as excinfo:
             await connect_app_server(endpoint, timeout=0.05)
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
+        for _ in range(300):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
-    async def test_stdio_cleanup_waits_for_process_exit(
-        self, stdio_endpoint, monkeypatch
-    ):
+    async def test_stdio_cleanup_waits_for_process_exit(self, tmp_path, stdio_endpoint):
+        terminated = tmp_path / "stdio-close.terminated"
         endpoint = stdio_endpoint(
-            "import json, sys, time\n"
+            "import json, pathlib, signal, sys, time\n"
+            "terminated = pathlib.Path(sys.argv[1])\n"
+            "def stop(signum, frame):\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
             "for line in sys.stdin:\n"
             "    message = json.loads(line)\n"
             "    if message.get('method') == 'initialize':\n"
             "        print(json.dumps({'id': message['id'], 'result': "
             "{'userAgent': 'stdio/1.0'}}), flush=True)\n"
             "        time.sleep(60)\n",
+            str(terminated),
             filename="stdio-running.py",
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
 
         app_server = await connect_app_server(endpoint)
-        transport = app_server._transport
-        assert isinstance(transport, JsonlStdioMessageTransport)
-        process = transport._process
         await app_server.close()
 
-        assert process.returncode is not None
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
     async def test_stdio_cleanup_terminates_descendant_process_group(
-        self, tmp_path, stdio_endpoint, monkeypatch
+        self, tmp_path, stdio_endpoint
     ):
         marker = tmp_path / "descendant-terminated"
         endpoint = stdio_endpoint(
@@ -1370,64 +1397,33 @@ while True:
             str(marker),
             filename="stdio-descendant.py",
         )
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-
         app_server = await connect_app_server(endpoint)
         await app_server.close()
 
-        for _ in range(100):
+        for _ in range(300):
             if marker.exists():
                 break
             await asyncio.sleep(0.01)
         assert marker.read_text(encoding="utf-8") == "terminated"
 
-    async def test_stdio_launch_cancellation_closes_transport(self, monkeypatch):
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        class Transport:
-            closed = False
-
-            async def close(self):
-                self.closed = True
-
-        transport = Transport()
-
-        async def launch(_argv, _state):
-            started.set()
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                await release.wait()
-            return transport
-
-        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
-        task = asyncio.create_task(_launch_stdio_process(("app-server",)))
-        await started.wait()
-        task.cancel()
-        release.set()
-
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert transport.closed
-
-    async def test_stdio_launch_cancellation_does_not_wait_for_stalled_launch(
+    async def test_stdio_connect_cancellation_does_not_wait_for_stalled_launch(
         self, monkeypatch
     ):
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def launch(_argv, _state):
+        async def stalled_subprocess_exec(*_args, **_kwargs):
             started.set()
             try:
                 await release.wait()
             except asyncio.CancelledError:
                 await release.wait()
-            return SimpleNamespace(close=lambda: None)
+            raise OSError("stalled subprocess launch")
 
-        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
-        task = asyncio.create_task(_launch_stdio_process(("app-server",)))
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "subprocess_exec", stalled_subprocess_exec)
+        endpoint = AppServerEndpoint("stdio", StdioTarget(("app-server",)))
+        task = asyncio.create_task(connect_app_server(endpoint))
         await started.wait()
         task.cancel()
 
@@ -1437,7 +1433,7 @@ while True:
         release.set()
         await asyncio.sleep(0)
 
-    async def test_stdio_launch_cancellation_eventually_reaps_captured_child(
+    async def test_stdio_connect_cancellation_reaps_child_created_during_launch(
         self, tmp_path, monkeypatch
     ):
         ready = tmp_path / "real-child.ready"
@@ -1468,17 +1464,15 @@ while True:
             return raw_transport, protocol
 
         monkeypatch.setattr(loop, "subprocess_exec", delayed_subprocess_exec)
-        monkeypatch.setattr(_OwnedStdioProcess, "_GRACEFUL_WAIT_SECONDS", 0.01)
-        monkeypatch.setattr(_OwnedStdioProcess, "_TERMINATE_WAIT_SECONDS", 0.01)
-        task = asyncio.create_task(
-            _launch_stdio_process(
-                (sys.executable, "-c", source, str(ready), str(terminated))
-            )
+        endpoint = AppServerEndpoint(
+            "stdio",
+            StdioTarget((sys.executable, "-c", source, str(ready), str(terminated))),
         )
+        task = asyncio.create_task(connect_app_server(endpoint))
         pid: int | None = None
         try:
             await subprocess_created.wait()
-            for _ in range(100):
+            for _ in range(300):
                 if ready.exists():
                     break
                 await asyncio.sleep(0.01)
@@ -1489,7 +1483,7 @@ while True:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-            for _ in range(100):
+            for _ in range(300):
                 if terminated.exists():
                     break
                 await asyncio.sleep(0.01)
@@ -1512,43 +1506,43 @@ while True:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(pid, signal.SIGKILL)
 
-    async def test_stdio_initialize_cancellation_closes_assigned_transport(
-        self, monkeypatch
+    async def test_stdio_connect_cancellation_closes_child_during_initialize(
+        self, tmp_path, stdio_endpoint
     ):
-        initialized = asyncio.Event()
-
-        class Transport:
-            closed = False
-
-            async def send_text(self, _payload):
-                pass
-
-            async def messages(self):
-                await asyncio.Future()
-                yield "{}"
-
-            async def close(self):
-                self.closed = True
-
-        transport = Transport()
-
-        async def launch(_argv, _state):
-            return transport
-
-        async def initialize(_app_server):
-            initialized.set()
-            await asyncio.Future()
-
-        monkeypatch.setattr(_OwnedStdioProcess, "launch", launch)
-        monkeypatch.setattr(AppServerSession, "_initialize", initialize)
-        endpoint = AppServerEndpoint("stdio", StdioTarget(("app-server",)))
+        ready = tmp_path / "initialize-cancel.ready"
+        terminated = tmp_path / "initialize-cancel.terminated"
+        endpoint = stdio_endpoint(
+            "import json, pathlib, signal, sys, time\n"
+            "ready = pathlib.Path(sys.argv[1])\n"
+            "terminated = pathlib.Path(sys.argv[2])\n"
+            "def stop(signum, frame):\n"
+            "    terminated.write_text('terminated')\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('method') == 'initialize':\n"
+            "        ready.write_text('ready')\n"
+            "        time.sleep(60)\n",
+            str(ready),
+            str(terminated),
+            filename="stdio-initialize-cancel.py",
+        )
         task = asyncio.create_task(connect_app_server(endpoint))
-        await initialized.wait()
+        for _ in range(300):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert ready.read_text(encoding="utf-8") == "ready"
         task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert transport.closed
+        for _ in range(300):
+            if terminated.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert terminated.read_text(encoding="utf-8") == "terminated"
 
 
 class TestUnixSocketConnection:
@@ -1749,7 +1743,14 @@ class TestUnixSocketConnection:
 
     @pytest.mark.parametrize(
         "payload",
-        [b'{"binary": true}', "{malformed", "[]", '{"value": NaN}'],
+        [
+            b'{"binary": true}',
+            "{malformed",
+            "[]",
+            '{"value": NaN}',
+            '{"value": Infinity}',
+            '{"value": -Infinity}',
+        ],
     )
     async def test_tcp_rejects_binary_malformed_non_object_and_nonstandard_json(
         self, payload
@@ -1796,47 +1797,48 @@ class TestUnixSocketConnection:
         assert excinfo.value.code == ErrorCode.APP_SERVER_UNAVAILABLE
 
     async def test_tcp_connect_passes_token_path_query_and_no_compression(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         captured: dict = {}
 
-        class Connection:
-            def __aiter__(self):
-                return self
+        async def handle(connection):
+            captured["path"] = connection.request.path
+            captured["headers"] = dict(connection.request.headers)
+            async for frame in connection:
+                message = json.loads(frame)
+                if message.get("method") == "initialize":
+                    await connection.send(
+                        json.dumps(
+                            {
+                                "id": message["id"],
+                                "result": {"userAgent": "fake-app-server/1.0"},
+                            }
+                        )
+                    )
 
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            async def close(self):
-                pass
-
-        async def fake_connect(url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return Connection()
-
-        async def initialize(self):
-            pass
-
-        import websockets.asyncio.client
-
-        monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
-        monkeypatch.setattr(AppServerSession, "_initialize", initialize)
+        server = await serve(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
         token_file = tmp_path / "token"
         endpoint = AppServerEndpoint(
-            "ws://127.0.0.1:7777/app-server?client=test",
-            WebSocketTarget("ws://127.0.0.1:7777/app-server?client=test", token_file),
+            f"ws://127.0.0.1:{port}/app-server?client=test",
+            WebSocketTarget(
+                f"ws://127.0.0.1:{port}/app-server?client=test", token_file
+            ),
         )
         # The file intentionally does not exist until connection time.
         token_file.write_text("  secret-token\n", encoding="utf-8")
-        app_server = await connect_app_server(endpoint)
-        await app_server.close()
+        app_server = None
+        try:
+            app_server = await connect_app_server(endpoint)
+        finally:
+            if app_server is not None:
+                await app_server.close()
+            server.close()
+            await server.wait_closed()
 
-        assert captured["url"] == "ws://127.0.0.1:7777/app-server?client=test"
-        assert captured["additional_headers"] == {
-            "Authorization": "Bearer secret-token"
-        }
-        assert captured["compression"] is None
+        assert captured["path"] == "/app-server?client=test"
+        assert captured["headers"]["authorization"] == "Bearer secret-token"
+        assert "sec-websocket-extensions" not in captured["headers"]
 
     @pytest.mark.parametrize("contents", ["", " \n"])
     async def test_empty_tcp_token_is_unavailable(self, tmp_path, contents):

@@ -1,7 +1,4 @@
-"""CLI: output-mode matrix, usage errors, exit-code mapping.
-
-All paths tested here return before any runtime connection is attempted.
-"""
+"""CLI: public execution, output-mode matrix, usage errors, and exit mapping."""
 
 import asyncio
 import io
@@ -13,29 +10,21 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import FakeAppServer, make_ctl
 
 from codexctl.appserver import JsonlStdioMessageTransport
 from codexctl.cli import (
-    _OUTPUT_MATRIX,
     EXIT_DOMAIN,
     EXIT_OK,
     EXIT_RUNTIME,
     EXIT_TURN,
     EXIT_USAGE,
-    _build_command,
-    _execute,
-    _select_runtime_provider,
-    _split_prompt,
     build_parser,
     exit_code_for,
     main,
 )
 from codexctl.core import CodexCtl
 from codexctl.endpoint import (
-    SshRuntimeProvider,
     StdioFraming,
-    StdioRuntimeProvider,
     StdioTarget,
 )
 from codexctl.model import (
@@ -44,11 +33,13 @@ from codexctl.model import (
     CodexCtlError,
     ErrorCode,
     Follow,
+    HistorySnapshot,
     ListThreads,
     ReplayActiveTurn,
     Resume,
     SandboxPolicy,
     Start,
+    Status,
     Steer,
 )
 
@@ -90,13 +81,41 @@ for line in sys.stdin:
 """
 
 
-class TestStdioExecution:
-    async def test_start_preserves_text_rendering(self, stdio_runtime_provider, capsys):
-        endpoint = stdio_runtime_provider(
-            _SUCCESSFUL_STDIO_SERVER, filename="render.py"
-        )
+def _argv_recording_stdio_server() -> str:
+    return (
+        "import json, pathlib, sys\n"
+        "pathlib.Path(sys.argv[-1]).write_text(json.dumps(sys.argv[1:-1]))\n"
+        + _SUCCESSFUL_STDIO_SERVER
+    )
 
-        code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
+
+def stdio_cli_argv(endpoint, command_args, prompt=None):
+    target = endpoint.target
+    assert isinstance(target, StdioTarget)
+    argv = [*command_args, "--stdio-exec", target.argv[0]]
+    for value in target.argv[1:]:
+        argv.extend(("--stdio-arg", value))
+    if prompt is not None:
+        argv.extend(("--", prompt))
+    return argv
+
+
+def capture_cli_command(monkeypatch):
+    commands = []
+
+    async def run(_ctl, command):
+        commands.append(command)
+        return HistorySnapshot(thread_id="t1")
+
+    monkeypatch.setattr(CodexCtl, "run", run)
+    return commands
+
+
+class TestStdioExecution:
+    def test_start_preserves_text_rendering(self, stdio_endpoint, capsys):
+        endpoint = stdio_endpoint(_SUCCESSFUL_STDIO_SERVER, filename="render.py")
+
+        code = main(stdio_cli_argv(endpoint, ["start"], "hello"))
 
         assert code == 0
         output = capsys.readouterr().out
@@ -106,15 +125,11 @@ class TestStdioExecution:
         assert "[agent]\ndone\n" in output
         assert "Turn completed\n" in output
 
-    async def test_detach_returns_the_existing_json_document(
-        self, stdio_runtime_provider, capsys
-    ):
-        endpoint = stdio_runtime_provider(
-            _SUCCESSFUL_STDIO_SERVER, filename="detach.py"
-        )
+    def test_detach_returns_the_existing_json_document(self, stdio_endpoint, capsys):
+        endpoint = stdio_endpoint(_SUCCESSFUL_STDIO_SERVER, filename="detach.py")
 
-        code = await _execute(
-            CodexCtl(endpoint), Start(prompt="hello", detach=True), "json"
+        code = main(
+            stdio_cli_argv(endpoint, ["start", "--detach", "-o", "json"], "hello")
         )
 
         assert code == 0
@@ -124,12 +139,10 @@ class TestStdioExecution:
             "detached": True,
         }
 
-    async def test_cleanup_failure_does_not_replace_successful_result(
-        self, stdio_runtime_provider, capsys, monkeypatch
+    def test_cleanup_failure_does_not_replace_successful_result(
+        self, stdio_endpoint, capsys, monkeypatch
     ):
-        endpoint = stdio_runtime_provider(
-            _SUCCESSFUL_STDIO_SERVER, filename="cleanup.py"
-        )
+        endpoint = stdio_endpoint(_SUCCESSFUL_STDIO_SERVER, filename="cleanup.py")
         original_close = JsonlStdioMessageTransport.close
 
         async def close_then_fail(transport):
@@ -138,7 +151,7 @@ class TestStdioExecution:
 
         monkeypatch.setattr(JsonlStdioMessageTransport, "close", close_then_fail)
 
-        code = await _execute(CodexCtl(endpoint), Start(prompt="hello"), "text")
+        code = main(stdio_cli_argv(endpoint, ["start"], "hello"))
 
         assert code == 0
         assert "Turn completed" in capsys.readouterr().out
@@ -221,65 +234,185 @@ class TestStdioExecution:
 
 
 class TestPersistFollowExecution:
-    def test_persist_flag_builds_follow_command(self):
-        args = build_parser().parse_args(["follow", "t1", "--persist"])
+    def test_persist_flag_builds_follow_command(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-        command = _build_command(args, None)
-
-        assert command == Follow(
+        assert main(["follow", "t1", "--persist", "--stdio-exec", "app"]) == EXIT_OK
+        assert commands[-1] == Follow(
             thread_id="t1", replay=ReplayActiveTurn(), persist=True
         )
 
-    def test_default_follow_is_not_persistent(self):
-        args = build_parser().parse_args(["follow", "t1"])
+    def test_default_follow_is_not_persistent(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-        command = _build_command(args, None)
+        assert main(["follow", "t1", "--stdio-exec", "app"]) == EXIT_OK
+        assert commands[-1] == Follow(thread_id="t1", replay=ReplayActiveTurn())
 
-        assert command == Follow(thread_id="t1", replay=ReplayActiveTurn())
-
-    async def test_connection_loss_maps_to_protocol_error_exit_path(self):
-        # Persist exits 5 on connection loss: _execute re-raises the
-        # APP_SERVER_PROTOCOL_ERROR carried by the outcome result.
-        server = FakeAppServer()
-        server.result(
-            "thread/resume",
-            {"thread": {"id": "t1", "status": {"type": "idle"}, "turns": []}},
+    def test_connection_loss_maps_to_protocol_error_exit_path(self, tmp_path, capsys):
+        record = tmp_path / "methods"
+        server = tmp_path / "connection-loss.py"
+        server.write_text(
+            "import json, pathlib, sys\n"
+            "record = pathlib.Path(sys.argv[1])\n"
+            "def send(value):\n"
+            "    print(json.dumps(value), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    with record.open('a', encoding='utf-8') as stream:\n"
+            "        stream.write(message.get('method', '') + '\\n')\n"
+            "    if message.get('method') == 'initialize':\n"
+            "        send({'id': message['id'], 'result': {'userAgent': 'stdio/1.0'}})\n"
+            "    elif message.get('method') == 'thread/resume':\n"
+            "        send({'id': message['id'], 'result': {'thread': {'id': 't1', "
+            "'status': {'type': 'idle'}, 'turns': []}}})\n"
+            "        break\n",
+            encoding="utf-8",
         )
-        server.end_stream()
 
-        with pytest.raises(CodexCtlError) as excinfo:
-            await _execute(
-                make_ctl(server), Follow(thread_id="t1", persist=True), "text"
-            )
+        code = main(
+            [
+                "follow",
+                "t1",
+                "--persist",
+                "--stdio-exec",
+                sys.executable,
+                "--stdio-arg",
+                str(server),
+                "--stdio-arg",
+                str(record),
+            ]
+        )
 
-        assert excinfo.value.code == ErrorCode.APP_SERVER_PROTOCOL_ERROR
-        assert exit_code_for(excinfo.value) == EXIT_RUNTIME
-        assert "turn/interrupt" not in server.methods_requested
+        assert code == EXIT_RUNTIME
+        assert "APP_SERVER_PROTOCOL_ERROR" in capsys.readouterr().err
+        assert "turn/interrupt" not in record.read_text(encoding="utf-8")
 
 
 class TestOutputMatrixContract:
     """The matrix is the public contract from the interface specification."""
 
-    def test_streaming_commands_accept_jsonl_foreground(self):
-        for command in ("start", "resume", "follow"):
-            assert "jsonl" in _OUTPUT_MATRIX[(command, False)]
-            assert "json" not in _OUTPUT_MATRIX[(command, False)]
+    def test_streaming_commands_accept_jsonl_foreground(self, monkeypatch):
+        capture_cli_command(monkeypatch)
+        for argv in (
+            ["start", "--stdio-exec", "app", "-o", "jsonl", "--", "hello"],
+            [
+                "resume",
+                "t1",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "jsonl",
+                "--",
+                "hello",
+            ],
+            ["follow", "t1", "--stdio-exec", "app", "-o", "jsonl"],
+        ):
+            assert main(argv) == EXIT_OK
+        for argv in (
+            ["start", "--stdio-exec", "app", "-o", "json", "--", "hello"],
+            [
+                "resume",
+                "t1",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "json",
+                "--",
+                "hello",
+            ],
+            ["follow", "t1", "--stdio-exec", "app", "-o", "json"],
+        ):
+            assert main(argv) == EXIT_USAGE
 
-    def test_detached_start_resume_accept_json_not_jsonl(self):
-        for command in ("start", "resume"):
-            assert "json" in _OUTPUT_MATRIX[(command, True)]
-            assert "jsonl" not in _OUTPUT_MATRIX[(command, True)]
+    def test_detached_start_resume_accept_json_not_jsonl(self, monkeypatch):
+        capture_cli_command(monkeypatch)
+        for argv in (
+            [
+                "start",
+                "--detach",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "json",
+                "--",
+                "hello",
+            ],
+            [
+                "resume",
+                "t1",
+                "--detach",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "json",
+                "--",
+                "hello",
+            ],
+        ):
+            assert main(argv) == EXIT_OK
+        for argv in (
+            [
+                "start",
+                "--detach",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "jsonl",
+                "--",
+                "hello",
+            ],
+            [
+                "resume",
+                "t1",
+                "--detach",
+                "--stdio-exec",
+                "app",
+                "-o",
+                "jsonl",
+                "--",
+                "hello",
+            ],
+        ):
+            assert main(argv) == EXIT_USAGE
 
-    def test_snapshot_commands_accept_json_not_jsonl(self):
-        for command in ("status", "steer", "interrupt", "list", "doctor"):
-            assert "json" in _OUTPUT_MATRIX[(command, False)]
-            assert "jsonl" not in _OUTPUT_MATRIX[(command, False)]
+    def test_snapshot_commands_accept_json_not_jsonl(self, monkeypatch):
+        capture_cli_command(monkeypatch)
+        for argv in (
+            ["status", "t1", "--stdio-exec", "app", "-o", "json"],
+            ["steer", "t1", "--stdio-exec", "app", "-o", "json", "--", "hello"],
+            ["interrupt", "t1", "--stdio-exec", "app", "-o", "json"],
+            ["list", "--stdio-exec", "app", "-o", "json"],
+            ["doctor", "--stdio-exec", "app", "-o", "json"],
+        ):
+            assert main(argv) == EXIT_OK
+        for argv in (
+            ["status", "t1", "--stdio-exec", "app", "-o", "jsonl"],
+            ["steer", "t1", "--stdio-exec", "app", "-o", "jsonl", "--", "hello"],
+            ["interrupt", "t1", "--stdio-exec", "app", "-o", "jsonl"],
+            ["list", "--stdio-exec", "app", "-o", "jsonl"],
+            ["doctor", "--stdio-exec", "app", "-o", "jsonl"],
+        ):
+            assert main(argv) == EXIT_USAGE
 
-    def test_history_accepts_all_modes(self):
-        assert _OUTPUT_MATRIX[("history", False)] == {"text", "json", "jsonl"}
+    def test_history_accepts_all_modes(self, monkeypatch):
+        capture_cli_command(monkeypatch)
+        for mode in ("text", "json", "jsonl"):
+            assert main(["history", "t1", "--stdio-exec", "app", "-o", mode]) == EXIT_OK
 
-    def test_text_always_allowed(self):
-        assert all("text" in modes for modes in _OUTPUT_MATRIX.values())
+    def test_text_always_allowed(self, monkeypatch):
+        capture_cli_command(monkeypatch)
+        commands = (
+            ["start", "--stdio-exec", "app", "--", "hello"],
+            ["resume", "t1", "--stdio-exec", "app", "--", "hello"],
+            ["status", "t1", "--stdio-exec", "app"],
+            ["history", "t1", "--stdio-exec", "app"],
+            ["follow", "t1", "--stdio-exec", "app"],
+            ["steer", "t1", "--stdio-exec", "app", "--", "hello"],
+            ["interrupt", "t1", "--stdio-exec", "app"],
+            ["list", "--stdio-exec", "app"],
+            ["doctor", "--stdio-exec", "app"],
+        )
+        assert all(main(argv) == EXIT_OK for argv in commands)
 
 
 class TestOutputModeRejection:
@@ -340,18 +473,35 @@ class TestUsageErrors:
     def test_unknown_command(self, capsys):
         assert main(["frobnicate"]) == EXIT_USAGE
 
-    def test_list_all_builds_global_list_command(self):
-        args = build_parser().parse_args(["list", "--all"])
+    def test_list_all_builds_global_list_command(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-        assert _build_command(args, None) == ListThreads(all_threads=True)
+        assert main(["list", "--all", "--stdio-exec", "app"]) == EXIT_OK
+        assert commands[-1] == ListThreads(all_threads=True)
 
-    def test_ssh_list_accepts_explicit_remote_cwd(self):
-        args = build_parser().parse_args(
-            ["list", "--ssh", "devbox", "--cwd", "/srv/repos/foo"]
-        )
+    def test_ssh_list_accepts_explicit_remote_cwd(self, monkeypatch):
+        captured = {}
 
-        assert _build_command(args, None) == ListThreads(cwd="/srv/repos/foo")
-        assert isinstance(_select_runtime_provider(args), SshRuntimeProvider)
+        class RecordingSshProvider:
+            def __init__(self, destination, ssh_args, remote_codex, remote_socket):
+                captured.update(
+                    destination=destination,
+                    ssh_args=ssh_args,
+                    remote_codex=remote_codex,
+                    remote_socket=remote_socket,
+                )
+
+        monkeypatch.setattr("codexctl.cli.SshRuntimeProvider", RecordingSshProvider)
+        commands = capture_cli_command(monkeypatch)
+
+        assert main(["list", "--ssh", "devbox", "--cwd", "/srv/repos/foo"]) == EXIT_OK
+        assert commands[-1] == ListThreads(cwd="/srv/repos/foo")
+        assert captured == {
+            "destination": "devbox",
+            "ssh_args": (),
+            "remote_codex": None,
+            "remote_socket": None,
+        }
 
     @pytest.mark.parametrize(
         "argv",
@@ -373,10 +523,24 @@ class TestUsageErrors:
         assert main(argv) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
 
-    def test_ssh_list_all_does_not_require_cwd(self):
-        args = build_parser().parse_args(["list", "--ssh", "devbox", "--all"])
+    def test_ssh_list_all_does_not_require_cwd(self, monkeypatch):
+        captured = {}
 
-        assert _build_command(args, None) == ListThreads(all_threads=True)
+        class RecordingSshProvider:
+            def __init__(self, destination, ssh_args, remote_codex, remote_socket):
+                captured.update(
+                    destination=destination,
+                    ssh_args=ssh_args,
+                    remote_codex=remote_codex,
+                    remote_socket=remote_socket,
+                )
+
+        monkeypatch.setattr("codexctl.cli.SshRuntimeProvider", RecordingSshProvider)
+        commands = capture_cli_command(monkeypatch)
+
+        assert main(["list", "--ssh", "devbox", "--all"]) == EXIT_OK
+        assert commands[-1] == ListThreads(all_threads=True)
+        assert captured["destination"] == "devbox"
 
     @pytest.mark.parametrize(
         "argv",
@@ -418,21 +582,33 @@ class TestUsageErrors:
         )
         assert "USAGE_ERROR" in capsys.readouterr().err
 
-    def test_ssh_args_preserve_one_token_order(self):
-        args = build_parser().parse_args(
-            [
-                "list",
-                "--ssh",
-                "devbox",
-                "--ssh-arg=-Jbastion",
-                "--ssh-arg=-p2222",
-            ]
+    def test_ssh_args_preserve_one_token_order(self, monkeypatch):
+        captured = {}
+
+        class RecordingSshProvider:
+            def __init__(self, destination, ssh_args, remote_codex, remote_socket):
+                captured["destination"] = destination
+                captured["ssh_args"] = ssh_args
+                captured["remote_codex"] = remote_codex
+                captured["remote_socket"] = remote_socket
+
+        monkeypatch.setattr("codexctl.cli.SshRuntimeProvider", RecordingSshProvider)
+        capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "list",
+                    "--ssh",
+                    "devbox",
+                    "--ssh-arg=-Jbastion",
+                    "--ssh-arg=-p2222",
+                ]
+            )
+            == EXIT_OK
         )
-
-        provider = _select_runtime_provider(args)
-
-        assert isinstance(provider, SshRuntimeProvider)
-        assert provider._ssh_args == ("-Jbastion", "-p2222")
+        assert captured["destination"] == "devbox"
+        assert captured["ssh_args"] == ("-Jbastion", "-p2222")
 
     def test_usage_errors_do_not_reuse_output_mode_code(self, capsys):
         # OUTPUT_MODE_NOT_SUPPORTED is reserved for the output-mode matrix;
@@ -455,45 +631,73 @@ class TestUsageErrors:
         assert main(["list", "--endpoint-token-file", "/tmp/token"]) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
 
-    def test_stdio_arg_accepts_dash_prefixed_values_and_preserves_order(self):
-        args = build_parser().parse_args(
-            [
-                "list",
-                "--stdio-exec",
-                "app-server",
-                "--stdio-arg",
-                "--child-flag",
-                "--stdio-arg",
-                "value",
-            ]
+    def test_stdio_arg_accepts_dash_prefixed_values_and_preserves_order(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class RecordingStdioProvider:
+            def __init__(self, executable, args, framing):
+                captured["executable"] = executable
+                captured["args"] = args
+                captured["framing"] = framing
+
+        monkeypatch.setattr("codexctl.cli.StdioRuntimeProvider", RecordingStdioProvider)
+        capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "list",
+                    "--stdio-exec",
+                    "app-server",
+                    "--stdio-arg",
+                    "--child-flag",
+                    "--stdio-arg",
+                    "value",
+                ]
+            )
+            == EXIT_OK
         )
+        assert captured == {
+            "executable": "app-server",
+            "args": ("--child-flag", "value"),
+            "framing": StdioFraming.JSONL,
+        }
 
-        endpoint = _select_runtime_provider(args)
+    def test_stdio_websocket_protocol_is_recorded_on_the_target(self, monkeypatch):
+        captured = {}
 
-        assert isinstance(endpoint, StdioRuntimeProvider)
-        assert endpoint.mode == "stdio"
-        assert endpoint._target == StdioTarget(("app-server", "--child-flag", "value"))
+        class RecordingStdioProvider:
+            def __init__(self, executable, args, framing):
+                captured["executable"] = executable
+                captured["args"] = args
+                captured["framing"] = framing
 
-    def test_stdio_websocket_protocol_is_recorded_on_the_target(self):
-        args = build_parser().parse_args(
-            [
-                "list",
-                "--stdio-exec",
-                "codex",
-                "--stdio-framing",
-                "websocket",
-                "--stdio-arg",
-                "app-server",
-                "--stdio-arg",
-                "proxy",
-            ]
+        monkeypatch.setattr("codexctl.cli.StdioRuntimeProvider", RecordingStdioProvider)
+        capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "list",
+                    "--stdio-exec",
+                    "codex",
+                    "--stdio-framing",
+                    "websocket",
+                    "--stdio-arg",
+                    "app-server",
+                    "--stdio-arg",
+                    "proxy",
+                ]
+            )
+            == EXIT_OK
         )
-
-        endpoint = _select_runtime_provider(args)
-
-        assert endpoint._target == StdioTarget(
-            ("codex", "app-server", "proxy"), StdioFraming.WEBSOCKET
-        )
+        assert captured == {
+            "executable": "codex",
+            "args": ("app-server", "proxy"),
+            "framing": StdioFraming.WEBSOCKET,
+        }
 
     def test_stdio_websocket_protocol_requires_an_executable(self, capsys):
         assert main(["list", "--stdio-framing", "websocket"]) == EXIT_USAGE
@@ -521,18 +725,19 @@ class TestUsageErrors:
         assert "selected stdio framing" in help_text
         assert "newline-delimited JSON" not in help_text
 
-    def test_stdio_literal_double_dash_can_precede_prompt_delimiter(self):
-        args = build_parser().parse_args(
-            ["start", "--stdio-exec", "app", "--stdio-arg=--"]
+    def test_stdio_literal_double_dash_can_precede_prompt_delimiter(
+        self, tmp_path, stdio_endpoint
+    ):
+        record = tmp_path / "stdio-argv.json"
+        endpoint = stdio_endpoint(
+            _argv_recording_stdio_server(),
+            "--",
+            str(record),
+            filename="stdio-literal-double-dash.py",
         )
-        endpoint = _select_runtime_provider(args)
-        assert endpoint._target == StdioTarget(("app", "--"))
 
-        argv, prompt = _split_prompt(
-            ["start", "--stdio-exec", "app", "--stdio-arg=--", "--", "run"]
-        )
-        assert argv[-1] == "--stdio-arg=--"
-        assert prompt == "run"
+        assert main(stdio_cli_argv(endpoint, ["start"], "run")) == EXIT_OK
+        assert json.loads(record.read_text(encoding="utf-8")) == ["--"]
 
     @pytest.mark.parametrize(
         "argv",
@@ -581,9 +786,10 @@ class TestUsageErrors:
     ):
         stdin = "\n leading line\ninternal line\n\n"
         monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+        commands = capture_cli_command(monkeypatch)
 
-        args = build_parser().parse_args(argv)
-        command = _build_command(args, None)
+        assert main([*argv, "--stdio-exec", "app"]) == EXIT_OK
+        command = commands[-1]
 
         assert isinstance(command, command_type)
         assert getattr(command, input_field) == stdin
@@ -595,16 +801,19 @@ class TestUsageErrors:
         self, argv, monkeypatch, capsys
     ):
         monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        launched = False
 
-        def endpoint_must_not_be_selected(_args):
-            pytest.fail("empty stdin attempted to connect to the app-server")
+        async def subprocess_exec(*_args, **_kwargs):
+            nonlocal launched
+            launched = True
+            pytest.fail("empty stdin attempted to launch the stdio runtime")
 
-        monkeypatch.setattr(
-            "codexctl.cli._select_runtime_provider", endpoint_must_not_be_selected
-        )
+        monkeypatch.setattr(asyncio.BaseEventLoop, "subprocess_exec", subprocess_exec)
+        runtime_argv = [argv[0], "--stdio-exec", "app", *argv[1:]]
 
-        assert main(argv) == EXIT_USAGE
+        assert main(runtime_argv) == EXIT_USAGE
         assert "USAGE_ERROR" in capsys.readouterr().err
+        assert not launched
 
     def test_dash_is_not_stdin_input_for_non_prompt_commands(self, capsys, monkeypatch):
         class StdinMustNotBeRead:
@@ -626,10 +835,26 @@ class TestSandboxPolicy:
             ("danger-full-access", SandboxPolicy.dangerFullAccess),
         ),
     )
-    def test_parser_and_command_use_public_policy_vocabulary(self, argument, policy):
-        args = build_parser().parse_args(["start", "--sandbox", argument])
+    def test_parser_and_command_use_public_policy_vocabulary(
+        self, argument, policy, monkeypatch
+    ):
+        commands = capture_cli_command(monkeypatch)
 
-        command = _build_command(args, "hello")
+        assert (
+            main(
+                [
+                    "start",
+                    "--sandbox",
+                    argument,
+                    "--stdio-exec",
+                    "app",
+                    "--",
+                    "hello",
+                ]
+            )
+            == EXIT_OK
+        )
+        command = commands[-1]
 
         assert isinstance(command, Start)
         assert command.config.sandbox is policy
@@ -640,19 +865,24 @@ class TestSandboxPolicy:
 
 
 class TestApproveForMe:
-    def test_flag_enables_auto_review(self):
-        args = build_parser().parse_args(["start", "--approve-for-me"])
+    def test_flag_enables_auto_review(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-        command = _build_command(args, "hello")
+        assert (
+            main(["start", "--approve-for-me", "--stdio-exec", "app", "--", "hello"])
+            == EXIT_OK
+        )
+        command = commands[-1]
 
         assert isinstance(command, Start)
         assert command.config.approval_policy is ApprovalPolicy.onRequest
         assert command.config.approvals_reviewer is ApprovalsReviewer.autoReview
 
-    def test_default_stays_unattended(self):
-        args = build_parser().parse_args(["start"])
+    def test_default_stays_unattended(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-        command = _build_command(args, "hello")
+        assert main(["start", "--stdio-exec", "app", "--", "hello"]) == EXIT_OK
+        command = commands[-1]
 
         assert isinstance(command, Start)
         assert command.config.approval_policy is ApprovalPolicy.never
@@ -660,33 +890,60 @@ class TestApproveForMe:
 
 
 class TestSplitPrompt:
-    def test_prompt_after_double_dash(self):
-        argv, prompt = _split_prompt(
-            ["start", "-o", "jsonl", "--", "fix", "the", "bug"]
+    def test_prompt_after_double_dash(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "start",
+                    "-o",
+                    "jsonl",
+                    "--stdio-exec",
+                    "app",
+                    "--",
+                    "fix",
+                    "the",
+                    "bug",
+                ]
+            )
+            == EXIT_OK
         )
-        assert argv == ["start", "-o", "jsonl"]
-        assert prompt == "fix the bug"
+        assert commands[-1] == Start(prompt="fix the bug")
 
-    def test_no_double_dash(self):
-        argv, prompt = _split_prompt(["status", "t1"])
-        assert argv == ["status", "t1"] and prompt is None
+    def test_no_double_dash(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-    def test_flags_after_double_dash_are_prompt_content(self):
-        argv, prompt = _split_prompt(["start", "--", "run", "--verbose"])
-        assert argv == ["start"]
-        assert prompt == "run --verbose"
+        assert main(["status", "t1", "--stdio-exec", "app"]) == EXIT_OK
+        assert commands[-1] == Status(thread_id="t1")
 
-    def test_dash_after_double_dash_remains_prompt_content(self):
-        argv, prompt = _split_prompt(["start", "--", "-"])
-        assert argv == ["start"]
-        assert prompt == "-"
+    def test_flags_after_double_dash_are_prompt_content(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
 
-    def test_stdio_dash_value_does_not_become_prompt_delimiter(self):
-        argv, prompt = _split_prompt(
-            ["start", "--stdio-arg", "--child-flag", "--", "run"]
+        assert (
+            main(["start", "--stdio-exec", "app", "--", "run", "--verbose"]) == EXIT_OK
         )
-        assert argv == ["start", "--stdio-arg", "--child-flag"]
-        assert prompt == "run"
+        assert commands[-1] == Start(prompt="run --verbose")
+
+    def test_dash_after_double_dash_remains_prompt_content(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
+
+        assert main(["start", "--stdio-exec", "app", "--", "-"]) == EXIT_OK
+        assert commands[-1] == Start(prompt="-")
+
+    def test_stdio_dash_value_does_not_become_prompt_delimiter(
+        self, tmp_path, stdio_endpoint
+    ):
+        record = tmp_path / "stdio-argv.json"
+        endpoint = stdio_endpoint(
+            _argv_recording_stdio_server(),
+            "--child-flag",
+            str(record),
+            filename="stdio-dash-value.py",
+        )
+
+        assert main(stdio_cli_argv(endpoint, ["start"], "run")) == EXIT_OK
+        assert json.loads(record.read_text(encoding="utf-8")) == ["--child-flag"]
 
     def test_keyboard_interrupt_returns_130(self, monkeypatch):
         def interrupt(coroutine):
