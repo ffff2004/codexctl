@@ -1,6 +1,9 @@
 Review the implementation changes in {{cwd}} on the Standards axis. Read the
 repository's documented coding standards and check the implementation against
-them. This is round {{round}}, with issue URI {{issue}}.
+them.
+
+This is round {{round}}. If round > 1, reuse your previous context and see if
+previous problems are fixed.
 
 Also apply this Fowler smell baseline. These are labelled heuristics, not hard
 violations; documented repository standards override them, and tooling-enforced
@@ -28,4 +31,4 @@ Review this unstaged diff as part of the checkout:
 
 {{unstaged_diff}}
 
-Do not edit the checkout. Do not spawn sub-agents.
+Do not edit the checkout. You are the standards reviewer, review yourself, do not spawn sub-agents.
