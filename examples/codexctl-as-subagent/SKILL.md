@@ -29,8 +29,12 @@ thread. A worker shares the checkout and runtime, but has its own context.
    Use `--sandbox read-only` instead of `--approve-for-me` for investigation-only work.
    Start separate threads only when their responsibilities cannot conflict.
 
-2. Wait until it ends, or continue work that does not overlap the worker if the user asks so. Inspect its state only when
-   an answer is useful:
+2. Wait until it ends, or continue work that does not overlap the worker if the user asks so.
+   
+   If you can only rely on polling to wait, then use the largest possible polling interval
+   (for example, for Codex's `write_stdin` tool, wait at least 300 seconds).
+
+   Inspect its state only when an answer is useful:
 
    ```sh
    codexctl status --json THREAD_ID
