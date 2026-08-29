@@ -34,6 +34,7 @@ from codexctl.model import (
     ErrorCode,
     Follow,
     HistorySnapshot,
+    IsolationOptions,
     ListThreads,
     ReplayActiveTurn,
     Resume,
@@ -234,6 +235,53 @@ class TestStdioExecution:
 
 
 class TestPersistFollowExecution:
+    def test_isolation_flags_are_available_on_start_and_resume(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "start",
+                    "--no-goals",
+                    "--no-agents",
+                    "--stdio-exec",
+                    "app",
+                    "--",
+                    "work",
+                ]
+            )
+            == EXIT_OK
+        )
+        assert commands[-1].config.isolation == IsolationOptions(
+            no_goals=True, no_agents=True
+        )
+
+        assert (
+            main(
+                [
+                    "resume",
+                    "t1",
+                    "--no-goals",
+                    "--no-agents",
+                    "--stdio-exec",
+                    "app",
+                    "--",
+                    "more",
+                ]
+            )
+            == EXIT_OK
+        )
+        assert commands[-1] == Resume(
+            thread_id="t1",
+            prompt="more",
+            isolation=IsolationOptions(no_goals=True, no_agents=True),
+        )
+
+    @pytest.mark.parametrize("flag", ["--no-goals", "--no-agents"])
+    def test_follow_rejects_isolation_flags(self, flag):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["follow", "t1", flag])
+
     def test_persist_flag_builds_follow_command(self, monkeypatch):
         commands = capture_cli_command(monkeypatch)
 

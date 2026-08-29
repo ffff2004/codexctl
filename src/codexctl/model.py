@@ -124,12 +124,21 @@ DEFAULT_APPROVAL_POLICY = ApprovalPolicy.never
 
 
 @dataclass(frozen=True)
+class IsolationOptions:
+    """Closed isolation options accepted while loading a thread."""
+
+    no_goals: bool = False
+    no_agents: bool = False
+
+
+@dataclass(frozen=True)
 class StartConfig:
     """Deliberately limited start-time configuration.
 
     ``sandbox`` uses the public Codex sandbox presets. ``approval_policy``
     and ``approvals_reviewer`` select the approval behavior; the defaults
-    keep unattended execution (``never``, no reviewer).
+    keep unattended execution (``never``, no reviewer). ``isolation`` holds
+    the only supported app-server config overrides.
     """
 
     cwd: str | None = None
@@ -138,6 +147,7 @@ class StartConfig:
     sandbox: SandboxPolicy | None = None
     approval_policy: ApprovalPolicy = DEFAULT_APPROVAL_POLICY
     approvals_reviewer: ApprovalsReviewer | None = None
+    isolation: IsolationOptions = field(default_factory=IsolationOptions)
 
 
 @dataclass(frozen=True)
@@ -152,6 +162,7 @@ class Resume:
     thread_id: str
     prompt: str
     detach: bool = False
+    isolation: IsolationOptions = field(default_factory=IsolationOptions)
 
 
 @dataclass(frozen=True)

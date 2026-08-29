@@ -42,6 +42,7 @@ from codexctl.model import (
     ApprovalsReviewer,
     CodexCtlError,
     ErrorCode,
+    IsolationOptions,
     SandboxPolicy,
     StartConfig,
 )
@@ -271,6 +272,31 @@ class TestProjectResponse:
 
 
 class TestTypedOperations:
+    async def test_thread_loading_serializes_only_closed_isolation_overrides(self):
+        responses = {
+            "thread/start": lambda _params: {"thread": {"id": "t1"}},
+            "thread/resume": lambda _params: {"thread": {"id": "t1", "status": "idle"}},
+        }
+        async with _wire_app_server(responses) as (app_server, received):
+            await app_server.start_thread(
+                StartConfig(isolation=IsolationOptions(no_goals=True, no_agents=True))
+            )
+            assert received[-1]["params"]["config"] == {
+                "features.goals": False,
+                "agents.enabled": False,
+            }
+
+            await app_server.resume_thread(
+                "t1", isolation=IsolationOptions(no_goals=True, no_agents=True)
+            )
+            assert received[-1]["params"] == {
+                "threadId": "t1",
+                "config": {
+                    "features.goals": False,
+                    "agents.enabled": False,
+                },
+            }
+
     async def test_start_thread_serializes_upstream_sandbox_enum(self):
         async with _wire_app_server(
             {"thread/start": lambda _params: {"thread": {"id": "t1"}}}

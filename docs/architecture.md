@@ -51,6 +51,10 @@ Everything crossing `CodexCtl.run` is defined here: `Command` values
 the stable error codes enumerated in
 [reference.md — Error codes](reference.md#error-codes).
 
+`IsolationOptions` is the frozen, closed value object shared by `StartConfig`
+and `Resume`; `Follow` has no isolation configuration because it is
+observational.
+
 Selector parsing is pure and follows Python semantics exactly
 (`parse_turn_selector`, `parse_replay_selector`, `apply_turn_selector`,
 `select_replay_turns`); the accepted syntaxes are specified in
@@ -85,6 +89,7 @@ Selector parsing is pure and follows Python semantics exactly
   by `(event type, turn id, item id)`, so events visible in replay and
   live are emitted exactly once. Replay only registers keys of events it
   actually emits, so a suppressed replay event is still delivered live.
+  Its resume request carries no isolation configuration.
   The public replay, persist, termination, and turn-marker semantics are
   defined in [reference.md — follow](reference.md#follow) and
   [reference.md — Streaming text output](reference.md#streaming-text-output).
@@ -161,6 +166,10 @@ Raw Codex protocol messages never leave this module. Callers use typed
 thread/turn operations and see projected results, `JsonRpcError`, and
 `ProjectedEvent` only. The generic JSON-RPC request helper is private to this
 module; protocol method names and payload construction do not cross the client interface.
+
+The private isolation serializer is the only place that translates the
+domain-level `IsolationOptions` into Codex config overrides. An empty value
+produces no config field.
 
 Transport and session facts (verified against the Codex source):
 

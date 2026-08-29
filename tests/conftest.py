@@ -8,8 +8,6 @@ from typing import Any, AsyncIterator, Callable
 import pytest
 
 from codexctl.appserver import (
-    _APPROVAL_POLICY_TO_WIRE,
-    _APPROVALS_REVIEWER_TO_WIRE,
     REQUIRED_LIFECYCLE_OPERATIONS,
     AppServerResponse,
     AppServerThread,
@@ -18,7 +16,6 @@ from codexctl.appserver import (
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
-    _serialize_sandbox_policy,
     project_notification,
     project_response,
 )
@@ -31,7 +28,7 @@ from codexctl.endpoint import (
     StdioTarget,
     UnixSocketTarget,
 )
-from codexctl.model import ProjectedEvent, StartConfig
+from codexctl.model import IsolationOptions, ProjectedEvent, StartConfig
 
 
 class FakeAppServer:
@@ -49,6 +46,9 @@ class FakeAppServer:
         self.closed = False
         self.unsubscribed: list[str] = []
         self.missing_lifecycle_operations: set[str] = set()
+        self.thread_starts: list[StartConfig] = []
+        self.thread_resumes: list[tuple[str, IsolationOptions]] = []
+        self.turn_starts: list[tuple[str, str, str | None]] = []
 
     # -- scripting -----------------------------------------------------------
 
@@ -109,37 +109,27 @@ class FakeAppServer:
         return response.thread
 
     async def start_thread(self, config: StartConfig) -> AppServerThread | None:
-        params: dict[str, Any] = {
-            "approvalPolicy": _APPROVAL_POLICY_TO_WIRE[config.approval_policy],
-            "sandbox": _serialize_sandbox_policy(config.sandbox),
-        }
-        if config.approvals_reviewer is not None:
-            params["approvalsReviewer"] = _APPROVALS_REVIEWER_TO_WIRE[
-                config.approvals_reviewer
-            ]
-        if config.cwd:
-            params["cwd"] = config.cwd
-        if config.model:
-            params["model"] = config.model
-        response = await self._request("thread/start", params)
+        self.thread_starts.append(config)
+        response = await self._request("thread/start")
         assert isinstance(response, ThreadResponse)
         return response.thread
 
     async def start_turn(
         self, thread_id: str, prompt: str, effort: str | None = None
     ) -> str | None:
-        params: dict[str, Any] = {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
-        }
-        if effort:
-            params["effort"] = effort
-        response = await self._request("turn/start", params)
+        self.turn_starts.append((thread_id, prompt, effort))
+        response = await self._request("turn/start")
         assert isinstance(response, TurnResponse)
         return response.turn_id if response.turn_id else None
 
-    async def resume_thread(self, thread_id: str) -> AppServerThread | None:
-        response = await self._request("thread/resume", {"threadId": thread_id})
+    async def resume_thread(
+        self,
+        thread_id: str,
+        *,
+        isolation: IsolationOptions = IsolationOptions(),
+    ) -> AppServerThread | None:
+        self.thread_resumes.append((thread_id, isolation))
+        response = await self._request("thread/resume")
         assert isinstance(response, ThreadResponse)
         return response.thread
 

@@ -115,7 +115,7 @@ codexctl list --ssh devbox --remote-socket /run/user/1000/codex.sock --all
 ### start
 
 ```sh
-codexctl start [--detach] [--cwd DIR] [--model MODEL] [--effort EFFORT]
+codexctl start [--detach] [--no-goals] [--no-agents] [--cwd DIR] [--model MODEL] [--effort EFFORT]
                [--sandbox {read-only,workspace-write,danger-full-access}]
                [--approve-for-me] (-- PROMPT... | -)
 ```
@@ -136,6 +136,10 @@ the complete prompt from standard input.
   infers a remote cwd from the local directory.
 - `--detach` returns as soon as the turn has started and disconnects; the
   turn keeps running in the shared runtime.
+- `--no-goals` and `--no-agents` apply the closed config overrides
+  `features.goals=false` and `agents.enabled=false`. They do not expose a
+  generic config map. Use them again on `resume` when isolation must survive
+  a thread unload/reload.
 
 Foreground output streams projected events until the turn reaches a
 terminal state, following the shared
@@ -146,7 +150,7 @@ The exit code reflects the turn's terminal status, see
 ### resume
 
 ```sh
-codexctl resume <thread-id> [--detach] (-- PROMPT... | -)
+codexctl resume <thread-id> [--detach] [--no-goals] [--no-agents] (-- PROMPT... | -)
 ```
 
 Recovers the thread in the shared runtime and starts one new turn. A
@@ -154,6 +158,8 @@ positional `-` reads the complete prompt from standard input. Fails
 with `THREAD_BUSY` if the thread already has an active turn,
 `THREAD_NOT_FOUND` if the thread does not exist, and
 `THREAD_RECOVERY_FAILED` if recovery itself fails.
+The isolation flags have the same meaning as on [`start`](#start) and are
+reapplied while loading the thread.
 
 ### status
 
@@ -204,7 +210,8 @@ codexctl follow <thread-id> [--replay-turns SELECTOR] [--persist]
 Attaches to the thread's current active turn. Without `--persist`, fails
 with `NO_ACTIVE_TURN` if there is none. Before streaming live events,
 `codexctl` replays a continuous suffix of the reconstructed history; events
-visible in both phases are emitted once.
+visible in both phases are emitted once. Follow is observational: loading and
+subscribing do not send app-server config overrides.
 
 `--replay-turns` accepts exactly three forms. The anchor is the active turn
 when one exists, otherwise the end of history (reachable only with

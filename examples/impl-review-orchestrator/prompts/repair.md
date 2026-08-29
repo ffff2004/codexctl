@@ -1,20 +1,10 @@
-Repair the implementation
-in the checkout {{cwd}}.
+Repair the current implementation using the supplied gate or review evidence.
 
-the specification: 
-{{spec}}
+Inspect the evidence critically, address every valid finding, and run useful
+checks while developing. Give a concise handoff describing the commits,
+checks, rejected findings, assumptions, and any unresolved friction.
 
-Related issue: {{issue}}.
-
-Configured project gates:
-{{gates}}
-
-Previous review findings:
-
-{{review_findings}}
-
-Address every actionable finding,
-run appropriate checks,
-and leave the checkout ready for review.
-Leave the changes UNSTAGED, 
-do not commit, revert or clean up.
+If all supplied findings are invalid or conflit with the spec, make no changes
+and create no commit, then explain why. If only some findings are valid,
+implement and commit that subset and explain the rest. For multiple independent
+findings, multiple commits are preferred.

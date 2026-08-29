@@ -33,6 +33,7 @@ from codexctl.model import (
     HistorySnapshot,
     HistoryTurn,
     Interrupt,
+    IsolationOptions,
     ListThreads,
     ReplayActiveTurn,
     ReplayAll,
@@ -184,7 +185,7 @@ class TestStart:
         ]
         assert terminal.context is None
 
-    async def test_unattended_defaults_on_the_wire(self, monkeypatch, tmp_path):
+    async def test_unattended_defaults_are_forwarded(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         server = FakeAppServer()
         self._script(server)
@@ -192,15 +193,8 @@ class TestStart:
         outcome = await make_ctl(server).run(Start(prompt="hello"))
         await collect(outcome)
 
-        assert server.params_of("thread/start") == {
-            "approvalPolicy": "never",
-            "sandbox": "workspace-write",
-            "cwd": str(Path.cwd()),
-        }
-        assert server.params_of("turn/start") == {
-            "threadId": "t1",
-            "input": [{"type": "text", "text": "hello"}],
-        }
+        assert server.thread_starts == [StartConfig(cwd=str(Path.cwd()))]
+        assert server.turn_starts == [("t1", "hello", None)]
 
     async def test_config_forwarding(self):
         server = FakeAppServer()
@@ -218,13 +212,33 @@ class TestStart:
             )
         )
         await collect(outcome)
-        assert server.params_of("thread/start") == {
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
-            "cwd": "/work",
-            "model": "gpt-5",
-        }
-        assert server.params_of("turn/start")["effort"] == "low"
+        assert server.thread_starts == [
+            StartConfig(
+                cwd="/work",
+                model="gpt-5",
+                effort="low",
+                sandbox=SandboxPolicy.readOnly,
+            )
+        ]
+        assert server.turn_starts == [("t1", "hi", "low")]
+
+    async def test_isolation_options_reach_thread_start(self):
+        server = FakeAppServer()
+        self._script(server)
+        emit_completed(server, "t1", "u1")
+        outcome = await make_ctl(server).run(
+            Start(
+                prompt="hi",
+                config=StartConfig(
+                    isolation=IsolationOptions(no_goals=True, no_agents=True)
+                ),
+            )
+        )
+        await collect(outcome)
+
+        assert [config.isolation for config in server.thread_starts] == [
+            IsolationOptions(no_goals=True, no_agents=True)
+        ]
 
     async def test_default_cwd_comes_from_runtime_policy(self):
         server = FakeAppServer()
@@ -241,9 +255,9 @@ class TestStart:
         ).run(Start(prompt="hello"))
         await collect(outcome)
 
-        assert server.params_of("thread/start")["cwd"] == "/remote/workspace"
+        assert server.thread_starts == [StartConfig(cwd="/remote/workspace")]
 
-    async def test_approve_for_me_reaches_the_wire(self):
+    async def test_approval_configuration_is_forwarded(self):
         server = FakeAppServer()
         self._script(server)
         emit_completed(server, "t1", "u1")
@@ -258,12 +272,13 @@ class TestStart:
             )
         )
         await collect(outcome)
-        assert server.params_of("thread/start") == {
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "auto_review",
-            "sandbox": "workspace-write",
-            "cwd": "/work",
-        }
+        assert server.thread_starts == [
+            StartConfig(
+                cwd="/work",
+                approval_policy=ApprovalPolicy.onRequest,
+                approvals_reviewer=ApprovalsReviewer.autoReview,
+            )
+        ]
 
     async def test_detach_returns_ids_and_disconnects_without_interrupting(self):
         server = FakeAppServer()
@@ -400,6 +415,28 @@ class TestResume:
         events, terminal = await collect(outcome)
         assert outcome.turn_id == "u2"
         assert terminal.status == "completed"
+
+    async def test_isolation_options_reach_thread_resume(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/resume",
+            {"thread": thread_doc(turns=[turn_doc("u0", status="completed")])},
+        )
+        server.result("turn/start", {"turn": {"id": "u2"}})
+        emit_completed(server, "t1", "u2")
+
+        outcome = await make_ctl(server).run(
+            Resume(
+                thread_id="t1",
+                prompt="more",
+                isolation=IsolationOptions(no_goals=True, no_agents=True),
+            )
+        )
+        await collect(outcome)
+
+        assert server.thread_resumes == [
+            ("t1", IsolationOptions(no_goals=True, no_agents=True))
+        ]
 
     async def test_thread_not_found(self):
         server = FakeAppServer()
@@ -621,6 +658,7 @@ class TestFollow:
         with pytest.raises(CodexCtlError) as excinfo:
             await make_ctl(server).run(Follow(thread_id="t1"))
         assert excinfo.value.code == ErrorCode.NO_ACTIVE_TURN
+        assert server.thread_resumes == [("t1", IsolationOptions())]
         assert "t1" in server.unsubscribed
         assert server.closed
 
@@ -668,6 +706,7 @@ class TestFollow:
             ("turn/completed", "live", None),
         ]
         assert terminal.status == "completed"
+        assert server.thread_resumes == [("t1", IsolationOptions())]
 
     async def test_in_progress_item_started_is_delivered_by_live_not_lost(self):
         # Replay suppresses item/started of the in-progress turn; that

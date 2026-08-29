@@ -1,77 +1,81 @@
 # Implementation review orchestrator
 
-This is a self-contained demo of a worker/reviewer/gates workflow built on
-the documented [`codexctl` JSONL contract](../../docs/reference.md). It is
-deliberately one Python file and uses only the standard library.
+This standalone example runs an implementation and review workflow whose
+durable checkpoints are Git commits. It uses the documented
+[`codexctl` contract](../../docs/reference.md), the Python standard library,
+and a single deep [`Workflow`](impl_review.py) interface.
 
-See [`SKILL.md`](SKILL.md) for the corresponding implementation-review
-workflow.
+The caller supplies a clean checkout. The orchestrator freezes its current
+`HEAD`, creates and leaves checked out a new work branch, and asks each Worker
+to append commits. It runs configured gates against every candidate commit
+before review. A fresh reviewer cohort audits the cumulative base-to-candidate
+subject. If that audit fails, the same cohort reviews repairs incrementally;
+an incremental pass rotates to another fresh cumulative audit before the run
+can be certified.
 
-Run it from this directory, with any clean Git checkout as `--cwd`:
+## Run
+
+From this directory:
 
 ```sh
-python impl_review.py \
+uv run python impl_review.py start \
   --cwd /path/to/checkout \
   --spec /path/to/spec.md \
-  [--issue https://github.com/owner/repo/issues/19] \
   --worker-prompt prompts/worker.md \
   --repair-prompt prompts/repair.md \
   --reviewer standards=prompts/reviewers/standards.md \
   --reviewer spec=prompts/reviewers/spec.md \
-  [--publish-review-findings] \
   --gate 'uv run pytest' \
   --gate 'uv run pre-commit run --all-files'
 ```
 
-`--worker-prompt`, `--repair-prompt`, and every `--reviewer NAME=PATH` prompt
-are required UTF-8 files and are snapshotted at run start. A failed first
-review starts a fresh worker round and resumes the reviewer threads. Short
-prompt templates are provided in
-`prompts/worker.md`, `prompts/repair.md`, and
-`prompts/reviewers/{standards,spec}.md`.
-Prompt templates may use `{{gates}}`; configured `--gate` commands are rendered
-one per line.
+`--branch` selects the new branch; otherwise the name is
+`impl-review/<run-id>`. `--max-auto-worker-rounds` defaults to 2 and counts the
+initial Worker. `--worker-approve-for-me` is a run-level, Worker-only switch.
+`--gate-timeout-seconds` defaults to 1800 for each gate. Prompt, rubric, gate,
+model, effort, isolation, and approval policy inputs are snapshotted at start.
 
-`--issue` is optional and must be a complete GitHub Issue URI, such as
-`https://github.com/owner/repo/issues/19`. The URI is passed through unchanged
-when `{{issue}}` is rendered; when omitted, it renders as `none`. The URI also
-provides the repository and issue number used by `gh` when publishing review
-findings. No issue is fetched automatically. `--publish-review-findings` is
-opt-in and requires `--issue`.
+Workers run in `workspace-write`; reviewers run in `read-only`. Every start and
+resume uses `--no-goals --no-agents`. Agent starts detach first, then the
+example verifies the active turn ID before following the saved target as JSONL.
+Follow is observational and sends no isolation overrides. A target that
+already finished is recovered from JSONL history; a different active turn is
+surfaced as `UNEXPECTED_CONTINUATION` and is never followed. Reviewers inspect
+the exact commit range themselves and do not run configured gates.
 
-A paused run is resumed without reading stdin:
+## Resume and inspect
 
-```sh
-python impl_review.py resume \
-  --run-id RUN_ID --decision retry
-```
-
-Possible decisions are recorded in `state.json`. Typical ones are `retry`,
-`retry-publication`, `accept`, `start-next-round` after a repair round still
-has review findings, and `acknowledge-drift` after inspecting a changed
-checkout. For example, after the second repair round still fails review:
+A waiting report lists its valid typed actions. For example:
 
 ```sh
-python impl_review.py resume \
-  --run-id RUN_ID --decision start-next-round
+uv run python impl_review.py resume RUN_ID --action START_NEXT_ROUND \
+  --additional-prompt 'Preserve the public API.'
+
+uv run python impl_review.py resume RUN_ID --action RETRY_REVIEWERS
+uv run python impl_review.py inspect RUN_ID --output json
 ```
 
-This creates another repair worker round and resumes the reviewer threads.
-The decision can be repeated for subsequent failed rounds. Ambiguous codexctl
-output, publication failures, and checkout drift become `WAITING_FOR_USER`.
+`--additional-prompt-file PATH` snapshots the same persistent amendment;
+`PATH=-` reads it from stdin. Amendments are cumulative and are included in all
+later Worker and reviewer prompts. The closed action vocabulary and current
+state transitions are owned by [`impl_review.py`](impl_review.py), while the
+behavioral coverage is in [`tests/test_impl_review.py`](tests/test_impl_review.py).
+
+Exit 0 means a current gate attestation and fresh full-audit certificate bind
+the same commit. Exit 2 means the run is waiting. Exit 3 means explicit review
+findings were accepted as a waiver; a waiver is never a certificate. Fatal,
+usage, and internal failures exit 1.
 
 State defaults to
 `$XDG_STATE_HOME/codexctl/impl-review-orchestrator` (or
-`~/.local/state/codexctl/impl-review-orchestrator`). Inputs, rendered prompts,
-raw JSONL/std streams, final messages, findings, and gate records are
-immutable artifacts. `state.json` is atomically replaced. Failed-review
-changes remain unstaged while the caller inspects them; when a repair round is
-started, the orchestrator stages the checkout with `git add --all` before the
-new worker runs. It never commits, merges, creates worktrees, or cleans up.
+`~/.local/state/codexctl/impl-review-orchestrator`). State replacement is
+atomic, advancement uses a cross-process run lock, and `inspect` is read-only.
+The artifact manifest records SHA-256 digests for prompt snapshots, amendments,
+gate streams, agent JSONL, and final messages. Agent artifacts also identify
+their owning attempt or review session, role, and available thread/turn IDs.
+Git commit identity remains the repository's native object ID.
 
-Use `--output json` (or `--json`) for one machine-readable result containing
-the run ID, artifacts, review verdicts, gate results, and handoff status.
-In text mode, the worker's `codexctl` text-renderer output is streamed as it
-arrives. Reviewer intermediate output is not streamed; each reviewer's final
-agent message is printed when that reviewer completes. JSON mode suppresses
-live agent output.
+The orchestrator never creates a worktree, adopts external commits, commits on
+behalf of a Worker, merges, pushes, rebases, amends, resets, deletes the work
+branch, or switches back at handoff. Checkout concurrency between different
+runs remains the caller's responsibility.

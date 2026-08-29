@@ -1,14 +1,5 @@
-Implement the specification: 
-{{spec}}
-in the checkout {{cwd}}.
+Implement the supplied specification completely in the current checkout.
 
-Related issue: {{issue}}.
-
-Configured project gates:
-{{gates}}
-
-Inspect the project, make the requested changes,
-run appropriate checks,
-and leave the checkout ready for review.
-Leave the changes UNSTAGED, 
-do not commit, revert or clean up.
+Use the repository's public interfaces and documented standards. Run useful
+checks while developing and give a concise handoff describing the commits,
+checks, assumptions, and any unresolved friction.

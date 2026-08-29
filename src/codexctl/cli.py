@@ -30,6 +30,7 @@ from .model import (
     Follow,
     History,
     Interrupt,
+    IsolationOptions,
     ListThreads,
     Resume,
     SandboxPolicy,
@@ -220,6 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("start", help="create a new thread and start its first turn")
     _add_common(p)
     p.add_argument("--detach", action="store_true")
+    p.add_argument("--no-goals", action="store_true")
+    p.add_argument("--no-agents", action="store_true")
     p.add_argument("--cwd", default=None)
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
@@ -236,6 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.add_argument("thread_id")
     p.add_argument("--detach", action="store_true")
+    p.add_argument("--no-goals", action="store_true")
+    p.add_argument("--no-agents", action="store_true")
     _add_stdin_prompt(p)
 
     p = sub.add_parser("status", help="read the current state of a thread")
@@ -376,6 +381,10 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
                 ),
                 approval_policy=approval_policy,
                 approvals_reviewer=approvals_reviewer,
+                isolation=IsolationOptions(
+                    no_goals=args.no_goals,
+                    no_agents=args.no_agents,
+                ),
             ),
             detach=args.detach,
         )
@@ -383,7 +392,15 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
         prompt = _require_prompt(
             prompt, "resume requires prompt input after -- or from stdin"
         )
-        return Resume(thread_id=args.thread_id, prompt=prompt, detach=args.detach)
+        return Resume(
+            thread_id=args.thread_id,
+            prompt=prompt,
+            detach=args.detach,
+            isolation=IsolationOptions(
+                no_goals=args.no_goals,
+                no_agents=args.no_agents,
+            ),
+        )
     if args.command == "status":
         return Status(thread_id=args.thread_id)
     if args.command == "history":
@@ -399,7 +416,11 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
             replay = parse_replay_selector(args.replay_turns)
         except ValueError as exc:
             raise _CliUsageError(f"invalid --replay-turns selector: {exc}") from exc
-        return Follow(thread_id=args.thread_id, replay=replay, persist=args.persist)
+        return Follow(
+            thread_id=args.thread_id,
+            replay=replay,
+            persist=args.persist,
+        )
     if args.command == "steer":
         prompt = _require_prompt(prompt, "steer requires input after -- or from stdin")
         return Steer(thread_id=args.thread_id, input=prompt)

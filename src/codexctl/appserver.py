@@ -30,6 +30,7 @@ from .model import (
     ApprovalsReviewer,
     CodexCtlError,
     ErrorCode,
+    IsolationOptions,
     ProjectedEvent,
     SandboxPolicy,
     StartConfig,
@@ -81,6 +82,15 @@ def _serialize_sandbox_policy(policy: SandboxPolicy | None) -> str:
         raise UsageError(
             f"unsupported sandbox policy {policy!r}; expected one of: {choices}"
         ) from exc
+
+
+def _serialize_isolation_options(isolation: IsolationOptions) -> dict[str, bool]:
+    overrides: dict[str, bool] = {}
+    if isolation.no_goals:
+        overrides["features.goals"] = False
+    if isolation.no_agents:
+        overrides["agents.enabled"] = False
+    return overrides
 
 
 # Each probe is the sole definition of a required operation: its projected
@@ -242,7 +252,12 @@ class AppServerClient(Protocol):
         self, thread_id: str, prompt: str, effort: str | None = None
     ) -> str | None: ...
 
-    async def resume_thread(self, thread_id: str) -> AppServerThread | None: ...
+    async def resume_thread(
+        self,
+        thread_id: str,
+        *,
+        isolation: IsolationOptions = IsolationOptions(),
+    ) -> AppServerThread | None: ...
 
     async def steer_turn(
         self, thread_id: str, input_text: str, expected_turn_id: str
@@ -798,6 +813,9 @@ class AppServerSession:
             params["cwd"] = config.cwd
         if config.model:
             params["model"] = config.model
+        overrides = _serialize_isolation_options(config.isolation)
+        if overrides:
+            params["config"] = overrides
         response = await self._request("thread/start", params)
         assert isinstance(response, ThreadResponse)
         return response.thread
@@ -815,8 +833,17 @@ class AppServerSession:
         assert isinstance(response, TurnResponse)
         return response.turn_id
 
-    async def resume_thread(self, thread_id: str) -> AppServerThread | None:
-        response = await self._request("thread/resume", {"threadId": thread_id})
+    async def resume_thread(
+        self,
+        thread_id: str,
+        *,
+        isolation: IsolationOptions = IsolationOptions(),
+    ) -> AppServerThread | None:
+        params: dict[str, Any] = {"threadId": thread_id}
+        overrides = _serialize_isolation_options(isolation)
+        if overrides:
+            params["config"] = overrides
+        response = await self._request("thread/resume", params)
         assert isinstance(response, ThreadResponse)
         return response.thread
 

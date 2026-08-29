@@ -182,7 +182,10 @@ class CodexCtl:
         app_server = await self._open()
         try:
             try:
-                thread = await app_server.resume_thread(command.thread_id)
+                thread = await app_server.resume_thread(
+                    command.thread_id,
+                    isolation=command.isolation,
+                )
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
             thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
