@@ -19,6 +19,8 @@ Lifecycle invariants visible to callers:
 - Detaching (`--detach`) and local interruption (Ctrl+C) never interrupt the
   running turn.
 - `status` and `history` are strictly read-only; they never resume or mutate.
+- `follow` is observational: loading and subscribing do not send app-server
+  config overrides.
 - `codexctl` runs unattended: it never blocks waiting for human input (see
   [Unattended operation](#unattended-operation)).
 

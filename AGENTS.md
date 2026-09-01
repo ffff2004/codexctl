@@ -64,23 +64,17 @@ uv build         # build dist/ artifacts
 - [render.py](src/codexctl/render.py) / [cli.py](src/codexctl/cli.py) — outside the seam; output formats never
   influence execution behavior.
 
-## Invariants to preserve when changing code
+## Invariants
 
-- `resume` never queues and never becomes steer; recovery failure never
-  creates a replacement thread.
-- `status`/`history` are strictly read-only.
-- Detaching and local Ctrl+C never send a turn interrupt.
-- Unattended: never block on human input (decline approvals, surface
-  `UNSUPPORTED_INTERACTION`).
-- Follow emits each event once across replay/live, keyed on stable
+- `follow` emits each event once across replay/live, keyed on stable
   Codex identities (see [docs/architecture.md](docs/architecture.md) for the dedup key).
-- Error mapping: `-32601` → `INCOMPATIBLE_CODEX`; rejected interrupt is
-  always a domain error (`NO_ACTIVE_TURN`).
 - Core behaviors are pinned by tests in [tests/](tests/) driven through
   `FakeAppServer` (see [tests/conftest.py](tests/conftest.py)); update them together with
   behavior changes, and keep [docs/reference.md](docs/reference.md) in sync.
   Tests should verify behavior through public interfaces of each module, not private helpers.
   Mock real system boundaries, not project-private helpers.
+
+See [docs/reference.md](docs/reference.md) for public invariants.
 
 ## Agent skills
 
