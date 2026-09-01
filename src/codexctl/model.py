@@ -15,6 +15,22 @@ from typing import Any, AsyncIterator, Literal
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ResumeOverrideWarning:
+    """A resume override that the app-server did not apply."""
+
+    code: str
+    message: str
+    overrides: tuple[str, ...] = ()
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "overrides": list(self.overrides),
+        }
+
+
 class ErrorCode(str, Enum):
     """Stable codexctl-owned error codes (public contract)."""
 
@@ -43,6 +59,7 @@ class CodexCtlError(Exception):
         thread_id: str | None = None,
         turn_id: str | None = None,
         cause: Exception | None = None,
+        warnings: tuple[ResumeOverrideWarning, ...] = (),
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -50,6 +67,7 @@ class CodexCtlError(Exception):
         self.thread_id = thread_id
         self.turn_id = turn_id
         self.cause = cause
+        self.warnings = warnings
 
     def to_document(self) -> dict[str, Any]:
         doc: dict[str, Any] = {"code": self.code.value, "message": self.message}
@@ -57,6 +75,8 @@ class CodexCtlError(Exception):
             doc["threadId"] = self.thread_id
         if self.turn_id is not None:
             doc["turnId"] = self.turn_id
+        if self.warnings:
+            doc["warnings"] = [warning.to_document() for warning in self.warnings]
         return doc
 
 
@@ -470,6 +490,7 @@ class EventStreamOutcome:
 class DetachedTurnStarted:
     thread_id: str
     turn_id: str
+    warnings: tuple[ResumeOverrideWarning, ...] = ()
 
 
 @dataclass(frozen=True)

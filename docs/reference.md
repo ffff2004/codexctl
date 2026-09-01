@@ -166,6 +166,18 @@ The isolation flags have the same meaning as on [`start`](#start) and are
 reapplied while loading the thread. `--approve-for-me` and `--sandbox` use the
 same values and behavior as on [`start`](#start); when omitted, resume leaves
 the thread's existing approval and sandbox configuration unchanged.
+If the app-server keeps an already-loaded thread and ignores one or more
+requested overrides, resume reports a RESUME_OVERRIDE_IGNORED warning. In
+text mode it is written to stderr; in jsonl mode it is a warning event; with
+--detach -o json it is included in the warnings array of the snapshot.
+Approval and sandbox warnings are based on the effective values returned by the
+app-server. For --no-goals and --no-agents, codexctl can report the warning
+when the response proves the loaded thread was retained; the upstream protocol
+does not expose generic config values or the other clients' subscriber state,
+so an idle loaded thread retained because of another subscriber may not be
+distinguishable from a successful reload.
+If the command then fails after the warning is detected, structured error
+documents carry the same warning in their `warnings` array.
 
 ### status
 
@@ -352,12 +364,22 @@ Streaming commands in jsonl mode emit projected events, one per line:
 {"type": "turn/completed", "threadId": "...", "turnId": "...", "status": "completed", "source": "live"}
 ```
 
+When resume detects an ignored override, it emits this additional record
+before turn/started:
+
+```json
+{"type": "warning", "threadId": "...", "warning": {"code": "RESUME_OVERRIDE_IGNORED", "message": "...", "overrides": ["approvalPolicy", "sandbox"]}}
+```
+
 - `source` is `"live"` for events delivered from the runtime and
   `"replay"` for events reconstructed from history (`follow`, and
   `history -o jsonl`). Replay records additionally carry `turnIndex`.
 - `item` is a projected item, see [Projected items](#projected-items).
 - `turn/completed` carries `status` (`completed`, `interrupted`, or
   `failed`) and, when present, `error: {"message": ...}`.
+- `warning` records carry `warning: {"code", "message", "overrides"}` and
+  are diagnostics; they do not change the command's success or turn exit
+  status.
 - `thread/tokenUsage/updated` carries `usage` with the latest context size in
   `usedTokens`, the model context window in `windowTokens`, and the
   effective usage fraction in `ratio` when the runtime provides a context
@@ -394,6 +416,9 @@ Streaming commands in text mode share one rendering contract, in both
 ```json
 {"threadId": "...", "turnId": "...", "detached": true}
 ```
+
+When applicable, the detached resume document additionally contains
+`warnings`, an array of `{"code", "message", "overrides"}` records.
 
 `status`:
 

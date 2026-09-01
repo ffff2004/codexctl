@@ -13,6 +13,7 @@ from codexctl.appserver import (
     AppServerThread,
     EmptyResponse,
     JsonRpcError,
+    ResumeResponse,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
@@ -145,14 +146,14 @@ class FakeAppServer:
         approvals_reviewer: ApprovalsReviewer | None = None,
         sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
-    ) -> AppServerThread | None:
+    ) -> ResumeResponse:
         self.thread_resumes.append((thread_id, isolation))
         self.thread_resume_configs.append(
             (thread_id, approval_policy, approvals_reviewer, sandbox)
         )
         response = await self._request("thread/resume")
-        assert isinstance(response, ThreadResponse)
-        return response.thread
+        assert isinstance(response, ResumeResponse)
+        return response
 
     async def steer_turn(
         self, thread_id: str, input_text: str, expected_turn_id: str

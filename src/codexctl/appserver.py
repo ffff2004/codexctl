@@ -198,6 +198,19 @@ class ThreadResponse:
 
 
 @dataclass(frozen=True)
+class ResumeResponse:
+    """Projected result of ``thread/resume`` including effective settings."""
+
+    thread: AppServerThread | None
+    approval_policy: ApprovalPolicy | None = None
+    approvals_reviewer: ApprovalsReviewer | None = None
+    sandbox: SandboxPolicy | None = None
+    approval_policy_present: bool = False
+    approvals_reviewer_present: bool = False
+    sandbox_present: bool = False
+
+
+@dataclass(frozen=True)
 class TurnResponse:
     turn_id: str | None
 
@@ -229,6 +242,7 @@ class EmptyResponse:
 
 type AppServerResponse = (
     ThreadResponse
+    | ResumeResponse
     | TurnResponse
     | InitializeResponse
     | ThreadListResponse
@@ -260,7 +274,7 @@ class AppServerClient(Protocol):
         approvals_reviewer: ApprovalsReviewer | None = None,
         sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
-    ) -> AppServerThread | None: ...
+    ) -> ResumeResponse: ...
 
     async def steer_turn(
         self, thread_id: str, input_text: str, expected_turn_id: str
@@ -844,7 +858,7 @@ class AppServerSession:
         approvals_reviewer: ApprovalsReviewer | None = None,
         sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
-    ) -> AppServerThread | None:
+    ) -> ResumeResponse:
         params: dict[str, Any] = {"threadId": thread_id}
         if approval_policy is not None:
             params["approvalPolicy"] = _APPROVAL_POLICY_TO_WIRE[approval_policy]
@@ -858,8 +872,8 @@ class AppServerSession:
         if overrides:
             params["config"] = overrides
         response = await self._request("thread/resume", params)
-        assert isinstance(response, ThreadResponse)
-        return response.thread
+        assert isinstance(response, ResumeResponse)
+        return response
 
     async def steer_turn(
         self, thread_id: str, input_text: str, expected_turn_id: str
@@ -1291,7 +1305,19 @@ def project_response(method: str, response: Any) -> AppServerResponse:
             user_agent=_project_string(payload.get("userAgent")),
             codex_home=_project_string(payload.get("codexHome")),
         )
-    if method in ("thread/start", "thread/read", "thread/resume"):
+    if method == "thread/resume":
+        return ResumeResponse(
+            thread=_project_thread(payload.get("thread")),
+            approval_policy=_project_approval_policy(payload.get("approvalPolicy")),
+            approvals_reviewer=_project_approvals_reviewer(
+                payload.get("approvalsReviewer")
+            ),
+            sandbox=_project_sandbox_policy(payload.get("sandbox")),
+            approval_policy_present="approvalPolicy" in payload,
+            approvals_reviewer_present="approvalsReviewer" in payload,
+            sandbox_present="sandbox" in payload,
+        )
+    if method in ("thread/start", "thread/read"):
         return ThreadResponse(thread=_project_thread(payload.get("thread")))
     if method in ("turn/start", "turn/steer"):
         if method == "turn/start":
@@ -1327,6 +1353,43 @@ def _project_thread(raw: Any) -> AppServerThread | None:
         active_flags=flags,
         turns=turns,
     )
+
+
+def _project_approval_policy(raw: Any) -> ApprovalPolicy | None:
+    if raw == "untrusted":
+        return ApprovalPolicy.untrusted
+    if raw in ("on-request", "onRequest"):
+        return ApprovalPolicy.onRequest
+    if raw == "never":
+        return ApprovalPolicy.never
+    # Granular approval policies are intentionally outside codexctl's closed
+    # public vocabulary. An unknown value cannot be used for comparison.
+    return None
+
+
+def _project_approvals_reviewer(raw: Any) -> ApprovalsReviewer | None:
+    if raw == "user":
+        return ApprovalsReviewer.user
+    if raw in ("auto_review", "autoReview", "guardian_subagent"):
+        return ApprovalsReviewer.autoReview
+    return None
+
+
+def _project_sandbox_policy(raw: Any) -> SandboxPolicy | None:
+    if raw in ("read-only", "readOnly"):
+        return SandboxPolicy.readOnly
+    if raw in ("workspace-write", "workspaceWrite"):
+        return SandboxPolicy.workspaceWrite
+    if raw in (
+        "danger-full-access",
+        "dangerFullAccess",
+        "external-sandbox",
+        "externalSandbox",
+    ):
+        return SandboxPolicy.dangerFullAccess
+    if isinstance(raw, dict):
+        return _project_sandbox_policy(raw.get("type"))
+    return None
 
 
 def _project_turn(raw: Any) -> AppServerTurn | None:

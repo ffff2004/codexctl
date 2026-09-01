@@ -17,8 +17,10 @@ from websockets.asyncio.server import serve, unix_serve
 from codexctl.appserver import (
     REQUIRED_LIFECYCLE_OPERATIONS,
     UNSUPPORTED_INTERACTION_METHOD,
+    AppServerThread,
     AppServerTurn,
     JsonRpcError,
+    ResumeResponse,
     ThreadListResponse,
     ThreadResponse,
     TurnResponse,
@@ -260,6 +262,24 @@ class TestProjectResponse:
             turn_id="u1"
         )
         response = project_response(
+            "thread/resume",
+            {
+                "thread": {"id": "t1", "status": {"type": "idle"}},
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
+                "sandbox": {"type": "readOnly", "networkAccess": False},
+            },
+        )
+        assert response == ResumeResponse(
+            thread=AppServerThread("t1", "idle", [], []),
+            approval_policy=ApprovalPolicy.onRequest,
+            approvals_reviewer=ApprovalsReviewer.autoReview,
+            sandbox=SandboxPolicy.readOnly,
+            approval_policy_present=True,
+            approvals_reviewer_present=True,
+            sandbox_present=True,
+        )
+        response = project_response(
             "thread/list",
             {
                 "data": [{"id": "t1", "status": {"type": "idle"}}],
@@ -411,7 +431,7 @@ class TestTypedOperations:
             ).id == "t1"
             assert await app_server.start_turn("t1", "hello", effort="high") == "u1"
             assert (await app_server.read_thread("t1")).id == "t1"
-            assert (await app_server.resume_thread("t1")).id == "t1"
+            assert (await app_server.resume_thread("t1")).thread.id == "t1"
             assert await app_server.steer_turn("t1", "more", "u1") == "u1"
             await app_server.interrupt_turn("t1", "u1")
             assert (

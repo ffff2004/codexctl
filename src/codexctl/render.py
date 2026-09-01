@@ -45,11 +45,14 @@ def _context_document(context: ContextUsage | None) -> dict | None:
 
 def snapshot_document(outcome: Any) -> dict:
     if isinstance(outcome, DetachedTurnStarted):
-        return {
+        doc = {
             "threadId": outcome.thread_id,
             "turnId": outcome.turn_id,
             "detached": True,
         }
+        if outcome.warnings:
+            doc["warnings"] = [warning.to_document() for warning in outcome.warnings]
+        return doc
     if isinstance(outcome, SteerAcknowledged):
         return {"threadId": outcome.thread_id, "turnId": outcome.turn_id}
     if isinstance(outcome, InterruptResult):
@@ -198,13 +201,23 @@ class TextRenderer:
         self._out.write(text)
         self._out.flush()
 
+    def _write_warning(self, warning: dict[str, Any]) -> None:
+        message = warning.get("message")
+        if message:
+            self._err.write(f"codexctl: warning: {message}\n")
+            self._err.flush()
+
     def stream_header(self, thread_id: str, turn_id: str | None = None) -> None:
         # Unified across all streaming commands: the turn marker comes from
         # the stream's turn/started events, not from the header.
         self._write(f"Thread: {thread_id}\n\n")
 
     def event(self, event: ProjectedEvent) -> None:
-        if event.type == "turn/started":
+        if event.type == "warning":
+            warning = event.extra.get("warning")
+            if isinstance(warning, dict):
+                self._write_warning(warning)
+        elif event.type == "turn/started":
             self._write(f"Turn: {event.turn_id}\n")
         elif event.type == "item/completed" and event.item is not None:
             self._render_item(event.item)
@@ -272,6 +285,8 @@ class TextRenderer:
             self._write(
                 f"Thread: {outcome.thread_id}\nTurn: {outcome.turn_id}\nDetached\n"
             )
+            for warning in outcome.warnings:
+                self._write_warning(warning.to_document())
         elif isinstance(outcome, SteerAcknowledged):
             self._write(
                 f"Steered turn {outcome.turn_id} of thread {outcome.thread_id}\n"
@@ -326,6 +341,8 @@ class TextRenderer:
             raise TypeError(f"no text rendering for {type(outcome).__name__}")
 
     def error(self, error: CodexCtlError) -> None:
+        for warning in error.warnings:
+            self._write_warning(warning.to_document())
         self._err.write(f"codexctl: {error.code.value}: {error.message}\n")
         self._err.flush()
 

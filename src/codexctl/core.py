@@ -16,6 +16,7 @@ from .appserver import (
     AppServerThread,
     AppServerTurn,
     JsonRpcError,
+    ResumeResponse,
     connect_app_server,
 )
 from .endpoint import (
@@ -41,6 +42,7 @@ from .model import (
     ListThreads,
     ProjectedEvent,
     Resume,
+    ResumeOverrideWarning,
     Start,
     Status,
     StatusSnapshot,
@@ -182,7 +184,7 @@ class CodexCtl:
         app_server = await self._open()
         try:
             try:
-                thread = await app_server.resume_thread(
+                response = await app_server.resume_thread(
                     command.thread_id,
                     approval_policy=command.approval_policy,
                     approvals_reviewer=command.approvals_reviewer,
@@ -191,31 +193,61 @@ class CodexCtl:
                 )
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
-            thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
+            warnings = _resume_override_warnings(command, response)
+            thread = response.thread or AppServerThread(
+                command.thread_id, "notLoaded", [], []
+            )
             if thread.status == "active" or self._find_active_turn(thread) is not None:
                 raise CodexCtlError(
                     ErrorCode.THREAD_BUSY,
                     "thread has an active turn",
                     thread_id=command.thread_id,
+                    warnings=warnings,
                 )
             # Resume never queues and never becomes steer: one start-turn, or fail.
-            turn_id = await self._turn_start(
-                app_server, command.thread_id, command.prompt
-            )
+            try:
+                turn_id = await self._turn_start(
+                    app_server, command.thread_id, command.prompt
+                )
+            except CodexCtlError as exc:
+                exc.warnings = warnings
+                raise
         except Exception:
             await app_server.close()
             raise
         if command.detach:
             await app_server.close()
-            return DetachedTurnStarted(thread_id=command.thread_id, turn_id=turn_id)
-        return self._follow_live(app_server, command.thread_id, turn_id)
+            return DetachedTurnStarted(
+                thread_id=command.thread_id, turn_id=turn_id, warnings=warnings
+            )
+
+        async def prelude(seen: set[tuple]) -> AsyncIterator[ProjectedEvent]:
+            for warning in warnings:
+                event = ProjectedEvent(
+                    "warning",
+                    thread_id=command.thread_id,
+                    extra={"warning": warning.to_document()},
+                )
+                seen.add(event.dedup_key())
+                yield event
+
+        return self._follow_live(
+            app_server, command.thread_id, turn_id, prelude=prelude
+        )
 
     # -- foreground streaming --------------------------------------------------
 
     def _follow_live(
-        self, app_server: AppServerClient, thread_id: str, turn_id: str
+        self,
+        app_server: AppServerClient,
+        thread_id: str,
+        turn_id: str,
+        prelude: Callable[[set[tuple]], AsyncIterator[ProjectedEvent]] | None = None,
     ) -> EventStreamOutcome:
         async def started(seen: set[tuple]) -> AsyncIterator[ProjectedEvent]:
+            if prelude is not None:
+                async for event in prelude(seen):
+                    yield event
             ev = ProjectedEvent(
                 "turn/started", thread_id=thread_id, turn_id=turn_id, source="live"
             )
@@ -418,10 +450,12 @@ class CodexCtl:
         app_server = await self._open()
         try:
             try:
-                thread = await app_server.resume_thread(command.thread_id)
+                response = await app_server.resume_thread(command.thread_id)
             except JsonRpcError as exc:
                 raise _map_resume_error(exc, command.thread_id) from exc
-            thread = thread or AppServerThread(command.thread_id, "notLoaded", [], [])
+            thread = response.thread or AppServerThread(
+                command.thread_id, "notLoaded", [], []
+            )
         except Exception:
             await app_server.close()
             raise
@@ -721,6 +755,59 @@ _THREAD_NOT_FOUND_MARKERS = (
     "unknown thread",
     "does not exist",
 )
+
+
+def _resume_override_warnings(
+    command: Resume, response: ResumeResponse
+) -> tuple[ResumeOverrideWarning, ...]:
+    """Identify resume overrides contradicted by the server's response.
+
+    The upstream protocol does not report generic config values or subscriber
+    state. A config override is therefore reported as ignored only when the
+    returned status proves the loaded thread was retained.
+    """
+    ignored: list[str] = []
+    if command.approval_policy is not None and (
+        (
+            response.approval_policy is not None
+            and command.approval_policy != response.approval_policy
+        )
+        or (response.approval_policy_present and response.approval_policy is None)
+    ):
+        ignored.append("approvalPolicy")
+    if command.approvals_reviewer is not None and (
+        (
+            response.approvals_reviewer is not None
+            and command.approvals_reviewer != response.approvals_reviewer
+        )
+        or (response.approvals_reviewer_present and response.approvals_reviewer is None)
+    ):
+        ignored.append("approvalsReviewer")
+    if command.sandbox is not None and (
+        (response.sandbox is not None and command.sandbox != response.sandbox)
+        or (response.sandbox_present and response.sandbox is None)
+    ):
+        ignored.append("sandbox")
+    if (
+        (command.isolation.no_goals or command.isolation.no_agents)
+        and response.thread is not None
+        and response.thread.status in {"active", "systemError"}
+    ):
+        ignored.append("config")
+
+    if not ignored:
+        return ()
+    override_list = ", ".join(ignored)
+    return (
+        ResumeOverrideWarning(
+            code="RESUME_OVERRIDE_IGNORED",
+            message=(
+                "app-server ignored resume override(s) for the loaded thread: "
+                f"{override_list}"
+            ),
+            overrides=tuple(ignored),
+        ),
+    )
 
 
 def _map_rpc_error(

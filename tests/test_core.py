@@ -416,6 +416,71 @@ class TestResume:
         assert outcome.turn_id == "u2"
         assert terminal.status == "completed"
 
+    async def test_resume_reports_ignored_effective_overrides(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/resume",
+            {
+                "thread": thread_doc(turns=[turn_doc("u0", status="completed")]),
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite"},
+            },
+        )
+        server.result("turn/start", {"turn": {"id": "u2"}})
+        emit_completed(server, "t1", "u2")
+
+        outcome = await make_ctl(server).run(
+            Resume(
+                thread_id="t1",
+                prompt="more",
+                approval_policy=ApprovalPolicy.onRequest,
+                approvals_reviewer=ApprovalsReviewer.autoReview,
+                sandbox=SandboxPolicy.readOnly,
+            )
+        )
+        events, terminal = await collect(outcome)
+
+        assert events[0].type == "warning"
+        assert events[0].extra["warning"] == {
+            "code": "RESUME_OVERRIDE_IGNORED",
+            "message": (
+                "app-server ignored resume override(s) for the loaded thread: "
+                "approvalPolicy, approvalsReviewer, sandbox"
+            ),
+            "overrides": ["approvalPolicy", "approvalsReviewer", "sandbox"],
+        }
+        assert events[1].type == "turn/started"
+        assert terminal.status == "completed"
+
+    async def test_busy_resume_reports_ignored_config_override(self):
+        server = FakeAppServer()
+        server.result(
+            "thread/resume",
+            {"thread": thread_doc(status="active")},
+        )
+
+        with pytest.raises(CodexCtlError) as excinfo:
+            await make_ctl(server).run(
+                Resume(
+                    thread_id="t1",
+                    prompt="more",
+                    isolation=IsolationOptions(no_goals=True),
+                )
+            )
+
+        assert excinfo.value.code == ErrorCode.THREAD_BUSY
+        assert [warning.to_document() for warning in excinfo.value.warnings] == [
+            {
+                "code": "RESUME_OVERRIDE_IGNORED",
+                "message": (
+                    "app-server ignored resume override(s) for the loaded thread: "
+                    "config"
+                ),
+                "overrides": ["config"],
+            }
+        ]
+
     async def test_isolation_options_reach_thread_resume(self):
         server = FakeAppServer()
         server.result(

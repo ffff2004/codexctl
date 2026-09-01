@@ -5,14 +5,16 @@ from types import SimpleNamespace
 
 from codexctl.model import (
     ContextUsage,
+    DetachedTurnStarted,
     HistorySnapshot,
     HistoryTurn,
     ProjectedEvent,
+    ResumeOverrideWarning,
     ThreadListSnapshot,
     ThreadRecord,
     TurnTerminal,
 )
-from codexctl.render import TextRenderer, format_context_line
+from codexctl.render import TextRenderer, format_context_line, snapshot_document
 
 ITEMS = [
     {"type": "agentMessage", "text": "  hello  "},
@@ -184,6 +186,39 @@ def test_stream_header_prints_only_thread_line_and_marker_moves_to_turn_started(
         ProjectedEvent("turn/started", thread_id="t1", turn_id="u1", source="live")
     )
     assert out.getvalue() == "Thread: t1\n\nTurn: u1\n"
+
+
+def test_resume_override_warning_is_diagnostic_and_structured_when_detached():
+    out = StringIO()
+    err = StringIO()
+    warning = ResumeOverrideWarning(
+        code="RESUME_OVERRIDE_IGNORED",
+        message="app-server ignored resume override(s) for the loaded thread: config",
+        overrides=("config",),
+    )
+    renderer = TextRenderer(out=out, err=err)
+
+    renderer.event(
+        ProjectedEvent(
+            "warning",
+            thread_id="t1",
+            extra={"warning": warning.to_document()},
+        )
+    )
+
+    assert out.getvalue() == ""
+    assert err.getvalue() == (
+        "codexctl: warning: app-server ignored resume override(s) for the "
+        "loaded thread: config\n"
+    )
+    assert snapshot_document(
+        DetachedTurnStarted(thread_id="t1", turn_id="u1", warnings=(warning,))
+    ) == {
+        "threadId": "t1",
+        "turnId": "u1",
+        "detached": True,
+        "warnings": [warning.to_document()],
+    }
 
 
 def test_context_usage_line_is_event_driven_after_each_turn_completed():
