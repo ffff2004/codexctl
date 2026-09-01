@@ -11,7 +11,8 @@ Use this skill for a command that is expected to outlive the current Codex
 turn. The handoff is the important operation: start the wrapper in the
 foreground, let the execution tool return a live session, then end the turn.
 The wrapper keeps running, saves the command result, and makes one
-best-effort `codexctl resume` call when the command finishes.
+best-effort wake-up attempt when the command finishes: it tries `steer` first,
+then falls back to `codexctl resume` only for `NO_ACTIVE_TURN`.
 
 Install `codexctl` from GitHub as a `uv` tool when it is not already
 available:
@@ -71,22 +72,24 @@ contains:
 
 - `stdout.log` and `stderr.log` — the wrapped command's separate streams;
 - `result.txt` — the escaped command, command exit code, and stream paths;
-- `resume.stdout.log` and `resume.stderr.log` — the resume command's streams;
-- `resume.result.txt` — the resume command's exit code.
+- `steer.stdout.log` and `steer.stderr.log` — the steer command's streams;
+- `resume.stdout.log` and `resume.stderr.log` — the resume fallback's streams;
+- `wake.result.txt` — the wake method, exit codes, and steer error code.
 
 The completion prompt contains the command, its exit code, the stdout path,
 the stderr path, and the result metadata path. Treat the command exit code as
-the command outcome; use `resume.result.txt` only to diagnose notification
-delivery. The wrapper's own stdout is a short summary containing the job
-directory, command, both exit codes, and both command-output paths.
+the command outcome; use `wake.result.txt` to diagnose notification delivery.
+The wrapper's own stdout is a short summary containing the job directory,
+command, wake method, wake exit code, and both command-output paths.
 
 ## Limits
 
-The wrapper makes exactly one resume attempt. It does not poll or retry. If
-the command finishes before the original turn ends, `resume` may return
-`THREAD_BUSY`; the command artifacts remain authoritative, but no later
-automatic wake-up is attempted. A new turn is created only when the shared
-Codex runtime accepts the resume request.
+The wrapper makes exactly one steer attempt and at most one resume fallback.
+It does not poll or retry. If steer returns an error other than
+`NO_ACTIVE_TURN`, no resume is attempted. If the command finishes before the
+original turn ends, steer can deliver the prompt without creating a new turn;
+if the original turn has ended, resume can create one. The command artifacts
+remain authoritative when either wake-up operation fails.
 
 Use `--thread-id ID` when deliberately targeting another thread. Use
 `--output-dir DIR` when the default temporary location is unsuitable. Keep

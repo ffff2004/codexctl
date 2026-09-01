@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Run a command in the background, persist its output, and start one new
-# Codex turn when it finishes.
+# Run a command in the background, persist its output, and wake the current
+# Codex thread when it finishes.
 #
-# The wrapper deliberately makes one resume attempt. It does not poll or
-# retry: the command result remains available even when the resume attempt
-# fails.
+# The wrapper first steers the current turn. If the structured steer error is
+# NO_ACTIVE_TURN, it makes one resume attempt. It does not poll or retry: the
+# command result remains available even when notification delivery fails.
 
 set -u -o pipefail
 
@@ -74,7 +74,14 @@ stderr_file=$job_dir/stderr.log
 result_file=$job_dir/result.txt
 resume_stdout_file=$job_dir/resume.stdout.log
 resume_stderr_file=$job_dir/resume.stderr.log
-resume_result_file=$job_dir/resume.result.txt
+steer_stdout_file=$job_dir/steer.stdout.log
+steer_stderr_file=$job_dir/steer.stderr.log
+wake_result_file=$job_dir/wake.result.txt
+
+# Keep the artifact set stable even when steer succeeds or no resume fallback
+# is needed.
+: >"$resume_stdout_file"
+: >"$resume_stderr_file"
 
 # %q makes the command unambiguous in the wake-up prompt while retaining the
 # exact argv boundaries used for execution.
@@ -108,18 +115,49 @@ exit code means the command output is absent.
 EOF
 )
 
-# Keep hook output separate from the wrapped command's output. This is a
-# single best-effort notification; the result files are authoritative.
-"$codexctl_bin" resume "$thread_id" --detach --json -- "$resume_prompt" \
-  >"$resume_stdout_file" 2>"$resume_stderr_file"
-resume_exit_code=$?
+# Extract a stable error code from codexctl's JSON error document without
+# adding a jq dependency. Only NO_ACTIVE_TURN permits the resume fallback.
+json_error_code() {
+  local response pattern
+  response=$(<"$1")
+  pattern='"code"[[:space:]]*:[[:space:]]*"([A-Z_]+)"'
+  if [[ $response =~ $pattern ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
 
-printf 'resume_exit_code=%d\n' "$resume_exit_code" >"$resume_result_file"
+# Keep hook output separate from the wrapped command's output. First try to
+# deliver the completion prompt to the active turn.
+"$codexctl_bin" steer "$thread_id" --json -- "$resume_prompt" \
+  >"$steer_stdout_file" 2>"$steer_stderr_file"
+steer_exit_code=$?
+steer_error_code=$(json_error_code "$steer_stdout_file")
+wake_method=steer
+wake_exit_code=$steer_exit_code
+resume_exit_code=not_attempted
+
+if [[ $steer_error_code == NO_ACTIVE_TURN ]]; then
+  # The original turn has ended, so start one new turn with the same prompt.
+  "$codexctl_bin" resume "$thread_id" --detach --json -- "$resume_prompt" \
+    >"$resume_stdout_file" 2>"$resume_stderr_file"
+  resume_exit_code=$?
+  wake_method=resume
+  wake_exit_code=$resume_exit_code
+fi
+
+{
+  printf 'wake_method=%s\n' "$wake_method"
+  printf 'wake_exit_code=%s\n' "$wake_exit_code"
+  printf 'steer_exit_code=%d\n' "$steer_exit_code"
+  printf 'steer_error_code=%s\n' "${steer_error_code:-none}"
+  printf 'resume_exit_code=%s\n' "$resume_exit_code"
+} >"$wake_result_file"
 
 printf 'job_dir=%s\n' "$job_dir"
 printf 'command=%s\n' "$command_text"
 printf 'command_exit_code=%d\n' "$command_exit_code"
-printf 'resume_exit_code=%d\n' "$resume_exit_code"
+printf 'wake_method=%s\n' "$wake_method"
+printf 'wake_exit_code=%s\n' "$wake_exit_code"
 printf 'stdout=%s\n' "$stdout_file"
 printf 'stderr=%s\n' "$stderr_file"
 
