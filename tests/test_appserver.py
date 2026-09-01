@@ -363,6 +363,29 @@ class TestTypedOperations:
                 await app_server.start_thread(StartConfig(approval_policy=policy))
                 assert received[-1]["params"]["approvalPolicy"] == wire_value
 
+    async def test_resume_thread_serializes_approval_and_sandbox_overrides(self):
+        async with _wire_app_server(
+            {"thread/resume": lambda _params: {"thread": {"id": "t1"}}}
+        ) as (app_server, received):
+            await app_server.resume_thread(
+                "t1",
+                approval_policy=ApprovalPolicy.onRequest,
+                approvals_reviewer=ApprovalsReviewer.autoReview,
+                sandbox=SandboxPolicy.readOnly,
+                isolation=IsolationOptions(no_goals=True, no_agents=True),
+            )
+
+        assert received[-1]["params"] == {
+            "threadId": "t1",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+            "sandbox": "read-only",
+            "config": {
+                "features.goals": False,
+                "agents.enabled": False,
+            },
+        }
+
     async def test_operations_keep_wire_requests_inside_the_app_server(self):
         responses = {
             "thread/start": {"thread": {"id": "t1"}},

@@ -152,7 +152,9 @@ The exit code reflects the turn's terminal status, see
 ### resume
 
 ```sh
-codexctl resume <thread-id> [--detach] [--no-goals] [--no-agents] (-- PROMPT... | -)
+codexctl resume <thread-id> [--detach] [--no-goals] [--no-agents]
+                   [--sandbox {read-only,workspace-write,danger-full-access}]
+                   [--approve-for-me] (-- PROMPT... | -)
 ```
 
 Recovers the thread in the shared runtime and starts one new turn. A
@@ -161,7 +163,9 @@ with `THREAD_BUSY` if the thread already has an active turn,
 `THREAD_NOT_FOUND` if the thread does not exist, and
 `THREAD_RECOVERY_FAILED` if recovery itself fails.
 The isolation flags have the same meaning as on [`start`](#start) and are
-reapplied while loading the thread.
+reapplied while loading the thread. `--approve-for-me` and `--sandbox` use the
+same values and behavior as on [`start`](#start); when omitted, resume leaves
+the thread's existing approval and sandbox configuration unchanged.
 
 ### status
 
@@ -519,7 +523,7 @@ Environment variables:
 `codexctl` never blocks on human input:
 
 - Command approval requests are declined automatically. With
-  `start --approve-for-me`, approval decisions are instead resolved by the
+  `start --approve-for-me` or `resume --approve-for-me`, approval decisions are instead resolved by the
   runtime's auto reviewer server-side; `codexctl` still brokers no
   interactive approval itself.
 - Elicitations (user input requests) are declined automatically.

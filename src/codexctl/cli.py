@@ -241,6 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--detach", action="store_true")
     p.add_argument("--no-goals", action="store_true")
     p.add_argument("--no-agents", action="store_true")
+    p.add_argument("--sandbox", choices=_SANDBOX_POLICY_BY_ARGUMENT, default=None)
+    p.add_argument(
+        "--approve-for-me",
+        dest="approve_for_me",
+        action="store_true",
+        help="let the runtime auto-review approval requests instead of declining them",
+    )
     _add_stdin_prompt(p)
 
     p = sub.add_parser("status", help="read the current state of a thread")
@@ -392,6 +399,12 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
         prompt = _require_prompt(
             prompt, "resume requires prompt input after -- or from stdin"
         )
+        if args.approve_for_me:
+            approval_policy = ApprovalPolicy.onRequest
+            approvals_reviewer = ApprovalsReviewer.autoReview
+        else:
+            approval_policy = None
+            approvals_reviewer = None
         return Resume(
             thread_id=args.thread_id,
             prompt=prompt,
@@ -400,6 +413,13 @@ def _build_command(args: argparse.Namespace, prompt: str | None) -> Any:
                 no_goals=args.no_goals,
                 no_agents=args.no_agents,
             ),
+            sandbox=(
+                _SANDBOX_POLICY_BY_ARGUMENT[args.sandbox]
+                if args.sandbox is not None
+                else None
+            ),
+            approval_policy=approval_policy,
+            approvals_reviewer=approvals_reviewer,
         )
     if args.command == "status":
         return Status(thread_id=args.thread_id)

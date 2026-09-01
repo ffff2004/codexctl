@@ -430,12 +430,23 @@ class TestResume:
                 thread_id="t1",
                 prompt="more",
                 isolation=IsolationOptions(no_goals=True, no_agents=True),
+                approval_policy=ApprovalPolicy.onRequest,
+                approvals_reviewer=ApprovalsReviewer.autoReview,
+                sandbox=SandboxPolicy.readOnly,
             )
         )
         await collect(outcome)
 
         assert server.thread_resumes == [
             ("t1", IsolationOptions(no_goals=True, no_agents=True))
+        ]
+        assert server.thread_resume_configs == [
+            (
+                "t1",
+                ApprovalPolicy.onRequest,
+                ApprovalsReviewer.autoReview,
+                SandboxPolicy.readOnly,
+            )
         ]
 
     async def test_thread_not_found(self):

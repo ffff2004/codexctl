@@ -78,7 +78,7 @@ class UsageError(CodexCtlError):
 
 
 class SandboxPolicy(Enum):
-    """Domain sandbox presets accepted by ``start --sandbox``.
+    """Domain sandbox presets accepted by ``start`` and ``resume``.
 
     These values are deliberately independent of the app-server wire enum;
     serialization belongs to the app-server compatibility layer.
@@ -93,7 +93,7 @@ DEFAULT_SANDBOX_POLICY = SandboxPolicy.workspaceWrite
 
 
 class ApprovalPolicy(Enum):
-    """Domain approval policy accepted by ``start``.
+    """Domain approval policy accepted by ``start`` and ``resume``.
 
     These values are deliberately independent of the app-server wire enum;
     serialization belongs to the app-server compatibility layer.
@@ -163,6 +163,9 @@ class Resume:
     prompt: str
     detach: bool = False
     isolation: IsolationOptions = field(default_factory=IsolationOptions)
+    sandbox: SandboxPolicy | None = None
+    approval_policy: ApprovalPolicy | None = None
+    approvals_reviewer: ApprovalsReviewer | None = None
 
 
 @dataclass(frozen=True)

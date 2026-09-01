@@ -277,6 +277,34 @@ class TestPersistFollowExecution:
             isolation=IsolationOptions(no_goals=True, no_agents=True),
         )
 
+    def test_resume_accepts_start_approval_and_sandbox_flags(self, monkeypatch):
+        commands = capture_cli_command(monkeypatch)
+
+        assert (
+            main(
+                [
+                    "resume",
+                    "t1",
+                    "--approve-for-me",
+                    "--sandbox",
+                    "read-only",
+                    "--stdio-exec",
+                    "app",
+                    "--",
+                    "more",
+                ]
+            )
+            == EXIT_OK
+        )
+
+        assert commands[-1] == Resume(
+            thread_id="t1",
+            prompt="more",
+            sandbox=SandboxPolicy.readOnly,
+            approval_policy=ApprovalPolicy.onRequest,
+            approvals_reviewer=ApprovalsReviewer.autoReview,
+        )
+
     @pytest.mark.parametrize("flag", ["--no-goals", "--no-agents"])
     def test_follow_rejects_isolation_flags(self, flag):
         with pytest.raises(SystemExit):

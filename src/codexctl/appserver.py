@@ -256,6 +256,9 @@ class AppServerClient(Protocol):
         self,
         thread_id: str,
         *,
+        approval_policy: ApprovalPolicy | None = None,
+        approvals_reviewer: ApprovalsReviewer | None = None,
+        sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
     ) -> AppServerThread | None: ...
 
@@ -837,9 +840,20 @@ class AppServerSession:
         self,
         thread_id: str,
         *,
+        approval_policy: ApprovalPolicy | None = None,
+        approvals_reviewer: ApprovalsReviewer | None = None,
+        sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
     ) -> AppServerThread | None:
         params: dict[str, Any] = {"threadId": thread_id}
+        if approval_policy is not None:
+            params["approvalPolicy"] = _APPROVAL_POLICY_TO_WIRE[approval_policy]
+        if approvals_reviewer is not None:
+            params["approvalsReviewer"] = _APPROVALS_REVIEWER_TO_WIRE[
+                approvals_reviewer
+            ]
+        if sandbox is not None:
+            params["sandbox"] = _serialize_sandbox_policy(sandbox)
         overrides = _serialize_isolation_options(isolation)
         if overrides:
             params["config"] = overrides

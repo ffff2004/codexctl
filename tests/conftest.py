@@ -28,7 +28,14 @@ from codexctl.endpoint import (
     StdioTarget,
     UnixSocketTarget,
 )
-from codexctl.model import IsolationOptions, ProjectedEvent, StartConfig
+from codexctl.model import (
+    ApprovalPolicy,
+    ApprovalsReviewer,
+    IsolationOptions,
+    ProjectedEvent,
+    SandboxPolicy,
+    StartConfig,
+)
 
 
 class FakeAppServer:
@@ -48,6 +55,14 @@ class FakeAppServer:
         self.missing_lifecycle_operations: set[str] = set()
         self.thread_starts: list[StartConfig] = []
         self.thread_resumes: list[tuple[str, IsolationOptions]] = []
+        self.thread_resume_configs: list[
+            tuple[
+                str,
+                ApprovalPolicy | None,
+                ApprovalsReviewer | None,
+                SandboxPolicy | None,
+            ]
+        ] = []
         self.turn_starts: list[tuple[str, str, str | None]] = []
 
     # -- scripting -----------------------------------------------------------
@@ -126,9 +141,15 @@ class FakeAppServer:
         self,
         thread_id: str,
         *,
+        approval_policy: ApprovalPolicy | None = None,
+        approvals_reviewer: ApprovalsReviewer | None = None,
+        sandbox: SandboxPolicy | None = None,
         isolation: IsolationOptions = IsolationOptions(),
     ) -> AppServerThread | None:
         self.thread_resumes.append((thread_id, isolation))
+        self.thread_resume_configs.append(
+            (thread_id, approval_policy, approvals_reviewer, sandbox)
+        )
         response = await self._request("thread/resume")
         assert isinstance(response, ThreadResponse)
         return response.thread

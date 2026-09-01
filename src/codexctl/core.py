@@ -184,6 +184,9 @@ class CodexCtl:
             try:
                 thread = await app_server.resume_thread(
                     command.thread_id,
+                    approval_policy=command.approval_policy,
+                    approvals_reviewer=command.approvals_reviewer,
+                    sandbox=command.sandbox,
                     isolation=command.isolation,
                 )
             except JsonRpcError as exc:
