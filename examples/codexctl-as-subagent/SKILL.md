@@ -1,7 +1,6 @@
 ---
 name: codexctl-as-subagent
 description: Run Codex workers through codexctl
-disable-model-invocation: true
 ---
 
 Install `codexctl` from GitHub as a `uv` tool when it is not already

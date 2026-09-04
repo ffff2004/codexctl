@@ -1,6 +1,6 @@
 ---
 name: command-resume-hook
-description: Handoff long-running shell commands with the command resume hook when completion should wake the current Codex thread and leave stdout/stderr available for on-demand reading.
+description: Handoff long-running (>30s) shell commands.
 ---
 
 # Command resume hook
@@ -26,14 +26,9 @@ uv tool install git+https://github.com/ffff2004/codexctl.git
 1. Choose the handoff only when waiting for the command would make the
    current turn spend its time polling. Use an ordinary foreground execution
    for short commands whose result is needed immediately.
-   Completion criterion: the command is expected to outlive the current turn.
+   Criterion: the command is expected to take >30s.
 
-2. Use `CODEX_THREAD_ID` as the target thread ID. It is inherited by child
-   processes. Do not substitute the execution tool's `session_id`; that ID
-   only identifies a command process for optional later polling.
-   Completion criterion: a non-empty target thread ID is selected.
-
-3. Invoke the wrapper with all wrapper options before `--`, followed by the
+2. Invoke the wrapper with all wrapper options before `--`, followed by the
    command argv:
    (The wrapper script is in the same dir of this SKILL.md)
 
@@ -47,10 +42,8 @@ uv tool install git+https://github.com/ffff2004/codexctl.git
    command-resume-hook.sh -- \
      bash -lc 'COMMAND | OTHER_COMMAND'
    ```
-   Completion criterion: the wrapper receives the intended command argv after
-   its `--` delimiter.
 
-4. Run that command in the foreground and ask the execution tool to return
+3. Run that command in the foreground and ask the execution tool to return
    after a short initial wait. When it returns a live `session_id` without a
    final exit code, the handoff is complete: report that the wrapper has
    started and end the current turn.
