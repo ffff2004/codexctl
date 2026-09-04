@@ -1921,6 +1921,14 @@ class Workflow:
         """Strictly read a run report without taking the run lock."""
         self._load(run_id)
         report = self._report()
+        operation_intent = self.state.get("operation_intent") or {}
+        if (
+            self.state.get("status") == "RUNNING"
+            and self.state.get("phase") == "WORKER"
+            and operation_intent.get("kind")
+            in {"agent_start", "agent_follow", "agent_terminal"}
+        ):
+            return report
         try:
             self._require_checkpoint(
                 allow_descendant=any(

@@ -60,6 +60,9 @@ uv run python impl_review.py inspect RUN_ID --output json
 later Worker and reviewer prompts. The closed action vocabulary and current
 state transitions are owned by [`impl_review.py`](impl_review.py), while the
 behavioral coverage is in [`tests/test_impl_review.py`](tests/test_impl_review.py).
+During a persisted in-flight Worker operation, `inspect` reports `RUNNING`
+without requiring the checkout to match the saved checkpoint. Stable waiting,
+review, and terminal states continue to report checkout drift strictly.
 
 Exit 0 means a current gate attestation and fresh full-audit certificate bind
 the same commit. Exit 2 means the run is waiting. Exit 3 means explicit review

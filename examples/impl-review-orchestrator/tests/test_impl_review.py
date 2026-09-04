@@ -281,6 +281,26 @@ class BlockingStartCodex:
         return impl_review.AgentResult("completed")
 
 
+class BlockingWorkerFollowCodex:
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def start(self, *, prompt, cwd, role, approve, model, effort):
+        return impl_review.DetachReceipt(f"{role}-thread", f"{role}-turn")
+
+    def follow(self, *, thread_id, turn_id):
+        if thread_id == "worker-thread":
+            self.started.set()
+            if not self.release.wait(10):
+                raise AssertionError("blocked Worker was not released")
+        return impl_review.AgentResult(
+            "completed",
+            messages=["Pass.\nVERDICT: PASS"],
+            observed_turn_ids=[turn_id],
+        )
+
+
 class RecordingGit:
     def __init__(self, events_path: Path):
         self.delegate = impl_review.GitAdapter()
@@ -1916,6 +1936,43 @@ def test_run_lock_blocks_resume_but_not_inspect(repo: Path, tmp_path: Path):
         with pytest.raises(impl_review.UsageError, match="RUN_BUSY"):
             workflow.resume("test-run", "START_NEXT_ROUND")
         fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@pytest.mark.parametrize("mutation", ["dirty", "ahead"])
+def test_inspect_does_not_report_drift_during_worker_follow(
+    repo: Path, tmp_path: Path, mutation: str
+):
+    codex = BlockingWorkerFollowCodex()
+    workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
+    result: dict[str, object] = {}
+
+    def run_start() -> None:
+        try:
+            result["report"] = workflow.start(config(repo, tmp_path, gates=()))
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run_start)
+    thread.start()
+    assert codex.started.wait(5), "Worker did not reach its active follow"
+    try:
+        if mutation == "dirty":
+            (repo / "in-progress.txt").write_text("Worker is still editing.\n")
+        else:
+            commit(repo, "in-progress.txt", "Worker committed while active.\n")
+
+        inspected = impl_review.Workflow(
+            state_dir=tmp_path / "state", codex=codex
+        ).inspect("test-run")
+        assert inspected["status"] == "RUNNING"
+        assert inspected["phase"] == "WORKER"
+        assert inspected["waitingReason"] is None
+    finally:
+        codex.release.set()
+        thread.join(10)
+
+    assert not thread.is_alive()
+    assert "error" not in result
 
 
 def test_start_initialization_and_advancement_hold_run_lock(
