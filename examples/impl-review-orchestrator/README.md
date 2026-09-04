@@ -18,7 +18,7 @@ can be certified.
 From this directory:
 
 ```sh
-uv run python impl_review.py start \
+python3.14 impl_review.py start \
   --cwd /path/to/checkout \
   --spec /path/to/spec.md \
   --worker-prompt prompts/worker.md \
@@ -63,11 +63,11 @@ short read-only operation and emits no progress.
 A waiting report lists its valid typed actions. For example:
 
 ```sh
-uv run python impl_review.py resume RUN_ID --action START_NEXT_ROUND \
+python3.14 impl_review.py resume RUN_ID --action START_NEXT_ROUND \
   --additional-prompt 'Preserve the public API.'
 
-uv run python impl_review.py resume RUN_ID --action RETRY_REVIEWERS
-uv run python impl_review.py inspect RUN_ID --output json
+python3.14 impl_review.py resume RUN_ID --action RETRY_REVIEWERS
+python3.14 impl_review.py inspect RUN_ID --output json
 ```
 
 `--additional-prompt-file PATH` snapshots the same persistent amendment;
