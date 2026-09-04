@@ -20,6 +20,7 @@ thread. A worker shares the checkout and runtime, but has its own context.
    it must preserve unrelated changes and report any friction or assumptions.
 
    Start the worker and save the returned `threadId`:
+   (For Codex: if skill `command-resume-hook` exists, use it to run `codexctl start`)
 
    ```sh
    codexctl start --cwd "$PWD" --approve-for-me -- \
@@ -31,9 +32,6 @@ thread. A worker shares the checkout and runtime, but has its own context.
 
 2. Wait until it ends, or continue work that does not overlap the worker if the user asks so.
    
-   If you can only rely on polling to wait, then use the largest possible polling interval
-   (for example, for Codex's `write_stdin` tool, wait at least 300 seconds).
-
    Inspect its state only when an answer is useful:
 
    ```sh
