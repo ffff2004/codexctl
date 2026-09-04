@@ -27,9 +27,11 @@ of this `SKILL.md`.
    not appropriate.
 
 2. Collect a concrete specification plus Worker, repair, and Reviewer prompt
-   files. Select gates that check the checkout without mutating it. Give each
-   Reviewer a distinct `NAME=PATH` rubric; include a spec reviewer and a
-   standards reviewer unless the task calls for another cohort.
+   files. A Reviewer rubric may contain the optional `{spec}` placeholder, where
+   the specification will be injected. Select gates that check the checkout
+   without mutating it. Give each Reviewer a distinct `NAME=PATH` rubric; include
+   a spec reviewer and a standards reviewer unless the task calls for another
+   cohort.
 
    Completion: every prompt path and gate command is intentional and can run
    in the target checkout.

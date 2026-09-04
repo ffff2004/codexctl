@@ -56,7 +56,7 @@ def inputs(tmp_path: Path) -> tuple[Path, Path, Path, tuple[tuple[str, Path], ..
     spec.write_text("Implement the ticket.")
     worker.write_text("Implement the specification.")
     repair.write_text("Repair the supplied failures.")
-    reviewer.write_text("Audit correctness and the specification.")
+    reviewer.write_text("Audit correctness.\n\nSpecification:\n{spec}")
     return spec, worker, repair, (("spec", reviewer),)
 
 
@@ -659,6 +659,10 @@ def test_multiple_commits_are_certified_as_one_cumulative_subject(
     )
     assert f"{report['baseCommit']}..{report['candidateHead']}" in reviewer_prompt
     assert "Do not run gates" in reviewer_prompt
+    assert (
+        "Audit correctness.\n\nSpecification:\nImplement the ticket." in reviewer_prompt
+    )
+    assert reviewer_prompt.count("Implement the ticket.") == 1
     assert workflow.inspect("test-run")["status"] == "READY_CERTIFIED"
     assert (
         impl_review.main(
@@ -673,6 +677,27 @@ def test_multiple_commits_are_certified_as_one_cumulative_subject(
         )
         == 0
     )
+
+
+def test_reviewer_rubric_can_omit_spec_placeholder(repo: Path, tmp_path: Path):
+    reviewer = tmp_path / "reviewer-without-spec-placeholder.md"
+    reviewer.write_text("Audit correctness.")
+    codex = ScriptedCodex(
+        repo,
+        [lambda: commit(repo, "work.txt", "work\n")],
+        ["Passes.\nVERDICT: PASS"],
+    )
+
+    report = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
+        config(repo, tmp_path, reviewers=(("standards", reviewer),))
+    )
+
+    assert report["status"] == "READY_CERTIFIED"
+    reviewer_prompt = next(
+        prompt for role, prompt, _ in codex.prompts if role == "reviewer"
+    )
+    assert "Audit correctness." in reviewer_prompt
+    assert "Implement the ticket." not in reviewer_prompt
 
 
 def test_failed_full_then_delta_pass_rotates_to_fresh_full(repo: Path, tmp_path: Path):

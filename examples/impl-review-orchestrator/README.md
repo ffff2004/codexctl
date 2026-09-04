@@ -34,6 +34,8 @@ python3.14 impl_review.py start \
 initial Worker. `--worker-approve-for-me` is a run-level, Worker-only switch.
 `--gate-timeout-seconds` defaults to 1800 for each gate. Prompt, rubric, gate,
 model, effort, isolation, and approval policy inputs are snapshotted at start.
+If a reviewer rubric contains the optional `{spec}` placeholder, the supplied
+specification is injected there when the reviewer prompt is composed.
 
 Workers run in `workspace-write`; reviewers run in `read-only`. Every start and
 resume uses `--no-goals --no-agents`. Agent starts detach first, then the

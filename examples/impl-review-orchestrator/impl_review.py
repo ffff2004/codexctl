@@ -2314,13 +2314,13 @@ class Workflow:
         )
         gate_summary = self._gate_summary()
         spec = self._read_artifact_text(self.state["prompts"]["spec"])
+        rubric = rubric.replace("{spec}", spec)
         pieces = [
             rubric,
             wrapper,
             f"Review subject: mode={mode}; base={self.state['base_commit']}; candidate={self.state['candidate_head']}"
             + (f"; previous={previous}" if previous else ""),
             gate_summary,
-            f"Specification:\n{spec}",
         ]
         if mode == "DELTA" and prior:
             pieces.append(f"Your cohort's prior review result:\n{prior}")
