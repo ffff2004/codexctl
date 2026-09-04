@@ -102,7 +102,7 @@ fi
 } >"$result_file"
 
 resume_prompt=$(cat <<EOF
-An asynchronous command has finished.
+An asynchronous command has finished
 
 Command: $command_text
 Exit code: $command_exit_code
@@ -110,8 +110,7 @@ stdout file: $stdout_file
 stderr file: $stderr_file
 Result metadata file: $result_file
 
-Read the stdout and stderr files as needed. Do not assume that a non-zero
-exit code means the command output is absent.
+Read the stdout and stderr files as needed
 EOF
 )
 
