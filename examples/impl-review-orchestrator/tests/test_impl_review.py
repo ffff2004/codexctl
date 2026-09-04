@@ -370,6 +370,276 @@ def config(repo: Path, tmp_path: Path, **changes):
     return impl_review.RunConfig(**values)
 
 
+def test_progress_marks_durable_boundaries_before_follow(repo: Path, tmp_path: Path):
+    events: list[str] = []
+    state_path: Path | None = None
+
+    def record_progress(message: str) -> None:
+        nonlocal state_path
+        events.append(message)
+        if message.startswith("Run initialized:"):
+            state_path = Path(message.split("statePath=", 1)[1])
+
+    class OrderingCodex(ScriptedCodex):
+        def follow(self, *, thread_id, turn_id):
+            detached = next(
+                event
+                for event in events
+                if event.startswith("Agent detached:") and f"turnId={turn_id}" in event
+            )
+            assert f"threadId={thread_id}" in detached
+            assert state_path is not None
+            persisted = json.loads(state_path.read_text())
+            attempt = next(
+                item for item in persisted["attempts"] if item["turn_id"] == turn_id
+            )
+            assert attempt["status"] == "DETACHED"
+            assert persisted["operation_intent"]["kind"] == "agent_follow"
+            return super().follow(thread_id=thread_id, turn_id=turn_id)
+
+    codex = OrderingCodex(
+        repo,
+        [lambda: commit(repo, "implemented.txt", "done\n")],
+        ["Review passed.\nVERDICT: PASS"],
+    )
+    workflow = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=record_progress
+    )
+
+    report = workflow.start(config(repo, tmp_path))
+
+    assert report["status"] == "READY_CERTIFIED"
+    prefixes = [event.split(":", 1)[0] for event in events]
+    assert prefixes[0] == "Run initialized"
+    assert prefixes.index("Agent starting") < prefixes.index("Agent detached")
+    assert prefixes.index("Agent detached") < prefixes.index("Agent completed")
+    assert "Checkpoint advanced" in prefixes
+    assert "Gate starting" in prefixes
+    assert "Gate completed" in prefixes
+    assert "Gates completed" in prefixes
+    assert "Review session started" in prefixes
+    assert "Reviewer completed" in prefixes
+    assert "Review completed" in prefixes
+    assert prefixes[-1] == "Terminal result"
+    assert prefixes.count("Agent completed") == len(report["attempts"])
+    assert any("role=Worker" in event for event in events)
+    assert any("role=reviewer:spec" in event for event in events)
+    assert any("stdoutArtifact=" in event for event in events)
+    assert any("verdict=PASS" in event for event in events)
+    assert all("Implement the specification" not in event for event in events)
+    assert all("Review passed" not in event for event in events)
+
+
+def test_raising_progress_sink_cannot_change_outcome_or_recovery(
+    repo: Path, tmp_path: Path
+):
+    delivered: list[str] = []
+
+    def broken_sink(message: str) -> None:
+        delivered.append(message)
+        raise BrokenPipeError("progress consumer closed")
+
+    codex = ScriptedCodex(
+        repo,
+        [lambda: commit(repo, "implemented.txt", "done\n")],
+        ["Review passed.\nVERDICT: PASS"],
+    )
+    report = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=broken_sink
+    ).start(config(repo, tmp_path))
+
+    assert report["status"] == "READY_CERTIFIED"
+    assert any(message.startswith("Checkpoint advanced:") for message in delivered)
+    recovered = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=broken_sink
+    ).resume("test-run")
+    assert recovered["status"] == "READY_CERTIFIED"
+    assert recovered["candidateHead"] == report["candidateHead"]
+
+
+@pytest.mark.parametrize("advancement", ["normal", "accept_worker_result"])
+def test_checkpoint_progress_interruption_recovers_in_verification(
+    repo: Path, tmp_path: Path, advancement: str
+):
+    def interrupt_at_checkpoint(message: str) -> None:
+        if message.startswith("Checkpoint advanced:"):
+            raise SimulatedCrash
+
+    worker_results = (
+        [impl_review.AgentResult("interrupted")]
+        if advancement == "accept_worker_result"
+        else None
+    )
+    codex = ScriptedCodex(
+        repo,
+        [lambda: commit(repo, "implemented.txt", "done\n")],
+        ["Review passed.\nVERDICT: PASS"],
+        worker_results=worker_results,
+    )
+    workflow = impl_review.Workflow(
+        state_dir=tmp_path / "state",
+        codex=codex,
+        progress=interrupt_at_checkpoint,
+    )
+
+    if advancement == "normal":
+        with pytest.raises(SimulatedCrash):
+            workflow.start(config(repo, tmp_path, max_auto_worker_rounds=1))
+        state_path = next((tmp_path / "state").glob("*/test-run/state.json"))
+    else:
+        waiting = workflow.start(config(repo, tmp_path, max_auto_worker_rounds=1))
+        assert "ACCEPT_WORKER_RESULT" in waiting["allowedActions"]
+        state_path = Path(waiting["statePath"])
+        with pytest.raises(SimulatedCrash):
+            workflow.resume("test-run", "ACCEPT_WORKER_RESULT")
+
+    interrupted = json.loads(state_path.read_text())
+    assert interrupted["status"] == "RUNNING"
+    assert interrupted["phase"] == "VERIFY_CHECKPOINT"
+    assert interrupted["candidate_head"] == git(repo, "rev-parse", "HEAD")
+    assert interrupted["pending_worker"] is None
+    assert interrupted["operation_intent"] is None
+
+    recovered = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).resume(
+        "test-run"
+    )
+
+    assert recovered["status"] == "READY_CERTIFIED"
+    assert recovered["waitingReason"] is None
+    assert (
+        recovered["gateAttestation"]["candidate_head"] == interrupted["candidate_head"]
+    )
+
+
+def test_ordinary_worker_start_failure_emits_one_durable_completion(
+    repo: Path, tmp_path: Path
+):
+    class FailingWorkerStartCodex(ScriptedCodex):
+        def start(self, **kwargs):
+            raise impl_review.OrchestratorError("worker start failed")
+
+    events: list[str] = []
+    report = impl_review.Workflow(
+        state_dir=tmp_path / "state",
+        codex=FailingWorkerStartCodex(repo, [], []),
+        progress=events.append,
+    ).start(config(repo, tmp_path))
+
+    completion = "Agent completed: role=Worker attemptId=attempt-1 status=unknown"
+    assert report["waitingReason"] == "AGENT_OUTCOME_UNKNOWN"
+    assert events.count(completion) == 1
+    assert events.index(completion) < next(
+        index for index, event in enumerate(events) if event.startswith("Waiting:")
+    )
+    state = json.loads(Path(report["statePath"]).read_text())
+    assert state["operation_intent"] is None
+    assert state["attempts"][-1]["status"] == "unknown"
+
+
+def test_ordinary_reviewer_start_failure_emits_one_durable_completion(
+    repo: Path, tmp_path: Path
+):
+    class FailingReviewerStartCodex(ScriptedCodex):
+        def start(self, **kwargs):
+            if kwargs["role"] == "reviewer":
+                raise impl_review.OrchestratorError("reviewer start failed")
+            return super().start(**kwargs)
+
+    events: list[str] = []
+    codex = FailingReviewerStartCodex(
+        repo, [lambda: commit(repo, "implemented.txt", "done\n")], []
+    )
+    report = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=events.append
+    ).start(config(repo, tmp_path, max_auto_worker_rounds=1))
+
+    completion = (
+        "Agent completed: role=reviewer:spec attemptId=attempt-2 status=unknown"
+    )
+    assert report["waitingReason"] == "REVIEWER_FAILURE"
+    assert events.count(completion) == 1
+    reviewer_boundary = next(
+        index
+        for index, event in enumerate(events)
+        if event.startswith("Reviewer completed:")
+    )
+    assert events.index(completion) < reviewer_boundary
+    state = json.loads(Path(report["statePath"]).read_text())
+    result = state["review_sessions"][-1]["results"]["spec"]
+    assert result["attempt_id"] == "attempt-2"
+    assert result["status"] == "unknown"
+
+
+def test_resume_reports_loaded_run_before_recovered_follow(repo: Path, tmp_path: Path):
+    codex = CrashDuringFollowCodex(repo, [lambda: None], [])
+    with pytest.raises(SimulatedCrash):
+        impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
+            config(repo, tmp_path)
+        )
+
+    events: list[str] = []
+    report = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=events.append
+    ).resume("test-run")
+
+    assert report["status"] == "WAITING"
+    assert events[0].startswith("Run loaded: runId=test-run statePath=")
+    assert events[1].startswith("Agent detached: role=Worker ")
+    assert events[-1] == (
+        "Waiting: reason=WORKER_NO_CHANGE actions=START_NEXT_ROUND,REQUIRE_FRESH_AUDIT"
+    )
+
+
+def test_cli_json_keeps_progress_out_of_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    report = {
+        "runId": "cli-run",
+        "status": "WAITING",
+        "phase": "WORKER",
+        "branch": "impl-review/cli-run",
+        "candidateHead": "abc123",
+        "waitingReason": "WORKER_NO_CHANGE",
+        "allowedActions": ["START_NEXT_ROUND"],
+        "exitCode": 2,
+    }
+
+    class FakeWorkflow:
+        def __init__(self, *, state_dir, progress):
+            self.progress = progress
+
+        def start(self, run_config):
+            self.progress("Run initialized: runId=cli-run statePath=/state.json")
+            return report
+
+    monkeypatch.setattr(impl_review, "Workflow", FakeWorkflow)
+    code = impl_review.main(
+        [
+            "start",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--output",
+            "json",
+            "--cwd",
+            str(tmp_path),
+            "--spec",
+            str(tmp_path / "spec.md"),
+            "--worker-prompt",
+            str(tmp_path / "worker.md"),
+            "--repair-prompt",
+            str(tmp_path / "repair.md"),
+            "--reviewer",
+            f"spec={tmp_path / 'reviewer.md'}",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert json.loads(captured.out) == report
+    assert captured.err == "Run initialized: runId=cli-run statePath=/state.json\n"
+    assert "Run initialized" not in captured.out
+
+
 def test_multiple_commits_are_certified_as_one_cumulative_subject(
     repo: Path, tmp_path: Path
 ):
@@ -1456,12 +1726,67 @@ def test_worker_start_persists_recovery_evidence_at_agent_start_boundary(
     assert intent == {"kind": "agent_start", "attempt_id": pending["attempt_id"]}
     assert state["attempts"][-1]["status"] == "START_INTENT"
 
-    recovered = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).resume(
-        "test-run"
-    )
+    events: list[str] = []
+    recovered = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=events.append
+    ).resume("test-run")
 
     assert recovered["waitingReason"] == "AGENT_OUTCOME_UNKNOWN"
     assert recovered["allowedActions"] == []
+    completion = "Agent completed: role=Worker attemptId=attempt-1 status=unknown"
+    assert events.count(completion) == 1
+    assert events.index(completion) < next(
+        index for index, event in enumerate(events) if event.startswith("Waiting:")
+    )
+
+
+def test_reviewer_agent_start_recovery_emits_one_durable_completion(
+    repo: Path, tmp_path: Path
+):
+    class CrashBeforeReviewerStartCodex(ScriptedCodex):
+        def start(self, **kwargs):
+            if kwargs["role"] == "reviewer":
+                raise SimulatedCrash
+            return super().start(**kwargs)
+
+    codex = CrashBeforeReviewerStartCodex(
+        repo,
+        [lambda: commit(repo, "implemented.txt", "done\n")],
+        [],
+    )
+    with pytest.raises(SimulatedCrash):
+        impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
+            config(repo, tmp_path, max_auto_worker_rounds=1)
+        )
+
+    state_path = next((tmp_path / "state").glob("*/test-run/state.json"))
+    crashed = json.loads(state_path.read_text())
+    assert crashed["operation_intent"] == {
+        "kind": "agent_start",
+        "attempt_id": "attempt-2",
+    }
+    assert crashed["attempts"][-1]["status"] == "START_INTENT"
+    assert crashed["review_sessions"][-1]["results"] == {}
+
+    events: list[str] = []
+    recovered = impl_review.Workflow(
+        state_dir=tmp_path / "state", codex=codex, progress=events.append
+    ).resume("test-run")
+
+    completion = (
+        "Agent completed: role=reviewer:spec attemptId=attempt-2 status=unknown"
+    )
+    assert recovered["waitingReason"] == "REVIEWER_FAILURE"
+    assert events.count(completion) == 1
+    assert events.index(completion) < next(
+        index
+        for index, event in enumerate(events)
+        if event.startswith("Reviewer completed:")
+    )
+    persisted = json.loads(state_path.read_text())
+    result = persisted["review_sessions"][-1]["results"]["spec"]
+    assert result["attempt_id"] == "attempt-2"
+    assert result["status"] == "unknown"
 
 
 def test_rewritten_worker_history_is_checkout_drift(repo: Path, tmp_path: Path):

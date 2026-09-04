@@ -43,6 +43,21 @@ already finished is recovered from JSONL history; a different active turn is
 surfaced as `UNEXPECTED_CONTINUATION` and is never followed. Reviewers inspect
 the exact commit range themselves and do not run configured gates.
 
+While `start` or `resume` is running, concise operational progress is written
+to stderr and flushed immediately. The initial or loaded run ID and state path
+appear before long work. Once an agent's detach receipt is durable, progress
+includes its Worker or reviewer role, attempt ID, thread ID, and turn ID, so a
+caller can observe it independently with `codexctl follow THREAD_ID`. Progress
+also marks checkpoint, gate, review, waiting, and terminal boundaries and
+references artifacts instead of printing prompts, model messages, or raw gate
+and agent output. There is no heartbeat.
+Progress delivery is best-effort: a closed or failing progress consumer cannot
+change workflow execution, durable state, or recovery.
+
+The final report is the only stdout output. In particular, `--output json`
+keeps stdout parseable while progress continues on stderr. `inspect` is a
+short read-only operation and emits no progress.
+
 ## Resume and inspect
 
 A waiting report lists its valid typed actions. For example:

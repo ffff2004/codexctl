@@ -1429,8 +1429,31 @@ class Workflow:
         self.state: dict[str, Any] = {}
 
     def _say(self, message: str) -> None:
-        if self.progress:
+        if not self.progress:
+            return
+        try:
             self.progress(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _agent_role(record: dict[str, Any]) -> str:
+        if record["role"] == "worker":
+            return "Worker"
+        return f"reviewer:{record['reviewer_role']}"
+
+    def _say_agent_detached(self, record: dict[str, Any]) -> None:
+        self._say(
+            f"Agent detached: role={self._agent_role(record)} "
+            f"attemptId={record['id']} threadId={record['thread_id']} "
+            f"turnId={record['turn_id']}"
+        )
+
+    def _say_agent_completed(self, record: dict[str, Any]) -> None:
+        self._say(
+            f"Agent completed: role={self._agent_role(record)} "
+            f"attemptId={record['id']} status={record['status']}"
+        )
 
     def _save(self) -> None:
         assert self.store is not None
@@ -1496,6 +1519,13 @@ class Workflow:
             self.codex = CodexctlAdapter(
                 str(self.state["config"]["codexctl"]), Path(self.state["cwd"])
             )
+
+    def _say_loaded_run(self) -> None:
+        assert self.store is not None
+        self._say(
+            f"Run loaded: runId={self.state['run_id']} "
+            f"statePath={self.store.state_path}"
+        )
 
     def _reconcile_interrupted_operation(self) -> dict[str, Any] | None:
         intent = self.state.get("operation_intent")
@@ -1606,7 +1636,12 @@ class Workflow:
             attempt["error"] = "crash occurred before detach receipt was recorded"
             if attempt["role"] == "worker":
                 self.state["operation_intent"] = None
-                return self._wait("AGENT_OUTCOME_UNKNOWN", [], self.state["phase"])
+                return self._wait(
+                    "AGENT_OUTCOME_UNKNOWN",
+                    [],
+                    self.state["phase"],
+                    completed_attempt=attempt,
+                )
             session = next(
                 item
                 for item in self.state["review_sessions"]
@@ -1618,6 +1653,7 @@ class Workflow:
                 attempt,
                 None,
                 AgentResult("unknown", error=attempt["error"]),
+                agent_completion_pending=True,
             )
             self._mark_pending_reviewer_starts_unknown(session)
             cohort = next(
@@ -1777,6 +1813,7 @@ class Workflow:
         recovered_review = unknown_review
         for attempt in detached:
             receipt = DetachReceipt(str(attempt["thread_id"]), str(attempt["turn_id"]))
+            self._say_agent_detached(attempt)
             follow_failed = False
             try:
                 result = self.codex.follow(
@@ -2046,6 +2083,9 @@ class Workflow:
                     )
                 )
             self._save()
+            self._say(
+                f"Run initialized: runId={run_id} statePath={self.store.state_path}"
+            )
             # Reconcile only the exact branch-create crash window owned by this run.
             current = self.git.snapshot(cwd)
             if not _matches_checkout(
@@ -2071,6 +2111,7 @@ class Workflow:
         additional_prompt: str | None = None,
     ) -> dict[str, Any]:
         self._load(run_id)
+        self._say_loaded_run()
         assert self.store is not None
         with self.store.exclusive():
             self.state = self.store.read_state()
@@ -2134,8 +2175,8 @@ class Workflow:
             if action == "CONTINUE_WORKER":
                 return self._continue_worker()
             if action == "ACCEPT_WORKER_RESULT":
-                self._accept_descendant_checkpoint()
-                return self._ensure_gates()
+                advanced_checkpoint = self._accept_descendant_checkpoint()
+                return self._ensure_gates(advanced_checkpoint=advanced_checkpoint)
             raise AssertionError(action)
 
     def _pending_worker_attempt(
@@ -2290,13 +2331,22 @@ class Workflow:
         return "\n\n".join(pieces)
 
     def _wait(
-        self, reason: str, actions: list[str], continuation: str
+        self,
+        reason: str,
+        actions: list[str],
+        continuation: str,
+        *,
+        completed_attempt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.state["status"] = "WAITING"
         self.state["waiting_reason"] = reason
         self.state["allowed_actions"] = actions
         self.state["continuation_phase"] = continuation
         self._save()
+        if completed_attempt is not None:
+            self._say_agent_completed(completed_attempt)
+        rendered_actions = ",".join(actions) if actions else "(none)"
+        self._say(f"Waiting: reason={reason} actions={rendered_actions}")
         return self._report()
 
     def _require_checkpoint(self, *, allow_descendant: bool = False) -> Checkout:
@@ -2340,12 +2390,13 @@ class Workflow:
             return actual
         raise UsageError("CHECKOUT_DRIFT: HEAD is not the saved checkpoint")
 
-    def _accept_descendant_checkpoint(self) -> None:
+    def _accept_descendant_checkpoint(self) -> str:
         actual = self._require_checkpoint(allow_descendant=True)
         if actual.head == self.state["candidate_head"]:
             raise UsageError("no descendant Worker result is available")
         self._freeze_checkpoint(actual.head)
         self.state["pending_worker"] = None
+        return actual.head
 
     def _freeze_checkpoint(self, head: str) -> None:
         cwd = Path(self.state["cwd"])
@@ -2510,6 +2561,7 @@ class Workflow:
         if result.error:
             record["error"] = result.error
         self._save()
+        self._say_agent_completed(record)
 
     def _start_agent_attempt(
         self,
@@ -2527,6 +2579,9 @@ class Workflow:
             "attempt_id": record["id"],
         }
         self._save()
+        self._say(
+            f"Agent starting: role={self._agent_role(record)} attemptId={record['id']}"
+        )
         try:
             if resume_thread:
                 receipt = self.codex.resume(thread_id=resume_thread, prompt=prompt)
@@ -2564,6 +2619,7 @@ class Workflow:
             "turn_id": receipt.turn_id,
         }
         self._save()
+        self._say_agent_detached(record)
 
     def _follow_agent_attempt(self, attempt: _AgentAttempt) -> AgentResult:
         """Follow the recorded turn and normalize runtime exceptions."""
@@ -2719,6 +2775,22 @@ class Workflow:
         *,
         expected_checkout: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        intent = self.state.get("operation_intent") or {}
+        start_failure = (
+            record
+            if intent.get("kind") == "agent_start"
+            and intent.get("attempt_id") == record["id"]
+            else None
+        )
+
+        def wait(reason: str, actions: list[str], continuation: str) -> dict[str, Any]:
+            return self._wait(
+                reason,
+                actions,
+                continuation,
+                completed_attempt=start_failure,
+            )
+
         cwd = Path(self.state["cwd"])
         actual = self.git.snapshot(cwd)
         if expected_checkout is not None and (
@@ -2727,13 +2799,13 @@ class Workflow:
             or list(actual.status) != expected_checkout.get("status")
         ):
             self.state["operation_intent"] = None
-            return self._wait("CHECKOUT_DRIFT", [], "WORKER")
+            return wait("CHECKOUT_DRIFT", [], "WORKER")
         if actual.branch != self.state["branch"]:
             self.state["operation_intent"] = None
-            return self._wait("CHECKOUT_DRIFT", [], "WORKER")
+            return wait("CHECKOUT_DRIFT", [], "WORKER")
         if not actual.clean:
             self.state["operation_intent"] = None
-            return self._wait("WORKER_CONTRACT_VIOLATION", [], "WORKER")
+            return wait("WORKER_CONTRACT_VIOLATION", [], "WORKER")
         descendant = (
             actual.head != input_head
             and self.git.is_ancestor(cwd, input_head, actual.head)
@@ -2741,7 +2813,7 @@ class Workflow:
         )
         if actual.head != input_head and not descendant:
             self.state["operation_intent"] = None
-            return self._wait("CHECKOUT_DRIFT", [], "WORKER")
+            return wait("CHECKOUT_DRIFT", [], "WORKER")
         self.state["operation_intent"] = None
         if result.status == "unexpected_continuation":
             self.state["pending_worker"] = {
@@ -2749,7 +2821,7 @@ class Workflow:
                 "attempt_id": record["id"],
                 "descendant_head": actual.head if descendant else None,
             }
-            return self._wait("UNEXPECTED_CONTINUATION", [], "WORKER")
+            return wait("UNEXPECTED_CONTINUATION", [], "WORKER")
         if result.status != "completed":
             actions = _worker_recovery_action_policy(
                 result.status,
@@ -2761,7 +2833,7 @@ class Workflow:
                 "attempt_id": record["id"],
                 "descendant_head": actual.head if descendant else None,
             }
-            return self._wait(
+            return wait(
                 "WORKER_INTERRUPTED"
                 if result.status in {"failed", "interrupted"}
                 else "AGENT_OUTCOME_UNKNOWN",
@@ -2770,14 +2842,14 @@ class Workflow:
             )
         if not descendant:
             self.state["pending_worker"] = None
-            return self._wait(
+            return wait(
                 "WORKER_NO_CHANGE",
                 ["START_NEXT_ROUND", "REQUIRE_FRESH_AUDIT"],
                 "WORKER",
             )
         self._freeze_checkpoint(actual.head)
         self.state["pending_worker"] = None
-        return self._ensure_gates()
+        return self._ensure_gates(advanced_checkpoint=actual.head)
 
     def _gate_summary(self) -> str:
         attestation = self.state.get("gate_attestation")
@@ -2795,11 +2867,20 @@ class Workflow:
             and value["policy_digest"] == self.state["config"]["gate_policy_digest"]
         )
 
-    def _ensure_gates(self, *, force_full: bool = False) -> dict[str, Any]:
+    def _ensure_gates(
+        self,
+        *,
+        force_full: bool = False,
+        advanced_checkpoint: str | None = None,
+    ) -> dict[str, Any]:
         self._require_checkpoint()
         self.state["phase"] = "VERIFY_CHECKPOINT"
         self.state["force_full"] = force_full or bool(self.state.get("force_full"))
         self._save()
+        if advanced_checkpoint is not None:
+            if advanced_checkpoint != self.state["candidate_head"]:
+                raise AssertionError("checkpoint announcement does not match candidate")
+            self._say(f"Checkpoint advanced: commit={advanced_checkpoint}")
         if self._valid_attestation():
             return self._review(
                 mode="FULL"
@@ -2834,6 +2915,10 @@ class Workflow:
             }
             self.state["operation_intent"] = intent
             self._save()
+            self._say(
+                f"Gate starting: gate={index + 1}/{len(commands)} "
+                f"checkpoint={candidate}"
+            )
             execution = self.gates.run(
                 command,
                 Path(self.state["cwd"]),
@@ -2870,6 +2955,11 @@ class Workflow:
             self.state["gate_results"].append(record)
             self.state["operation_intent"] = None
             self._save()
+            self._say(
+                f"Gate completed: gate={index + 1}/{len(commands)} "
+                f"status={execution.status} stdoutArtifact={stdout_ref} "
+                f"stderrArtifact={stderr_ref}"
+            )
             if before != after:
                 return self._wait("GATE_MUTATED_CHECKOUT", [], "VERIFY_CHECKPOINT")
             if execution.status == "execution_error":
@@ -2902,6 +2992,7 @@ class Workflow:
             "created_at": _now(),
         }
         self._save()
+        self._say(f"Gates completed: checkpoint={candidate} count={len(commands)}")
         return self._review(
             mode="FULL"
             if self.state["force_full"] or not self.state.get("development_cohort")
@@ -2915,6 +3006,8 @@ class Workflow:
         record: dict[str, Any],
         receipt: DetachReceipt | None,
         result: AgentResult,
+        *,
+        agent_completion_pending: bool = False,
     ) -> None:
         existing = session["results"].get(role)
         if existing is not None and existing.get("attempt_id") == record["id"]:
@@ -2969,6 +3062,14 @@ class Workflow:
             item["error"] = "completed turn had no agentMessage"
         session["results"][role] = item
         self._save()
+        if agent_completion_pending:
+            self._say_agent_completed(record)
+        verdict = item["verdict"] or "unavailable"
+        self._say(
+            f"Reviewer completed: reviewSessionId={session['id']} role={role} "
+            f"attemptId={record['id']} status={item['status']} verdict={verdict} "
+            f"messageArtifact={item['message_artifact'] or '(none)'}"
+        )
 
     def _mark_pending_reviewer_starts_unknown(self, session: dict[str, Any]) -> None:
         for pending in self.state["attempts"]:
@@ -2986,6 +3087,7 @@ class Workflow:
                     pending,
                     None,
                     AgentResult("unknown", error=pending["error"]),
+                    agent_completion_pending=True,
                 )
 
     def _finalize_review(
@@ -3033,6 +3135,10 @@ class Workflow:
         cohort["last_checkpoint"] = candidate
         self.state["force_full"] = False
         self._save()
+        self._say(
+            f"Review completed: reviewSessionId={session['id']} "
+            f"status={session['status']}"
+        )
         if session["status"] == "FAILED":
             if mode == "FULL":
                 self.state["development_cohort"] = cohort["id"]
@@ -3086,6 +3192,7 @@ class Workflow:
         self.state["allowed_actions"] = []
         self.state["operation_intent"] = None
         self._save()
+        self._say("Terminal result: status=READY_CERTIFIED")
         return self._report()
 
     def _review(
@@ -3100,6 +3207,7 @@ class Workflow:
             raise UsageError("review requires a current gate attestation")
         self.state["phase"] = "REVIEW"
         candidate = self.state["candidate_head"]
+        session_started = False
         if rotation is not None:
             if retry or mode != "FULL":
                 raise UsageError("invalid FULL audit rotation")
@@ -3154,6 +3262,7 @@ class Workflow:
                     "created_at": _now(),
                 }
                 self.state["review_sessions"].append(session)
+                session_started = True
             else:
                 self._validate_full_rotation_session(session, rotation, cohort)
             self._mark_pending_reviewer_starts_unknown(session)
@@ -3215,8 +3324,14 @@ class Workflow:
                 "created_at": _now(),
             }
             self.state["review_sessions"].append(session)
+            session_started = True
             roles = list(self.state["reviewer_roles"])
         self._save()
+        self._say(
+            f"Review session {'started' if session_started else 'resumed'}: "
+            f"reviewSessionId={session['id']} "
+            f"mode={mode} checkpoint={candidate}"
+        )
 
         if rotation is not None and session["status"] != "RUNNING":
             return self._prepare_review_finalization(session, cohort, "FULL", candidate)
@@ -3277,6 +3392,7 @@ class Workflow:
                     record,
                     None,
                     attempt.result,
+                    agent_completion_pending=True,
                 )
                 self._save()
                 continue
@@ -3426,6 +3542,7 @@ class Workflow:
         self.state["allowed_actions"] = []
         self.state["waiting_reason"] = None
         self._save()
+        self._say("Terminal result: status=READY_WITH_WAIVER")
         return self._report()
 
 
@@ -3489,6 +3606,10 @@ def _render(report: dict[str, Any], json_mode: bool) -> None:
         print(f"Allowed actions: {', '.join(report['allowedActions']) or '(none)'}")
 
 
+def _render_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -3496,9 +3617,7 @@ def main(argv: list[str] | None = None) -> int:
             args = parser.parse_args(argv)
         except SystemExit as exc:
             return 0 if exc.code == 0 else 1
-        workflow = Workflow(
-            state_dir=args.state_dir, progress=print if args.output == "text" else None
-        )
+        workflow = Workflow(state_dir=args.state_dir, progress=_render_progress)
         if args.command == "start":
             config = RunConfig(
                 cwd=args.cwd.resolve(),
