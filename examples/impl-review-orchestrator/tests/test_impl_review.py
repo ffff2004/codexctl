@@ -659,6 +659,7 @@ def test_multiple_commits_are_certified_as_one_cumulative_subject(
     )
     assert f"{report['baseCommit']}..{report['candidateHead']}" in reviewer_prompt
     assert "Do not run gates" in reviewer_prompt
+    assert "Configured gate commands:\n- git diff --quiet" in reviewer_prompt
     assert (
         "Audit correctness.\n\nSpecification:\nImplement the ticket." in reviewer_prompt
     )

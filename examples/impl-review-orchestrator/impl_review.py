@@ -2857,7 +2857,16 @@ class Workflow:
             return f"Gate summary for {self.state['candidate_head']}: no dynamic gates were configured."
         if not attestation:
             return f"Gate summary for {self.state['candidate_head']}: no valid attestation."
-        return f"Gate summary for {attestation['candidate_head']}: all {len(attestation['results'])} configured gates passed. Passing gates establish command exit only, not test sufficiency or spec compliance."
+        commands = "\n".join(
+            f"- {command}" for command in self.state["config"]["gates"]
+        )
+        return (
+            f"Gate summary for {attestation['candidate_head']}: "
+            f"all {len(attestation['results'])} configured gates passed.\n"
+            f"Configured gate commands:\n{commands}\n"
+            "Passing gates establish command exit only, not test sufficiency or "
+            "spec compliance."
+        )
 
     def _valid_attestation(self) -> bool:
         value = self.state.get("gate_attestation")
