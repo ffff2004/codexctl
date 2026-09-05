@@ -701,6 +701,32 @@ def test_reviewer_rubric_can_omit_spec_placeholder(repo: Path, tmp_path: Path):
     assert "Implement the ticket." not in reviewer_prompt
 
 
+def test_worker_prompt_includes_all_configured_gate_commands(
+    repo: Path, tmp_path: Path
+):
+    codex = ScriptedCodex(
+        repo,
+        [lambda: commit(repo, "work.txt", "work\n")],
+        ["Review passes.\nVERDICT: PASS"],
+    )
+
+    report = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
+        config(
+            repo,
+            tmp_path,
+            gates=("git diff --quiet", "git status --short"),
+        )
+    )
+
+    assert report["status"] == "READY_CERTIFIED"
+    worker_prompt = next(
+        prompt for role, prompt, _ in codex.prompts if role == "worker"
+    )
+    assert (
+        "Configured gate commands:\n- git diff --quiet\n- git status --short"
+    ) in worker_prompt
+
+
 def test_failed_full_then_delta_pass_rotates_to_fresh_full(repo: Path, tmp_path: Path):
     codex = ScriptedCodex(
         repo,

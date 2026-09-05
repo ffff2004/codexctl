@@ -2276,6 +2276,14 @@ class Workflow:
         )
         self._save()
 
+    def _configured_gate_commands(self) -> str:
+        commands = self.state["config"]["gates"]
+        if not commands:
+            return "Configured gate commands: none."
+        return "Configured gate commands:\n" + "\n".join(
+            f"- {command}" for command in commands
+        )
+
     def _compose_worker(
         self,
         context: str,
@@ -2287,7 +2295,12 @@ class Workflow:
             self.state["prompts"]["repair" if repair else "worker"]
         )
         spec = self._read_artifact_text(self.state["prompts"]["spec"])
-        pieces = [role, f"Specification:\n{spec}", f"Current context:\n{context}"]
+        pieces = [
+            role,
+            f"Specification:\n{spec}",
+            self._configured_gate_commands(),
+            f"Current context:\n{context}",
+        ]
         amendments = self._amendment_text(amendment_ids)
         if amendments:
             pieces.append(amendments)
@@ -2857,13 +2870,10 @@ class Workflow:
             return f"Gate summary for {self.state['candidate_head']}: no dynamic gates were configured."
         if not attestation:
             return f"Gate summary for {self.state['candidate_head']}: no valid attestation."
-        commands = "\n".join(
-            f"- {command}" for command in self.state["config"]["gates"]
-        )
         return (
             f"Gate summary for {attestation['candidate_head']}: "
             f"all {len(attestation['results'])} configured gates passed.\n"
-            f"Configured gate commands:\n{commands}\n"
+            f"{self._configured_gate_commands()}\n"
             "Passing gates establish command exit only, not test sufficiency or "
             "spec compliance."
         )
