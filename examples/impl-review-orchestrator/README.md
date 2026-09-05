@@ -25,8 +25,11 @@ python3.14 impl_review.py start \
   --repair-prompt prompts/repair.md \
   --reviewer standards=prompts/reviewers/standards.md \
   --reviewer spec=prompts/reviewers/spec.md \
-  --gate 'uv run pytest' \
-  --gate 'uv run pre-commit run --all-files'
+  --gate 'uv run --locked ruff format --check .' \
+  --gate 'uv run --locked ruff check .' \
+  --gate 'uv run --locked pyright' \
+  --gate 'uv run --locked pytest' \
+  --gate 'uv build'
 ```
 
 `--branch` selects the new branch; otherwise the name is

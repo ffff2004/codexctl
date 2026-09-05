@@ -47,7 +47,10 @@ of this `SKILL.md`.
      --repair-prompt prompts/repair.md \
      --reviewer standards=prompts/reviewers/standards.md \
      --reviewer spec=prompts/reviewers/spec.md \
-     --gate 'uv run pytest' \
+     --gate 'uv run --locked ruff format --check .' \
+     --gate 'uv run --locked ruff check .' \
+     --gate 'uv run --locked pyright' \
+     --gate 'uv run --locked pytest' \
      --gate 'uv build'
    ```
 
