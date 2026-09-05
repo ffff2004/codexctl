@@ -2,6 +2,4 @@ Audit the implementation against the supplied specification:
 
 {spec}
 
-Report missing or partial requirements, incorrect behavior, and material scope
-creep. Tie each finding to concrete implementation evidence and the applicable
-requirement. Keep the finding body as clear Markdown.
+Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words.
