@@ -840,7 +840,7 @@ while True:
         )
         ssh = tmp_path / "fake-ssh.py"
         ssh.write_text(
-            "#!/usr/bin/env python3\n"
+            f"#!{sys.executable}\n"
             "import os, sys\n"
             "print('ssh diagnostic', file=sys.stderr, flush=True)\n"
             f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(proxy)!r}])\n",
@@ -881,7 +881,7 @@ while True:
         )
         ssh = tmp_path / "fake-ssh-cancel.py"
         ssh.write_text(
-            "#!/usr/bin/env python3\n"
+            f"#!{sys.executable}\n"
             "import os, sys\n"
             f"os.execv({sys.executable!r}, [{sys.executable!r}, {str(proxy)!r}, "
             f"{str(ready)!r}, {str(terminated)!r}])\n",
