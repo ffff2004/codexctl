@@ -20,7 +20,7 @@ It stores nothing locally; threads live in the shared runtime.
 
 - Single source of truth:
   Link to an authoritative source instead of restating its details,
-  except README: it is intended for users/consumers, not maintainers.
+  except READMEs and SKILLs.
 - Documents describe current implemention;
   future outcomes belong in tracker specs or tickets.
 - Keep changing task state in GitHub rather than maintaining a repository copy.
@@ -63,6 +63,9 @@ uv build         # build dist/ artifacts
 - [rollout.py](src/codexctl/rollout.py) — best-effort read-only rollout reader; never raises.
 - [render.py](src/codexctl/render.py) / [cli.py](src/codexctl/cli.py) — outside the seam; output formats never
   influence execution behavior.
+
+- [Examples](examples/): example integrations and workflows.
+- [default.nix](default.nix): Nix derivation definition.
 
 ## Invariants
 
