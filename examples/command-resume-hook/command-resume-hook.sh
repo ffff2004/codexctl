@@ -71,7 +71,6 @@ fi
 job_dir=$(mktemp -d "$output_root/job.XXXXXX") || die "cannot create job directory"
 stdout_file=$job_dir/stdout.log
 stderr_file=$job_dir/stderr.log
-result_file=$job_dir/result.txt
 resume_stdout_file=$job_dir/resume.stdout.log
 resume_stderr_file=$job_dir/resume.stderr.log
 steer_stdout_file=$job_dir/steer.stdout.log
@@ -94,13 +93,6 @@ else
   command_exit_code=$?
 fi
 
-{
-  printf 'command=%s\n' "$command_text"
-  printf 'exit_code=%d\n' "$command_exit_code"
-  printf 'stdout=%s\n' "$stdout_file"
-  printf 'stderr=%s\n' "$stderr_file"
-} >"$result_file"
-
 resume_prompt=$(cat <<EOF
 An asynchronous command has finished
 
@@ -108,7 +100,6 @@ Command: $command_text
 Exit code: $command_exit_code
 stdout file: $stdout_file
 stderr file: $stderr_file
-Result metadata file: $result_file
 
 Read the stdout and stderr files as needed
 EOF

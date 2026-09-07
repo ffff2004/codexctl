@@ -58,20 +58,19 @@ the target thread ID was available, and no polling was performed afterward.
 ## Wake-up
 
 When the completion prompt resumes the thread, read the paths in that prompt
-as needed. Start with `result.txt`, then inspect `stdout.log` and `stderr.log`.
+as needed. Inspect `stdout.log` and `stderr.log`.
 
 The default job directory is `${TMPDIR:-/tmp}/codexctl-jobs/job.*`. A job
 contains:
 
 - `stdout.log` and `stderr.log` — the wrapped command's separate streams;
-- `result.txt` — the escaped command, command exit code, and stream paths;
 - `steer.stdout.log` and `steer.stderr.log` — the steer command's streams;
 - `resume.stdout.log` and `resume.stderr.log` — the resume fallback's streams;
 - `wake.result.txt` — the wake method, exit codes, and steer error code.
 
-The completion prompt contains the command, its exit code, the stdout path,
-the stderr path, and the result metadata path. Treat the command exit code as
-the command outcome; use `wake.result.txt` to diagnose notification delivery.
+The completion prompt contains the command, its exit code, and the stdout and
+stderr paths. Treat the command exit code as the command outcome; use
+`wake.result.txt` to diagnose notification delivery.
 The wrapper's own stdout is a short summary containing the job directory,
 command, wake method, wake exit code, and both command-output paths.
 
