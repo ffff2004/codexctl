@@ -31,6 +31,7 @@ from codexctl.model import (
     ApprovalPolicy,
     ApprovalsReviewer,
     CodexCtlError,
+    DoctorSnapshot,
     ErrorCode,
     Follow,
     HistorySnapshot,
@@ -489,6 +490,37 @@ class TestOutputMatrixContract:
             ["doctor", "--stdio-exec", "app"],
         )
         assert all(main(argv) == EXIT_OK for argv in commands)
+
+
+class TestDoctorExitStatus:
+    @pytest.mark.parametrize(
+        ("compatible", "expected_exit"),
+        [(True, EXIT_OK), (False, EXIT_RUNTIME)],
+    )
+    @pytest.mark.parametrize("mode", ["text", "json"])
+    def test_exit_status_reflects_compatibility(
+        self, monkeypatch, capsys, compatible, expected_exit, mode
+    ):
+        async def run(_ctl, _command):
+            return DoctorSnapshot(
+                codexctl_version="test",
+                endpoint_mode="stdio",
+                compatible=compatible,
+            )
+
+        monkeypatch.setattr(CodexCtl, "run", run)
+        argv = ["doctor", "--stdio-exec", "app"]
+        if mode == "json":
+            argv.extend(("-o", "json"))
+
+        assert main(argv) == expected_exit
+
+        output = capsys.readouterr().out
+        if mode == "json":
+            assert json.loads(output)["compatible"] is compatible
+        else:
+            verdict = "compatible" if compatible else "not compatible"
+            assert f"verdict: {verdict}\n" in output
 
 
 class TestOutputModeRejection:

@@ -64,6 +64,23 @@ done
 [[ -n $thread_id ]] || die "--thread-id or CODEX_THREAD_ID is required"
 (($# > 0)) || die "a command is required after --"
 
+doctor_output_file=$(mktemp "${TMPDIR:-/tmp}/codexctl-doctor.XXXXXX") \
+  || die "cannot create doctor output file"
+
+cleanup_doctor_output() {
+  rm -f -- "$doctor_output_file"
+}
+trap cleanup_doctor_output EXIT
+
+if "$codexctl_bin" doctor >"$doctor_output_file" 2>&1; then
+  cleanup_doctor_output
+  trap - EXIT
+else
+  doctor_exit_code=$?
+  cat "$doctor_output_file"
+  exit "$doctor_exit_code"
+fi
+
 if ! mkdir -p -- "$output_root"; then
   die "cannot create output directory: $output_root"
 fi

@@ -21,6 +21,11 @@ available:
 uv tool install git+https://github.com/ffff2004/codexctl.git
 ```
 
+Before starting the wrapped command, the wrapper runs `codexctl doctor` using
+the selected `codexctl` binary. Successful doctor output is suppressed and
+execution continues. If doctor fails, its output is printed and the wrapper
+exits with the same status without running the wrapped command.
+
 ## Handoff
 
 1. Choose the handoff only when waiting for the command would make the

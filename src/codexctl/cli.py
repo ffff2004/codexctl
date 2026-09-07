@@ -25,6 +25,7 @@ from .model import (
     ApprovalsReviewer,
     CodexCtlError,
     Doctor,
+    DoctorSnapshot,
     ErrorCode,
     EventStreamOutcome,
     Follow,
@@ -484,6 +485,8 @@ async def _execute(ctl: CodexCtl, command: Any, mode: str) -> int:
         JsonlRenderer().snapshot_records(history_to_events(outcome))
     else:
         TextRenderer().snapshot(outcome)
+    if isinstance(outcome, DoctorSnapshot) and not outcome.compatible:
+        return EXIT_RUNTIME
     return EXIT_OK
 
 

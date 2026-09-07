@@ -322,7 +322,8 @@ local `codex` CLI version for runtimes with managed lifecycle ownership, and
 rollout-based context enrichment availability when that capability is enabled.
 External and stdio runtimes omit the enrichment check. Context enrichment is
 optional and does not make a runtime incompatible.
-Exit code 0 means the checks completed (regardless of verdict).
+Exit code 0 means the runtime is compatible. A completed diagnostic whose
+verdict is `not compatible` exits 5 after printing the report.
 
 ## Output modes
 
@@ -584,7 +585,7 @@ Stable, codexctl-owned codes carried in all structured errors:
 | 2 | Usage error (argument/output-mode/selector problems) |
 | 3 | Domain conflict (see error-code table) |
 | 4 | The followed turn failed or was interrupted (unreachable for `follow --persist`) |
-| 5 | Runtime/protocol error |
+| 5 | Runtime/protocol error, including an incompatible `doctor` verdict |
 | 130 | Local interruption (Ctrl+C). Never sends a turn interrupt. |
 
 `follow --persist` exits only 130 (local interruption) or 5 (connection
