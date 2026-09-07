@@ -104,7 +104,10 @@ wake_result_file=$job_dir/wake.result.txt
 printf -v command_text '%q ' "$@"
 command_text=${command_text% }
 
-if "$@" >"$stdout_file" 2>"$stderr_file"; then
+# Capture bash's `time` output separately so it does not pollute the command's
+# stderr artifact.
+TIMEFORMAT='%R'
+if command_wall_clock_time=$( { time "$@" >"$stdout_file" 2>"$stderr_file"; } 2>&1); then
   command_exit_code=0
 else
   command_exit_code=$?
@@ -115,6 +118,7 @@ An asynchronous command has finished
 
 Command: $command_text
 Exit code: $command_exit_code
+Wall clock time: ${command_wall_clock_time}s
 stdout file: $stdout_file
 stderr file: $stderr_file
 
