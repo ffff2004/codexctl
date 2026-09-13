@@ -34,9 +34,9 @@ python3.14 impl_review.py start \
 
 `--branch` selects the new branch; otherwise the name is
 `impl-review/<run-id>`. `--max-auto-worker-rounds` defaults to 2 and counts the
-initial Worker. `--worker-approve-for-me` is a run-level, Worker-only switch.
+initial Worker. Workers always start with `approve for me` enabled.
 `--gate-timeout-seconds` defaults to 1800 for each gate. Prompt, rubric, gate,
-model, effort, isolation, and approval policy inputs are snapshotted at start.
+model, effort, isolation, and approval policy are snapshotted at start.
 If a reviewer rubric contains the optional `{spec}` placeholder, the supplied
 specification is injected there when the reviewer prompt is composed.
 

@@ -169,7 +169,7 @@ class RunConfig:
     reviewers: tuple[tuple[str, Path], ...]
     gates: tuple[str, ...] = ()
     branch: str | None = None
-    worker_approve_for_me: bool = False
+    worker_approve_for_me: bool = True
     max_auto_worker_rounds: int = 2
     gate_timeout_seconds: int = 1800
     model: str | None = None
@@ -3827,7 +3827,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--gate", action="append", default=[])
     start.add_argument("--branch")
-    start.add_argument("--worker-approve-for-me", action="store_true")
     start.add_argument("--max-auto-worker-rounds", type=int, default=2)
     start.add_argument("--gate-timeout-seconds", type=int, default=1800)
     start.add_argument("--model")
@@ -3884,7 +3883,6 @@ def main(argv: list[str] | None = None) -> int:
                 reviewers=tuple(args.reviewer),
                 gates=tuple(args.gate),
                 branch=args.branch,
-                worker_approve_for_me=args.worker_approve_for_me,
                 max_auto_worker_rounds=args.max_auto_worker_rounds,
                 gate_timeout_seconds=args.gate_timeout_seconds,
                 model=args.model,

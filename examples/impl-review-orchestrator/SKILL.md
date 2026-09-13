@@ -55,10 +55,9 @@ of this `SKILL.md`.
    ```
 
    `--branch` chooses the created work branch; otherwise it is
-   `impl-review/<run-id>`. `--max-auto-worker-rounds` defaults to two. Add
-   `--worker-approve-for-me` only when the Worker is authorized to approve its
-   own requested operations. `--model` and `--effort` apply to every started
-   agent. Capture the emitted run ID and state directory.
+   `impl-review/<run-id>`. `--max-auto-worker-rounds` defaults to two. Workers
+   always start with `approve for me` enabled. `--model` and `--effort` apply to
+   every started agent. Capture the emitted run ID and state directory.
 
    Completion: stdout reports the run ID, branch, candidate checkpoint, and
    either a terminal status or a waiting status. Progress belongs on stderr;

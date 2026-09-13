@@ -167,6 +167,8 @@ class ScriptedCodex:
 
     def start(self, *, prompt, cwd, role, approve, model, effort):
         assert cwd == self.repo
+        if role == "worker":
+            assert approve
         assert role != "reviewer" or not approve
         return self._receipt(role, prompt)
 
@@ -334,7 +336,7 @@ class BlockingStartCodex:
 
     def start(self, *, prompt, cwd, role, approve, model, effort):
         assert role == "worker"
-        assert not approve
+        assert approve
         self.ready_path.touch()
         while not self.release_path.exists():
             time.sleep(0.01)
