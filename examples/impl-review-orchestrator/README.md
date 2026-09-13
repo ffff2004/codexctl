@@ -42,16 +42,32 @@ specification is injected there when the reviewer prompt is composed.
 
 Workers run in `workspace-write`; reviewers run in `read-only`. Every start and
 resume uses `--no-goals --no-agents`. Agent starts detach first, then the
-example verifies the active turn ID before following the saved target as JSONL.
-Follow is observational and sends no isolation overrides. A target that
-already finished is recovered from JSONL history; a different active turn is
-surfaced as `UNEXPECTED_CONTINUATION` and is never followed. Reviewers inspect
-the exact commit range themselves and do not run configured gates.
+example follows the thread with `follow --persist --replay-turns :`. The full
+history replay and live subscription form one deduplicated stream, so recovery
+reconstructs prior evidence without missing a turn that finishes while the
+follower attaches. Follow is observational and sends no isolation overrides.
+Reviewers inspect the exact commit range themselves and do not run configured
+gates.
+
+An agent attempt is one logical execution initiated by an orchestrator start or
+resume. It may span multiple turns, including continuation turns created after
+a Worker hands off a long command through the
+[`command-resume-hook`](../command-resume-hook/). Each attempt receives a fresh
+128-bit correlation token. A Worker finishes only when its final agent message
+ends with `WORKER_DONE: TOKEN` and that same turn completes successfully. A
+reviewer analogously ends with `REVIEW_RESULT: TOKEN PASS` or
+`REVIEW_RESULT: TOKEN FAIL`. The token-bound marker is semantic completion;
+leading and trailing whitespace on its line is ignored. The marker otherwise
+must be the unique last non-empty line of the final agent message in its turn.
+The Worker result must still pass the branch, clean-checkout, changed-HEAD, and
+linear-history checks. A successful intermediate turn without the marker leaves
+the persistent follower waiting for another turn. There is deliberately no idle
+timeout.
 
 While `start` or `resume` is running, concise operational progress is written
 to stderr and flushed immediately. The initial or loaded run ID and state path
 appear before long work. Once an agent's detach receipt is durable, progress
-includes its Worker or reviewer role, attempt ID, thread ID, and turn ID, so a
+includes its Worker or reviewer role, attempt ID, thread ID, and initial turn ID, so a
 caller can observe it independently with `codexctl follow THREAD_ID`. Progress
 also marks checkpoint, gate, review, waiting, and terminal boundaries and
 references artifacts instead of printing prompts, model messages, or raw gate
@@ -95,7 +111,10 @@ State defaults to
 atomic, advancement uses a cross-process run lock, and `inspect` is read-only.
 The artifact manifest records SHA-256 digests for prompt snapshots, amendments,
 gate streams, agent JSONL, and final messages. Agent artifacts also identify
-their owning attempt or review session, role, and available thread/turn IDs.
+their owning attempt or review session, role, initial and terminal turn IDs,
+and every observed turn ID. Attempt state remains `RUNNING` across successful
+intermediate turns and becomes terminal only after marker-bound completion or
+an explicit failed/interrupted outcome.
 Git commit identity remains the repository's native object ID.
 
 The orchestrator never creates a worktree, adopts external commits, commits on

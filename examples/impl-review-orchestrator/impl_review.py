@@ -27,7 +27,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterator, NoReturn, Protocol, TypeVar
 
-STATE_VERSION = 3
+STATE_VERSION = 4
 TERMINAL_STATES = {"READY_CERTIFIED", "READY_WITH_WAIVER"}
 ACTIONS = {
     "START_NEXT_ROUND",
@@ -38,7 +38,6 @@ ACTIONS = {
     "CONTINUE_WORKER",
     "ACCEPT_WORKER_RESULT",
 }
-VERDICT_RE = re.compile(r"^VERDICT: (PASS|FAIL)$")
 BLOCKING_REVIEW_STATUSES = {"FAILED", "INCOMPLETE"}
 WORKER_ACCEPT_STATUSES = {"failed", "interrupted"}
 WORKER_CONTINUE_STATUSES = {
@@ -82,15 +81,59 @@ as a finding. Do not modify the checkout.
 
 Review yourself, do not delegate to sub-agents or `codexctl`.
 
-The unique last line of your final response must be exactly one of:
-VERDICT: PASS
-VERDICT: FAIL"""
+{completion_instruction}"""
 
 WORKER_FOOTER = """Workflow invariants: stay on the current branch; keep history
 linear and append-only; do not amend, rebase, merge, reset, push, disable hooks,
 or bypass verification. Finish with a clean checkout. Commit every implemented
 change (one or more commits are allowed). If the requested work cannot be
-implemented, make no changes and create no commit, then explain why."""
+implemented, make no changes and create no commit, then explain why.
+
+{completion_instruction}"""
+
+
+class AgentRole(StrEnum):
+    WORKER = "worker"
+    REVIEWER = "reviewer"
+
+
+class ReviewVerdict(StrEnum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+
+
+def _render_completion_marker(
+    role: AgentRole,
+    completion_token: str,
+    verdict: ReviewVerdict | None = None,
+) -> str:
+    if role is AgentRole.WORKER:
+        if verdict is not None:
+            raise ValueError("Worker completion markers do not have verdicts")
+        return f"WORKER_DONE: {completion_token}"
+    if verdict is None:
+        raise ValueError("Reviewer completion markers require a verdict")
+    return f"REVIEW_RESULT: {completion_token} {verdict}"
+
+
+def _completion_instruction(role: AgentRole, completion_token: str) -> str:
+    if role is AgentRole.WORKER:
+        marker = _render_completion_marker(role, completion_token)
+        return f"""Only after every asynchronous command result has been consumed,
+all requested work and verification are finished, every change is committed,
+and the checkout is clean, make the unique last non-empty line of your final
+response exactly:
+{marker}
+
+Do not emit or quote that line before the work is genuinely complete."""
+    pass_marker = _render_completion_marker(role, completion_token, ReviewVerdict.PASS)
+    fail_marker = _render_completion_marker(role, completion_token, ReviewVerdict.FAIL)
+    return f"""Only after the review is genuinely complete, make the unique last
+non-empty line of your final response exactly one of:
+{pass_marker}
+{fail_marker}
+
+Do not emit or quote either line before the review is genuinely complete."""
 
 
 class OrchestratorError(Exception):
@@ -171,6 +214,8 @@ class AgentResult:
     messages: list[str] = field(default_factory=list)
     observed_turn_ids: list[str] = field(default_factory=list)
     error: str | None = None
+    terminal_turn_id: str | None = None
+    verdict: str | None = None
 
     @property
     def final_message(self) -> str | None:
@@ -345,7 +390,8 @@ class ArtifactStore:
                 "review_session_id": owner.get("review_session_id"),
                 "role": owner.get("role"),
                 "thread_id": owner.get("thread_id"),
-                "turn_id": owner.get("turn_id"),
+                "initial_turn_id": owner.get("initial_turn_id"),
+                "terminal_turn_id": owner.get("terminal_turn_id"),
                 "observed_turn_ids": list(owner.get("observed_turn_ids", [])),
             }
         )
@@ -378,8 +424,22 @@ class CodexPort(Protocol):
         effort: str | None,
     ) -> DetachReceipt: ...
     def resume(self, *, thread_id: str, prompt: str) -> DetachReceipt: ...
-    def follow(self, *, thread_id: str, turn_id: str) -> AgentResult: ...
-    def history(self, *, thread_id: str, turn_id: str) -> AgentResult: ...
+    def follow(
+        self,
+        *,
+        thread_id: str,
+        initial_turn_id: str,
+        completion_token: str,
+        role: str,
+    ) -> AgentResult: ...
+    def history(
+        self,
+        *,
+        thread_id: str,
+        initial_turn_id: str,
+        completion_token: str,
+        role: str,
+    ) -> AgentResult: ...
 
 
 def _parse_detach(raw: bytes) -> DetachReceipt:
@@ -395,12 +455,46 @@ def _event_turn_id(event: dict[str, Any]) -> str | None:
     return str(value) if value else None
 
 
+def _parse_completion_marker(
+    messages: list[str], completion_token: str, role: AgentRole
+) -> tuple[bool, str | None]:
+    message_lines = [
+        [line.strip() for line in message.splitlines() if line.strip()]
+        for message in messages
+    ]
+    final_lines = message_lines[-1] if message_lines else []
+    if role is AgentRole.WORKER:
+        expected = _render_completion_marker(role, completion_token)
+        count = sum(lines.count(expected) for lines in message_lines)
+        valid = bool(final_lines and final_lines[-1] == expected and count == 1)
+        return valid, None
+    expected = {
+        _render_completion_marker(role, completion_token, verdict): verdict
+        for verdict in ReviewVerdict
+    }
+    matches = [
+        expected[line] for lines in message_lines for line in lines if line in expected
+    ]
+    final_verdict = expected.get(final_lines[-1]) if final_lines else None
+    if final_verdict is None or len(matches) != 1:
+        return False, None
+    return True, final_verdict.value
+
+
 def parse_agent_jsonl(
-    raw: bytes, target_turn: str, *, reject_other_turns: bool = True
+    raw: bytes,
+    initial_turn_id: str,
+    completion_token: str,
+    role: str,
 ) -> AgentResult:
+    try:
+        agent_role = AgentRole(role)
+    except ValueError:
+        return AgentResult("protocol_error", raw, error=f"unknown agent role: {role}")
     messages: list[str] = []
     turns: list[str] = []
-    status: str | None = None
+    messages_by_turn: dict[str, list[str]] = {}
+    in_attempt = False
     try:
         lines = raw.decode().splitlines()
     except UnicodeDecodeError as exc:
@@ -419,14 +513,12 @@ def parse_agent_jsonl(
                 "protocol_error", raw, error=f"JSONL line {number} is not an object"
             )
         turn_id = _event_turn_id(event)
-        if (
-            turn_id
-            and (reject_other_turns or turn_id == target_turn)
-            and turn_id not in turns
-        ):
-            turns.append(turn_id)
-        if turn_id != target_turn:
+        if turn_id == initial_turn_id:
+            in_attempt = True
+        if not in_attempt or turn_id is None:
             continue
+        if turn_id not in turns:
+            turns.append(turn_id)
         if event.get("type") == "item/completed":
             item = event.get("item")
             if (
@@ -435,13 +527,57 @@ def parse_agent_jsonl(
                 and isinstance(item.get("text"), str)
             ):
                 messages.append(item["text"])
+                messages_by_turn.setdefault(turn_id, []).append(item["text"])
         if event.get("type") == "turn/completed":
-            status = str(event.get("status") or "completed")
-    if reject_other_turns and any(turn != target_turn for turn in turns):
-        return AgentResult(
-            "unexpected_continuation", raw, messages, turns, "observed another turn"
-        )
-    return AgentResult(status or "unknown", raw, messages, turns)
+            status = event.get("status")
+            if not isinstance(status, str) or status not in {
+                "completed",
+                "failed",
+                "interrupted",
+            }:
+                return AgentResult(
+                    "protocol_error",
+                    raw,
+                    messages,
+                    turns,
+                    error=f"JSONL line {number} has invalid turn completion status",
+                    terminal_turn_id=turn_id,
+                )
+            if status in {"failed", "interrupted"}:
+                return AgentResult(
+                    status,
+                    raw,
+                    messages,
+                    turns,
+                    terminal_turn_id=turn_id,
+                )
+            turn_messages = messages_by_turn.get(turn_id, [])
+            if turn_messages:
+                valid, verdict = _parse_completion_marker(
+                    turn_messages, completion_token, agent_role
+                )
+                if valid:
+                    return AgentResult(
+                        "completed",
+                        raw,
+                        messages,
+                        turns,
+                        terminal_turn_id=turn_id,
+                        verdict=verdict,
+                    )
+    return AgentResult("running", raw, messages, turns)
+
+
+def _incomplete_agent_result(evidence: AgentResult, error: str) -> AgentResult:
+    return AgentResult(
+        "unknown",
+        evidence.raw_jsonl,
+        list(evidence.messages),
+        list(evidence.observed_turn_ids),
+        error,
+        evidence.terminal_turn_id,
+        evidence.verdict,
+    )
 
 
 class CodexctlAdapter:
@@ -455,6 +591,7 @@ class CodexctlAdapter:
         self.executable = executable
         self.cwd = cwd or Path.cwd()
         self._subprocess_runner = subprocess_runner or subprocess.run
+        self._injected_runner = subprocess_runner is not None
 
     def _run(self, argv: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
         try:
@@ -531,87 +668,95 @@ class CodexctlAdapter:
             )
         return _parse_detach(result.stdout)
 
-    def follow(self, *, thread_id: str, turn_id: str) -> AgentResult:
-        status = self._run(
-            [self.executable, "status", thread_id, "-o", "json"], self.cwd
-        )
-        active_turn_id: str | None = None
-        if status.returncode == 0:
-            try:
-                document = json.loads(status.stdout)
-                value = document.get("activeTurnId")
-                active_turn_id = str(value) if value else None
-            except AttributeError, UnicodeDecodeError, json.JSONDecodeError:
-                pass
-
-        if active_turn_id != turn_id:
-            recovered = self.history(thread_id=thread_id, turn_id=turn_id)
-            if active_turn_id:
-                observed = list(recovered.observed_turn_ids)
-                if active_turn_id not in observed:
-                    observed.append(active_turn_id)
-                return AgentResult(
-                    "unexpected_continuation",
-                    recovered.raw_jsonl,
-                    recovered.messages,
-                    observed,
-                    f"active turn {active_turn_id} differs from target {turn_id}",
-                )
-            return recovered
-
-        result = self._run(
-            [
-                self.executable,
-                "follow",
-                thread_id,
-                "-o",
-                "jsonl",
-            ],
-            self.cwd,
-        )
-        if result.returncode:
-            try:
-                recovered = self.history(thread_id=thread_id, turn_id=turn_id)
-            except OrchestratorError as exc:
-                recovered = AgentResult("unknown", error=str(exc))
-            if recovered.status != "unknown":
-                return recovered
+    def follow(
+        self,
+        *,
+        thread_id: str,
+        initial_turn_id: str,
+        completion_token: str,
+        role: str,
+    ) -> AgentResult:
+        argv = [
+            self.executable,
+            "follow",
+            thread_id,
+            "--persist",
+            "--replay-turns",
+            ":",
+            "-o",
+            "jsonl",
+        ]
+        if self._injected_runner:
+            result = self._run(argv, self.cwd)
+            parsed = parse_agent_jsonl(
+                result.stdout, initial_turn_id, completion_token, role
+            )
+            if parsed.status != "running":
+                return parsed
             stderr = result.stderr.decode("utf-8", "replace").strip()
-            error = (
-                stderr or f"codexctl follow failed with exit code {result.returncode}"
+            return _incomplete_agent_result(
+                parsed, stderr or "persistent follow ended before attempt completion"
             )
-            if recovered.error:
-                error = f"{error}; {recovered.error}"
-            return AgentResult("unknown", result.stdout, error=error)
-        parsed = parse_agent_jsonl(result.stdout, turn_id)
-        if parsed.status == "unexpected_continuation":
-            recovered = self.history(thread_id=thread_id, turn_id=turn_id)
-            observed = list(recovered.observed_turn_ids)
-            for observed_turn_id in parsed.observed_turn_ids:
-                if observed_turn_id not in observed:
-                    observed.append(observed_turn_id)
-            return AgentResult(
-                "unexpected_continuation",
-                parsed.raw_jsonl,
-                recovered.messages,
-                observed,
-                parsed.error,
-            )
-        if parsed.status == "unknown":
-            recovered = self.history(thread_id=thread_id, turn_id=turn_id)
-            if recovered.status != "unknown":
-                return recovered
-        return parsed
 
-    def history(self, *, thread_id: str, turn_id: str) -> AgentResult:
+        raw = bytearray()
+        with tempfile.TemporaryFile() as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    cwd=self.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise OrchestratorError(f"cannot invoke codexctl: {exc}") from exc
+            assert process.stdout is not None
+            completed: AgentResult | None = None
+            try:
+                for line in process.stdout:
+                    raw.extend(line)
+                    parsed = parse_agent_jsonl(
+                        bytes(raw), initial_turn_id, completion_token, role
+                    )
+                    if parsed.status != "running":
+                        completed = parsed
+                        process.send_signal(signal.SIGINT)
+                        break
+            except BaseException:
+                process.send_signal(signal.SIGINT)
+                process.wait()
+                raise
+            remaining, _ = process.communicate()
+            raw.extend(remaining)
+            if completed is not None:
+                completed.raw_jsonl = bytes(raw)
+                return completed
+            stderr_file.seek(0)
+            error = stderr_file.read().decode("utf-8", "replace").strip()
+        parsed = parse_agent_jsonl(bytes(raw), initial_turn_id, completion_token, role)
+        return _incomplete_agent_result(
+            parsed, error or f"persistent follow exited with code {process.returncode}"
+        )
+
+    def history(
+        self,
+        *,
+        thread_id: str,
+        initial_turn_id: str,
+        completion_token: str,
+        role: str,
+    ) -> AgentResult:
         result = self._run(
             [self.executable, "history", thread_id, "-o", "jsonl"], self.cwd
         )
+        parsed = parse_agent_jsonl(
+            result.stdout, initial_turn_id, completion_token, role
+        )
         if result.returncode:
-            return AgentResult("unknown", error="target turn history unavailable")
-        parsed = parse_agent_jsonl(result.stdout, turn_id, reject_other_turns=False)
-        if parsed.status == "unknown":
-            parsed.error = "target turn history unavailable"
+            return _incomplete_agent_result(parsed, "attempt history unavailable")
+        if parsed.status == "running":
+            return _incomplete_agent_result(parsed, "attempt has not completed")
         return parsed
 
 
@@ -683,12 +828,11 @@ class IntentKind(StrEnum):
 
 class AttemptStatus(StrEnum):
     START_INTENT = "START_INTENT"
-    DETACHED = "DETACHED"
+    RUNNING = "RUNNING"
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     UNKNOWN = "unknown"
-    UNEXPECTED_CONTINUATION = "unexpected_continuation"
     PROTOCOL_ERROR = "protocol_error"
 
 
@@ -711,7 +855,6 @@ class ReviewRecordStatus(StrEnum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     UNKNOWN = "unknown"
-    UNEXPECTED_CONTINUATION = "unexpected_continuation"
     PROTOCOL_ERROR = "protocol_error"
     AMBIGUOUS = "ambiguous"
 
@@ -785,7 +928,9 @@ class PersistedAttempt:
     role: str
     status: AttemptStatus
     thread_id: str | None
-    turn_id: str | None
+    initial_turn_id: str | None
+    terminal_turn_id: str | None
+    observed_turn_ids: tuple[str, ...]
     cohort: str | None
     review_session: str | None
     reviewer_role: str | None
@@ -797,7 +942,9 @@ class PersistedRecord:
     status: ReviewRecordStatus
     attempt_id: str
     thread_id: str | None
-    turn_id: str | None
+    initial_turn_id: str | None
+    terminal_turn_id: str | None
+    observed_turn_ids: tuple[str, ...]
     verdict: str | None
 
 
@@ -943,15 +1090,17 @@ def _parse_intent(value: Any) -> PersistedIntent | None:
             "review_session_id",
             "reviewer_role",
             "thread_id",
-            "turn_id",
+            "initial_turn_id",
+            "terminal_turn_id",
             "observed_turn_ids",
             "result_status",
             "message",
             "messages",
             "raw_jsonl",
             "error",
+            "verdict",
         },
-        IntentKind.AGENT_FOLLOW: {"attempt_id", "thread_id", "turn_id"},
+        IntentKind.AGENT_FOLLOW: {"attempt_id", "thread_id"},
     }[kind]
     _state_required(data, required, path)
     for key in required - {
@@ -965,6 +1114,8 @@ def _parse_intent(value: Any) -> PersistedIntent | None:
         "raw_jsonl",
         "error",
         "mode",
+        "terminal_turn_id",
+        "verdict",
     }:
         _state_string(data[key], f"{path}.{key}")
     if kind is IntentKind.GATE:
@@ -985,12 +1136,13 @@ def _parse_intent(value: Any) -> PersistedIntent | None:
         _state_optional_string(data["review_session_id"], f"{path}.review_session_id")
         _state_optional_string(data["reviewer_role"], f"{path}.reviewer_role")
         _state_string(data["thread_id"], f"{path}.thread_id")
-        _state_string(data["turn_id"], f"{path}.turn_id")
+        _state_string(data["initial_turn_id"], f"{path}.initial_turn_id")
+        _state_optional_string(data["terminal_turn_id"], f"{path}.terminal_turn_id")
         _state_strings(data["observed_turn_ids"], f"{path}.observed_turn_ids")
         terminal_status = _state_enum(
             AttemptStatus, data["result_status"], f"{path}.result_status"
         )
-        if terminal_status in {AttemptStatus.START_INTENT, AttemptStatus.DETACHED}:
+        if terminal_status in {AttemptStatus.START_INTENT, AttemptStatus.RUNNING}:
             _state_error(f"{path}.result_status", "must be terminal")
         if data["message"] is not None and not isinstance(data["message"], str):
             _state_error(f"{path}.message", "expected a string or null")
@@ -1001,6 +1153,18 @@ def _parse_intent(value: Any) -> PersistedIntent | None:
         except ValueError:
             _state_error(f"{path}.raw_jsonl", "must contain hexadecimal data")
         _state_optional_string(data["error"], f"{path}.error")
+        if data["verdict"] is not None and data["verdict"] not in {"PASS", "FAIL"}:
+            _state_error(f"{path}.verdict", "must be PASS, FAIL, or null")
+        if role == "worker" and data["verdict"] is not None:
+            _state_error(f"{path}.verdict", "Worker attempts cannot have a verdict")
+        if (
+            role == "reviewer"
+            and terminal_status is AttemptStatus.COMPLETED
+            and data["verdict"] is None
+        ):
+            _state_error(
+                f"{path}.verdict", "completed Reviewer attempts need a verdict"
+            )
         if role == "worker":
             _state_string(_state_field(data, "input_head", path), f"{path}.input_head")
             checkout = _state_object(
@@ -1029,7 +1193,9 @@ def _parse_attempts(value: Any) -> list[PersistedAttempt]:
         "role",
         "status",
         "thread_id",
-        "turn_id",
+        "initial_turn_id",
+        "terminal_turn_id",
+        "completion_token",
         "cohort",
         "review_session",
         "reviewer_role",
@@ -1038,6 +1204,7 @@ def _parse_attempts(value: Any) -> list[PersistedAttempt]:
     }
     result: list[PersistedAttempt] = []
     seen: set[str] = set()
+    seen_tokens: set[str] = set()
     for index, value in enumerate(value):
         path = f"state.attempts[{index}]"
         data = _state_object(value, path)
@@ -1051,25 +1218,44 @@ def _parse_attempts(value: Any) -> list[PersistedAttempt]:
             _state_error(f"{path}.role", "unknown role")
         status = _state_enum(AttemptStatus, data["status"], f"{path}.status")
         thread_id = _state_optional_string(data["thread_id"], f"{path}.thread_id")
-        turn_id = _state_optional_string(data["turn_id"], f"{path}.turn_id")
-        if (thread_id is None) != (turn_id is None):
-            _state_error(path, "thread_id and turn_id must be present together")
+        initial_turn_id = _state_optional_string(
+            data["initial_turn_id"], f"{path}.initial_turn_id"
+        )
+        terminal_turn_id = _state_optional_string(
+            data["terminal_turn_id"], f"{path}.terminal_turn_id"
+        )
+        completion_token = _state_string(
+            data["completion_token"], f"{path}.completion_token"
+        )
+        if not re.fullmatch(r"[0-9a-f]{32}", completion_token):
+            _state_error(f"{path}.completion_token", "expected a 128-bit hex token")
+        if completion_token in seen_tokens:
+            _state_error(f"{path}.completion_token", "is duplicated")
+        seen_tokens.add(completion_token)
+        if (thread_id is None) != (initial_turn_id is None):
+            _state_error(path, "thread_id and initial_turn_id must be present together")
         completed_at = _state_optional_string(
             data["completed_at"], f"{path}.completed_at"
         )
         if status is AttemptStatus.START_INTENT and (
-            thread_id is not None or completed_at is not None
+            thread_id is not None
+            or terminal_turn_id is not None
+            or completed_at is not None
         ):
             _state_error(path, "START_INTENT cannot have completion evidence")
-        if status is AttemptStatus.DETACHED and (
-            thread_id is None or completed_at is not None
+        if status is AttemptStatus.RUNNING and (
+            thread_id is None
+            or terminal_turn_id is not None
+            or completed_at is not None
         ):
-            _state_error(path, "DETACHED requires an unfinished thread receipt")
+            _state_error(path, "RUNNING requires an unfinished thread receipt")
         if (
-            status not in {AttemptStatus.START_INTENT, AttemptStatus.DETACHED}
+            status not in {AttemptStatus.START_INTENT, AttemptStatus.RUNNING}
             and completed_at is None
         ):
             _state_error(path, "terminal attempts require completed_at")
+        if status is AttemptStatus.COMPLETED and terminal_turn_id is None:
+            _state_error(path, "completed attempts require terminal_turn_id")
         cohort = _state_optional_string(data["cohort"], f"{path}.cohort")
         review_session = _state_optional_string(
             data["review_session"], f"{path}.review_session"
@@ -1087,14 +1273,24 @@ def _parse_attempts(value: Any) -> list[PersistedAttempt]:
             cohort is None or review_session is None or reviewer_role is None
         ):
             _state_error(path, "Reviewer ownership is incomplete")
-        _state_strings(data["observed_turn_ids"], f"{path}.observed_turn_ids")
+        observed = _state_strings(
+            data["observed_turn_ids"], f"{path}.observed_turn_ids"
+        )
+        if len(observed) != len(set(observed)):
+            _state_error(f"{path}.observed_turn_ids", "contains duplicates")
+        if observed and observed[0] != initial_turn_id:
+            _state_error(f"{path}.observed_turn_ids", "must begin with initial_turn_id")
+        if terminal_turn_id is not None and terminal_turn_id not in observed:
+            _state_error(f"{path}.terminal_turn_id", "was not observed")
         result.append(
             PersistedAttempt(
                 attempt_id,
                 role,
                 status,
                 thread_id,
-                turn_id,
+                initial_turn_id,
+                terminal_turn_id,
+                tuple(observed),
                 cohort,
                 review_session,
                 reviewer_role,
@@ -1134,7 +1330,8 @@ def _parse_record(value: Any, role: str, path: str) -> PersistedRecord:
             "status",
             "attempt_id",
             "thread_id",
-            "turn_id",
+            "initial_turn_id",
+            "terminal_turn_id",
             "observed_turn_ids",
             "message_artifact",
             "message",
@@ -1148,15 +1345,24 @@ def _parse_record(value: Any, role: str, path: str) -> PersistedRecord:
     if verdict is not None and verdict not in {"PASS", "FAIL"}:
         _state_error(f"{path}.verdict", "must be PASS, FAIL, or null")
     message = _state_string(data["message"], f"{path}.message", allow_empty=True)
+    thread_id = _state_optional_string(data["thread_id"], f"{path}.thread_id")
+    initial_turn_id = _state_optional_string(
+        data["initial_turn_id"], f"{path}.initial_turn_id"
+    )
+    terminal_turn_id = _state_optional_string(
+        data["terminal_turn_id"], f"{path}.terminal_turn_id"
+    )
     if status is ReviewRecordStatus.COMPLETED and (not message or verdict is None):
         _state_error(path, "completed records require a message and verdict")
+    if status is ReviewRecordStatus.COMPLETED and terminal_turn_id is None:
+        _state_error(path, "completed records require terminal_turn_id")
     if status is not ReviewRecordStatus.COMPLETED and verdict is not None:
         _state_error(f"{path}.verdict", "non-completed records cannot have a verdict")
-    thread_id = _state_optional_string(data["thread_id"], f"{path}.thread_id")
-    turn_id = _state_optional_string(data["turn_id"], f"{path}.turn_id")
-    if (thread_id is None) != (turn_id is None):
-        _state_error(path, "thread_id and turn_id must be present together")
-    _state_strings(data["observed_turn_ids"], f"{path}.observed_turn_ids")
+    if (thread_id is None) != (initial_turn_id is None):
+        _state_error(path, "thread_id and initial_turn_id must be present together")
+    observed = _state_strings(data["observed_turn_ids"], f"{path}.observed_turn_ids")
+    if len(observed) != len(set(observed)):
+        _state_error(f"{path}.observed_turn_ids", "contains duplicates")
     _state_optional_string(data["message_artifact"], f"{path}.message_artifact")
     _state_optional_string(data["error"], f"{path}.error")
     return PersistedRecord(
@@ -1164,7 +1370,9 @@ def _parse_record(value: Any, role: str, path: str) -> PersistedRecord:
         status,
         _state_string(data["attempt_id"], f"{path}.attempt_id"),
         thread_id,
-        turn_id,
+        initial_turn_id,
+        terminal_turn_id,
+        tuple(observed),
         verdict,
     )
 
@@ -1222,7 +1430,9 @@ def _parse_review_sessions(
                 attempt.review_session != session_id
                 or attempt.reviewer_role != role
                 or attempt.thread_id != record.thread_id
-                or attempt.turn_id != record.turn_id
+                or attempt.initial_turn_id != record.initial_turn_id
+                or attempt.terminal_turn_id != record.terminal_turn_id
+                or attempt.observed_turn_ids != record.observed_turn_ids
             ):
                 _state_error(f"{path}.results.{role}", "does not match its attempt")
             records.append(record)
@@ -1329,18 +1539,19 @@ def _validate_intent(
             _state_error(path, "does not identify a pending attempt")
     elif intent.kind is IntentKind.AGENT_FOLLOW:
         if (
-            attempt.status is not AttemptStatus.DETACHED
+            attempt.status is not AttemptStatus.RUNNING
             or data["thread_id"] != attempt.thread_id
-            or data["turn_id"] != attempt.turn_id
         ):
-            _state_error(path, "does not match a detached attempt")
+            _state_error(path, "does not match a running attempt")
     elif (
         data["role"] != attempt.role
         or data["result_status"] != attempt.status.value
         or data["thread_id"] != attempt.thread_id
-        or data["turn_id"] != attempt.turn_id
+        or data["initial_turn_id"] != attempt.initial_turn_id
+        or data["terminal_turn_id"] != attempt.terminal_turn_id
         or data["review_session_id"] != attempt.review_session
         or data["reviewer_role"] != attempt.reviewer_role
+        or data["observed_turn_ids"] != list(attempt.observed_turn_ids)
     ):
         _state_error(path, "does not match terminal attempt evidence")
 
@@ -1394,15 +1605,6 @@ def _policy_digest(*parts: str) -> str:
     return _digest("\0".join(parts).encode())
 
 
-def _verdict(message: str) -> str:
-    lines = [line.strip() for line in message.splitlines() if line.strip()]
-    matches = [VERDICT_RE.fullmatch(line) for line in lines]
-    verdicts = [match.group(1) for match in matches if match]
-    if not lines or not VERDICT_RE.fullmatch(lines[-1]) or len(verdicts) != 1:
-        raise UsageError("reviewer response has an ambiguous verdict")
-    return verdicts[0]
-
-
 class Workflow:
     """Small public workflow seam.
 
@@ -1446,7 +1648,7 @@ class Workflow:
         self._say(
             f"Agent detached: role={self._agent_role(record)} "
             f"attemptId={record['id']} threadId={record['thread_id']} "
-            f"turnId={record['turn_id']}"
+            f"initialTurnId={record['initial_turn_id']}"
         )
 
     def _say_agent_completed(self, record: dict[str, Any]) -> None:
@@ -1501,7 +1703,8 @@ class Workflow:
                     "review_session_id": owner.get("review_session_id"),
                     "role": owner.get("role"),
                     "thread_id": owner.get("thread_id"),
-                    "turn_id": owner.get("turn_id"),
+                    "initial_turn_id": owner.get("initial_turn_id"),
+                    "terminal_turn_id": owner.get("terminal_turn_id"),
                     "observed_turn_ids": list(owner.get("observed_turn_ids", [])),
                 }
             )
@@ -1534,7 +1737,7 @@ class Workflow:
             detached = [
                 item
                 for item in self.state.get("attempts", [])
-                if item["status"] == "DETACHED"
+                if item["status"] == "RUNNING"
             ]
             if detached:
                 pass
@@ -1675,7 +1878,8 @@ class Workflow:
             )
             if (
                 attempt.get("thread_id") != intent.get("thread_id")
-                or attempt.get("turn_id") != intent.get("turn_id")
+                or attempt.get("initial_turn_id") != intent.get("initial_turn_id")
+                or attempt.get("terminal_turn_id") != intent.get("terminal_turn_id")
                 or attempt.get("status") != intent.get("result_status")
                 or attempt.get("role") != intent.get("role")
             ):
@@ -1696,8 +1900,12 @@ class Workflow:
                     intent.get("observed_turn_ids", attempt["observed_turn_ids"])
                 ),
                 error=intent.get("error"),
+                terminal_turn_id=intent.get("terminal_turn_id"),
+                verdict=intent.get("verdict"),
             )
-            receipt = DetachReceipt(str(intent["thread_id"]), str(intent["turn_id"]))
+            receipt = DetachReceipt(
+                str(intent["thread_id"]), str(intent["initial_turn_id"])
+            )
             self._finish_attempt(
                 attempt, receipt, result, preserve_operation_intent=True
             )
@@ -1749,9 +1957,7 @@ class Workflow:
                 for item in self.state["attempts"]
                 if item["id"] == intent["attempt_id"]
             )
-            if attempt.get("thread_id") != intent.get("thread_id") or attempt.get(
-                "turn_id"
-            ) != intent.get("turn_id"):
+            if attempt.get("thread_id") != intent.get("thread_id"):
                 raise UsageError("invalid Reviewer follow recovery evidence")
             if attempt["role"] == "reviewer":
                 session = next(
@@ -1768,16 +1974,18 @@ class Workflow:
                 existing = session["results"].get(role, {})
                 if existing.get("attempt_id") == attempt["id"]:
                     pass
-                elif attempt["status"] != "DETACHED":
+                elif attempt["status"] != "RUNNING":
                     self._store_reviewer_result(
                         session,
                         role,
                         attempt,
                         (
                             DetachReceipt(
-                                str(attempt["thread_id"]), str(attempt["turn_id"])
+                                str(attempt["thread_id"]),
+                                str(attempt["initial_turn_id"]),
                             )
-                            if attempt.get("thread_id") and attempt.get("turn_id")
+                            if attempt.get("thread_id")
+                            and attempt.get("initial_turn_id")
                             else None
                         ),
                         AgentResult(str(attempt["status"]), error=attempt.get("error")),
@@ -1793,7 +2001,7 @@ class Workflow:
         detached = [
             item
             for item in self.state.get("attempts", [])
-            if item["status"] == "DETACHED"
+            if item["status"] == "RUNNING"
             and not (
                 item["role"] == "reviewer"
                 and next(
@@ -1812,12 +2020,17 @@ class Workflow:
         assert self.codex is not None
         recovered_review = unknown_review
         for attempt in detached:
-            receipt = DetachReceipt(str(attempt["thread_id"]), str(attempt["turn_id"]))
+            receipt = DetachReceipt(
+                str(attempt["thread_id"]), str(attempt["initial_turn_id"])
+            )
             self._say_agent_detached(attempt)
             follow_failed = False
             try:
                 result = self.codex.follow(
-                    thread_id=receipt.thread_id, turn_id=receipt.turn_id
+                    thread_id=receipt.thread_id,
+                    initial_turn_id=receipt.turn_id,
+                    completion_token=str(attempt["completion_token"]),
+                    role=str(attempt["role"]),
                 )
             except Exception as exc:
                 if attempt["role"] != "reviewer":
@@ -1827,7 +2040,10 @@ class Workflow:
             if result.status == "unknown" and not follow_failed:
                 try:
                     recovered = self.codex.history(
-                        thread_id=receipt.thread_id, turn_id=receipt.turn_id
+                        thread_id=receipt.thread_id,
+                        initial_turn_id=receipt.turn_id,
+                        completion_token=str(attempt["completion_token"]),
+                        role=str(attempt["role"]),
                     )
                 except Exception as exc:
                     if attempt["role"] != "reviewer":
@@ -1892,7 +2108,8 @@ class Workflow:
                 "reviewSessionId": item.get("review_session"),
                 "reviewerRole": item.get("reviewer_role"),
                 "threadId": item.get("thread_id"),
-                "turnId": item.get("turn_id"),
+                "initialTurnId": item.get("initial_turn_id"),
+                "terminalTurnId": item.get("terminal_turn_id"),
                 "observedTurnIds": list(item.get("observed_turn_ids", [])),
                 "status": item.get("status"),
                 "promptArtifact": item.get("prompt_artifact"),
@@ -1920,7 +2137,8 @@ class Workflow:
                         "status": result.get("status"),
                         "attemptId": result.get("attempt_id"),
                         "threadId": result.get("thread_id"),
-                        "turnId": result.get("turn_id"),
+                        "initialTurnId": result.get("initial_turn_id"),
+                        "terminalTurnId": result.get("terminal_turn_id"),
                         "observedTurnIds": list(result.get("observed_turn_ids", [])),
                         "messageArtifact": result.get("message_artifact"),
                         "verdict": result.get("verdict"),
@@ -2289,6 +2507,7 @@ class Workflow:
         context: str,
         *,
         repair: bool,
+        completion_token: str,
         amendment_ids: list[str] | None = None,
     ) -> str:
         role = self._read_artifact_text(
@@ -2304,7 +2523,13 @@ class Workflow:
         amendments = self._amendment_text(amendment_ids)
         if amendments:
             pieces.append(amendments)
-        pieces.append(WORKER_FOOTER)
+        pieces.append(
+            WORKER_FOOTER.format(
+                completion_instruction=_completion_instruction(
+                    AgentRole.WORKER, completion_token
+                )
+            )
+        )
         return "\n\n".join(pieces)
 
     def _compose_review(
@@ -2313,6 +2538,7 @@ class Workflow:
         mode: str,
         previous: str | None,
         prior: str,
+        completion_token: str,
         *,
         amendment_ids: list[str] | None = None,
     ) -> str:
@@ -2340,7 +2566,13 @@ class Workflow:
         amendments = self._amendment_text(amendment_ids)
         if amendments:
             pieces.append(amendments)
-        pieces.append(REVIEW_FOOTER)
+        pieces.append(
+            REVIEW_FOOTER.format(
+                completion_instruction=_completion_instruction(
+                    AgentRole.REVIEWER, completion_token
+                )
+            )
+        )
         return "\n\n".join(pieces)
 
     def _wait(
@@ -2433,7 +2665,8 @@ class Workflow:
             "review_session_id": record.get("review_session"),
             "role": record["role"],
             "thread_id": record.get("thread_id"),
-            "turn_id": record.get("turn_id"),
+            "initial_turn_id": record.get("initial_turn_id"),
+            "terminal_turn_id": record.get("terminal_turn_id"),
             "observed_turn_ids": list(record.get("observed_turn_ids", [])),
         }
 
@@ -2447,7 +2680,8 @@ class Workflow:
                     "review_session_id": owner["review_session_id"],
                     "role": owner["role"],
                     "thread_id": owner["thread_id"],
-                    "turn_id": owner["turn_id"],
+                    "initial_turn_id": owner["initial_turn_id"],
+                    "terminal_turn_id": owner["terminal_turn_id"],
                     "observed_turn_ids": owner["observed_turn_ids"],
                 }
             )
@@ -2463,6 +2697,7 @@ class Workflow:
         reviewer_role: str | None = None,
         amendment_ids: list[str] | None = None,
         amendment_digest: str | None = None,
+        completion_token: str,
     ) -> dict[str, Any]:
         attempt_id = f"attempt-{len(self.state['attempts']) + 1}"
         prompt_data = prompt.encode()
@@ -2478,7 +2713,9 @@ class Workflow:
             "review_session": session,
             "reviewer_role": reviewer_role,
             "thread_id": None,
-            "turn_id": None,
+            "initial_turn_id": None,
+            "terminal_turn_id": None,
+            "completion_token": completion_token,
             "observed_turn_ids": [],
             "status": "START_INTENT",
             "started_at": _now(),
@@ -2521,7 +2758,8 @@ class Workflow:
         if record["role"] == "worker":
             checkout = self.git.snapshot(Path(self.state["cwd"]))
         record["thread_id"] = receipt.thread_id
-        record["turn_id"] = receipt.turn_id
+        record["initial_turn_id"] = receipt.turn_id
+        record["terminal_turn_id"] = result.terminal_turn_id
         record["observed_turn_ids"] = result.observed_turn_ids
         record["status"] = result.status
         record["completed_at"] = _now()
@@ -2533,13 +2771,15 @@ class Workflow:
             "review_session_id": record.get("review_session"),
             "reviewer_role": record.get("reviewer_role"),
             "thread_id": receipt.thread_id,
-            "turn_id": receipt.turn_id,
+            "initial_turn_id": receipt.turn_id,
+            "terminal_turn_id": result.terminal_turn_id,
             "observed_turn_ids": list(result.observed_turn_ids),
             "result_status": result.status,
             "message": result.final_message,
             "messages": list(result.messages),
             "raw_jsonl": result.raw_jsonl.hex(),
             "error": result.error,
+            "verdict": result.verdict,
         }
         if checkout is not None:
             pending = self.state.get("pending_worker") or {}
@@ -2616,26 +2856,25 @@ class Workflow:
         return _AgentAttempt(record, receipt)
 
     def _detach_agent_attempt(self, attempt: _AgentAttempt) -> None:
-        """Persist the receipt and make its exact turn the recovery target."""
+        """Persist the receipt and make its thread the recovery target."""
         if attempt.receipt is None:
             raise AssertionError("cannot detach an attempt without a receipt")
         record = attempt.record
         receipt = attempt.receipt
         record["thread_id"] = receipt.thread_id
-        record["turn_id"] = receipt.turn_id
-        record["status"] = "DETACHED"
+        record["initial_turn_id"] = receipt.turn_id
+        record["status"] = "RUNNING"
         self._sync_attempt_artifacts(record)
         self.state["operation_intent"] = {
             "kind": "agent_follow",
             "attempt_id": record["id"],
             "thread_id": receipt.thread_id,
-            "turn_id": receipt.turn_id,
         }
         self._save()
         self._say_agent_detached(record)
 
     def _follow_agent_attempt(self, attempt: _AgentAttempt) -> AgentResult:
-        """Follow the recorded turn and normalize runtime exceptions."""
+        """Follow the attempt's thread and normalize runtime exceptions."""
         if attempt.result is not None:
             return attempt.result
         if attempt.receipt is None:
@@ -2644,7 +2883,9 @@ class Workflow:
         try:
             result = self.codex.follow(
                 thread_id=attempt.receipt.thread_id,
-                turn_id=attempt.receipt.turn_id,
+                initial_turn_id=attempt.receipt.turn_id,
+                completion_token=str(attempt.record["completion_token"]),
+                role=str(attempt.record["role"]),
             )
         except Exception as exc:
             result = AgentResult("unknown", error=str(exc))
@@ -2708,6 +2949,7 @@ class Workflow:
         self,
         prompt: str,
         *,
+        completion_token: str,
         resume_thread: str | None = None,
         amendment_ids: list[str],
         amendment_digest: str,
@@ -2720,6 +2962,7 @@ class Workflow:
             worker_round=round_number,
             amendment_ids=amendment_ids,
             amendment_digest=amendment_digest,
+            completion_token=completion_token,
         )
         attempt = self._start_agent_attempt(
             record,
@@ -2745,13 +2988,18 @@ class Workflow:
             self.state["review_sessions"] or self.state["gate_results"]
         )
         amendment_ids, amendment_digest = self._amendment_snapshot()
+        completion_token = uuid.uuid4().hex
         prompt = self._compose_worker(
-            context, repair=repair, amendment_ids=amendment_ids
+            context,
+            repair=repair,
+            completion_token=completion_token,
+            amendment_ids=amendment_ids,
         )
         self.state["phase"] = "WORKER"
         self.state["pending_worker"] = {"input_head": input_head}
         record, result = self._invoke_worker(
             prompt,
+            completion_token=completion_token,
             amendment_ids=amendment_ids,
             amendment_digest=amendment_digest,
         )
@@ -2767,13 +3015,16 @@ class Workflow:
             raise UsageError("no interrupted Worker thread can be continued")
         input_head = str(pending["input_head"])
         amendment_ids, amendment_digest = self._amendment_snapshot()
+        completion_token = uuid.uuid4().hex
         prompt = self._compose_worker(
             "Continue the interrupted Worker attempt. Inspect its existing clean descendant commits and complete the requested work.",
             repair=True,
+            completion_token=completion_token,
             amendment_ids=amendment_ids,
         )
         record, result = self._invoke_worker(
             prompt,
+            completion_token=completion_token,
             resume_thread=str(original["thread_id"]),
             amendment_ids=amendment_ids,
             amendment_digest=amendment_digest,
@@ -2828,13 +3079,6 @@ class Workflow:
             self.state["operation_intent"] = None
             return wait("CHECKOUT_DRIFT", [], "WORKER")
         self.state["operation_intent"] = None
-        if result.status == "unexpected_continuation":
-            self.state["pending_worker"] = {
-                "input_head": input_head,
-                "attempt_id": record["id"],
-                "descendant_head": actual.head if descendant else None,
-            }
-            return wait("UNEXPECTED_CONTINUATION", [], "WORKER")
         if result.status != "completed":
             actions = _worker_recovery_action_policy(
                 result.status,
@@ -3030,16 +3274,19 @@ class Workflow:
     ) -> None:
         existing = session["results"].get(role)
         if existing is not None and existing.get("attempt_id") == record["id"]:
-            if existing.get("thread_id") != record.get("thread_id") or existing.get(
-                "turn_id"
-            ) != record.get("turn_id"):
+            if (
+                existing.get("thread_id") != record.get("thread_id")
+                or existing.get("initial_turn_id") != record.get("initial_turn_id")
+                or existing.get("terminal_turn_id") != record.get("terminal_turn_id")
+            ):
                 raise UsageError("invalid persisted Reviewer result evidence")
             return
         item = {
             "status": result.status,
             "attempt_id": record["id"],
             "thread_id": record.get("thread_id"),
-            "turn_id": record.get("turn_id"),
+            "initial_turn_id": record.get("initial_turn_id"),
+            "terminal_turn_id": record.get("terminal_turn_id"),
             "observed_turn_ids": list(record.get("observed_turn_ids", [])),
             "message_artifact": None,
             "message": result.final_message or "",
@@ -3070,15 +3317,11 @@ class Workflow:
             item["message_artifact"] = message_artifact
             if message_artifact not in record["output_artifacts"]:
                 record["output_artifacts"].append(message_artifact)
-        if result.status == "completed" and result.final_message:
-            try:
-                item["verdict"] = _verdict(result.final_message)
-            except UsageError as exc:
-                item["status"] = "ambiguous"
-                item["error"] = str(exc)
+        if result.status == "completed" and result.final_message and result.verdict:
+            item["verdict"] = result.verdict
         elif result.status == "completed":
             item["status"] = "protocol_error"
-            item["error"] = "completed turn had no agentMessage"
+            item["error"] = "completed attempt had no valid review result marker"
         session["results"][role] = item
         self._save()
         if agent_completion_pending:
@@ -3131,17 +3374,9 @@ class Workflow:
         if failures or len(session["results"]) != len(self.state["reviewer_roles"]):
             session["status"] = "INCOMPLETE"
             self._save()
-            reason = (
-                "UNEXPECTED_CONTINUATION"
-                if any(
-                    item.get("status") == "unexpected_continuation"
-                    for item in session["results"].values()
-                )
-                else "REVIEWER_FAILURE"
-            )
             self.state["operation_intent"] = None
             return self._wait(
-                reason,
+                "REVIEWER_FAILURE",
                 ["RETRY_REVIEWERS", "REQUIRE_FRESH_AUDIT"],
                 "REVIEW",
             )
@@ -3357,6 +3592,7 @@ class Workflow:
 
         tasks: list[tuple[str, dict[str, Any], str, bool]] = []
         for role in roles:
+            completion_token = uuid.uuid4().hex
             previous = session.get("previous_checkpoint")
             prior = ""
             if mode == "DELTA":
@@ -3373,6 +3609,7 @@ class Workflow:
                 str(mode),
                 previous,
                 prior,
+                completion_token,
                 amendment_ids=amendment_ids,
             )
             record = self._attempt_record(
@@ -3383,6 +3620,7 @@ class Workflow:
                 reviewer_role=role,
                 amendment_ids=amendment_ids,
                 amendment_digest=amendment_digest,
+                completion_token=completion_token,
             )
             prior_status = session["results"].get(role, {}).get("status")
             resume_existing = mode == "DELTA" or (retry and prior_status == "ambiguous")

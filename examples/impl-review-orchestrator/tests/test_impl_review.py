@@ -6,6 +6,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -21,6 +22,14 @@ assert SPEC and SPEC.loader
 impl_review = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = impl_review
 SPEC.loader.exec_module(impl_review)
+
+
+def worker_marker(token: str) -> str:
+    return f"WORKER_DONE: {token}"
+
+
+def review_marker(token: str, verdict: str) -> str:
+    return f"REVIEW_RESULT: {token} {verdict}"
 
 
 def git(repo: Path, *args: str) -> str:
@@ -75,6 +84,7 @@ class ScriptedCodex:
         self.prompts: list[tuple[str, str, str | None]] = []
         self._serial = 0
         self._results: dict[str, impl_review.AgentResult] = {}
+        self._thread_roles: dict[str, str] = {}
         self._lock = threading.Lock()
         self.history_calls: list[tuple[str, str]] = []
         self.follow_calls: list[tuple[str, str]] = []
@@ -84,6 +94,8 @@ class ScriptedCodex:
             self._serial += 1
             thread_id = thread or f"thread-{self._serial}"
             turn_id = f"turn-{self._serial}"
+            prior_role = self._thread_roles.setdefault(thread_id, role)
+            assert prior_role == role
             self.prompts.append((role, prompt, thread))
             if role == "worker":
                 action = self.worker_actions.pop(0)
@@ -95,11 +107,42 @@ class ScriptedCodex:
                 )
             else:
                 scripted = self.verdicts.pop(0)
+            prompt_tokens = re.findall(r"\b[0-9a-f]{32}\b", prompt)
+            assert prompt_tokens
+            completion_token = prompt_tokens[-1]
             if isinstance(scripted, impl_review.AgentResult):
                 result = scripted
                 if not result.observed_turn_ids:
                     result.observed_turn_ids = [turn_id]
+                if result.status in {"completed", "failed", "interrupted"}:
+                    result.terminal_turn_id = turn_id
+                if result.status == "completed":
+                    if role == "worker":
+                        marker = worker_marker(completion_token)
+                    else:
+                        old_verdict = re.search(
+                            r"^VERDICT: (PASS|FAIL)$",
+                            result.final_message or "",
+                            re.MULTILINE,
+                        )
+                        verdict = old_verdict.group(1) if old_verdict else "PASS"
+                        marker = review_marker(completion_token, verdict)
+                        result.verdict = verdict
+                    if result.messages:
+                        result.messages[-1] = f"{result.messages[-1]}\n{marker}"
+                    else:
+                        result.messages = [marker]
             else:
+                if role == "worker":
+                    marker = worker_marker(completion_token)
+                    verdict = None
+                else:
+                    old_verdict = re.search(
+                        r"^VERDICT: (PASS|FAIL)$", scripted, re.MULTILINE
+                    )
+                    verdict = old_verdict.group(1) if old_verdict else "PASS"
+                    marker = review_marker(completion_token, verdict)
+                scripted = f"{scripted}\n{marker}"
                 raw = (
                     json.dumps(
                         {
@@ -112,7 +155,12 @@ class ScriptedCodex:
                     + "\n"
                 ).encode()
                 result = impl_review.AgentResult(
-                    "completed", raw, [scripted], [turn_id]
+                    "completed",
+                    raw,
+                    [scripted],
+                    [turn_id],
+                    terminal_turn_id=turn_id,
+                    verdict=verdict,
                 )
             self._results[turn_id] = result
             return impl_review.DetachReceipt(thread_id, turn_id)
@@ -123,16 +171,16 @@ class ScriptedCodex:
         return self._receipt(role, prompt)
 
     def resume(self, *, thread_id, prompt):
-        role = "reviewer" if "VERDICT: PASS" in prompt else "worker"
+        role = self._thread_roles[thread_id]
         return self._receipt(role, prompt, thread_id)
 
-    def follow(self, *, thread_id, turn_id):
-        self.follow_calls.append((thread_id, turn_id))
-        return self._results[turn_id]
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
+        self.follow_calls.append((thread_id, initial_turn_id))
+        return self._results[initial_turn_id]
 
-    def history(self, *, thread_id, turn_id):
-        self.history_calls.append((thread_id, turn_id))
-        return self._results[turn_id]
+    def history(self, *, thread_id, initial_turn_id, completion_token, role):
+        self.history_calls.append((thread_id, initial_turn_id))
+        return self._results[initial_turn_id]
 
 
 class SimulatedCrash(BaseException):
@@ -206,7 +254,7 @@ class CrashAtRotationBoundaryStore(impl_review.ArtifactStore):
                 and len(sessions) >= 3
                 and sessions[-1]["mode"] == "FULL"
                 and target_attempts
-                and sum(attempt["status"] == "DETACHED" for attempt in target_attempts)
+                and sum(attempt["status"] == "RUNNING" for attempt in target_attempts)
                 == 1
                 and (state.get("operation_intent") or {}).get("kind") == "agent_follow"
             )
@@ -228,13 +276,18 @@ class CrashDuringFollowCodex(ScriptedCodex):
         super().__init__(*args, **kwargs)
         self.crashed_turn: str | None = None
 
-    def follow(self, *, thread_id, turn_id):
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
         if self.crashed_turn is None:
-            self.crashed_turn = turn_id
+            self.crashed_turn = initial_turn_id
             raise SimulatedCrash
-        if turn_id == self.crashed_turn:
+        if initial_turn_id == self.crashed_turn:
             return impl_review.AgentResult("unknown")
-        return super().follow(thread_id=thread_id, turn_id=turn_id)
+        return super().follow(
+            thread_id=thread_id,
+            initial_turn_id=initial_turn_id,
+            completion_token=completion_token,
+            role=role,
+        )
 
 
 class ReviewerFollowFailureCodex(ScriptedCodex):
@@ -242,11 +295,16 @@ class ReviewerFollowFailureCodex(ScriptedCodex):
         super().__init__(*args, **kwargs)
         self.failing_turns = set(failing_turns)
 
-    def follow(self, *, thread_id, turn_id):
-        if turn_id in self.failing_turns:
-            self.follow_calls.append((thread_id, turn_id))
-            raise impl_review.OrchestratorError(f"follow failed for {turn_id}")
-        return super().follow(thread_id=thread_id, turn_id=turn_id)
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
+        if initial_turn_id in self.failing_turns:
+            self.follow_calls.append((thread_id, initial_turn_id))
+            raise impl_review.OrchestratorError(f"follow failed for {initial_turn_id}")
+        return super().follow(
+            thread_id=thread_id,
+            initial_turn_id=initial_turn_id,
+            completion_token=completion_token,
+            role=role,
+        )
 
 
 class BlockingReviewerFollowCodex(ScriptedCodex):
@@ -256,12 +314,17 @@ class BlockingReviewerFollowCodex(ScriptedCodex):
         self.blocked = threading.Event()
         self.release = threading.Event()
 
-    def follow(self, *, thread_id, turn_id):
-        if turn_id == self.blocked_turn:
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
+        if initial_turn_id == self.blocked_turn:
             self.blocked.set()
             if not self.release.wait(10):
                 raise AssertionError("blocked reviewer was not released")
-        return super().follow(thread_id=thread_id, turn_id=turn_id)
+        return super().follow(
+            thread_id=thread_id,
+            initial_turn_id=initial_turn_id,
+            completion_token=completion_token,
+            role=role,
+        )
 
 
 class BlockingStartCodex:
@@ -277,8 +340,13 @@ class BlockingStartCodex:
             time.sleep(0.01)
         return impl_review.DetachReceipt("worker-thread", "worker-turn")
 
-    def follow(self, *, thread_id, turn_id):
-        return impl_review.AgentResult("completed")
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
+        return impl_review.AgentResult(
+            "completed",
+            messages=[worker_marker(completion_token)],
+            observed_turn_ids=[initial_turn_id],
+            terminal_turn_id=initial_turn_id,
+        )
 
 
 class BlockingWorkerFollowCodex:
@@ -289,15 +357,17 @@ class BlockingWorkerFollowCodex:
     def start(self, *, prompt, cwd, role, approve, model, effort):
         return impl_review.DetachReceipt(f"{role}-thread", f"{role}-turn")
 
-    def follow(self, *, thread_id, turn_id):
+    def follow(self, *, thread_id, initial_turn_id, completion_token, role):
         if thread_id == "worker-thread":
             self.started.set()
             if not self.release.wait(10):
                 raise AssertionError("blocked Worker was not released")
         return impl_review.AgentResult(
             "completed",
-            messages=["Pass.\nVERDICT: PASS"],
-            observed_turn_ids=[turn_id],
+            messages=[f"Pass.\n{review_marker(completion_token, 'PASS')}"],
+            observed_turn_ids=[initial_turn_id],
+            terminal_turn_id=initial_turn_id,
+            verdict="PASS",
         )
 
 
@@ -381,21 +451,29 @@ def test_progress_marks_durable_boundaries_before_follow(repo: Path, tmp_path: P
             state_path = Path(message.split("statePath=", 1)[1])
 
     class OrderingCodex(ScriptedCodex):
-        def follow(self, *, thread_id, turn_id):
+        def follow(self, *, thread_id, initial_turn_id, completion_token, role):
             detached = next(
                 event
                 for event in events
-                if event.startswith("Agent detached:") and f"turnId={turn_id}" in event
+                if event.startswith("Agent detached:")
+                and f"initialTurnId={initial_turn_id}" in event
             )
             assert f"threadId={thread_id}" in detached
             assert state_path is not None
             persisted = json.loads(state_path.read_text())
             attempt = next(
-                item for item in persisted["attempts"] if item["turn_id"] == turn_id
+                item
+                for item in persisted["attempts"]
+                if item["initial_turn_id"] == initial_turn_id
             )
-            assert attempt["status"] == "DETACHED"
+            assert attempt["status"] == "RUNNING"
             assert persisted["operation_intent"]["kind"] == "agent_follow"
-            return super().follow(thread_id=thread_id, turn_id=turn_id)
+            return super().follow(
+                thread_id=thread_id,
+                initial_turn_id=initial_turn_id,
+                completion_token=completion_token,
+                role=role,
+            )
 
     codex = OrderingCodex(
         repo,
@@ -727,6 +805,33 @@ def test_worker_prompt_includes_all_configured_gate_commands(
     ) in worker_prompt
 
 
+def test_attempt_tokens_are_fresh_persisted_and_bound_to_role_prompts(
+    repo: Path, tmp_path: Path
+):
+    codex = ScriptedCodex(
+        repo,
+        [lambda: commit(repo, "work.txt", "work\n")],
+        ["Pass.\nVERDICT: PASS"],
+    )
+    report = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
+        config(repo, tmp_path)
+    )
+    state_path = Path(report["statePath"])
+    state = json.loads(state_path.read_text())
+    tokens = [attempt["completion_token"] for attempt in state["attempts"]]
+
+    assert len(tokens) == len(set(tokens))
+    assert all(re.fullmatch(r"[0-9a-f]{32}", token) for token in tokens)
+    for attempt in state["attempts"]:
+        prompt = (state_path.parent / attempt["prompt_artifact"]).read_text()
+        token = attempt["completion_token"]
+        if attempt["role"] == "worker":
+            assert f"WORKER_DONE: {token}" in prompt
+        else:
+            assert f"REVIEW_RESULT: {token} PASS" in prompt
+            assert f"REVIEW_RESULT: {token} FAIL" in prompt
+
+
 def test_failed_full_then_delta_pass_rotates_to_fresh_full(repo: Path, tmp_path: Path):
     codex = ScriptedCodex(
         repo,
@@ -1050,21 +1155,24 @@ def test_reports_and_manifest_preserve_all_agent_identity_associations(
     state = json.loads(Path(report["statePath"]).read_text())
     attempts = {attempt["id"]: attempt for attempt in state["attempts"]}
     assert all(
-        attempt["thread_id"] and attempt["turn_id"] for attempt in attempts.values()
+        attempt["thread_id"] and attempt["initial_turn_id"]
+        for attempt in attempts.values()
     )
     report_attempts = {attempt["attemptId"]: attempt for attempt in report["attempts"]}
     assert set(report_attempts) == set(attempts)
     for attempt_id, attempt in attempts.items():
         projected = report_attempts[attempt_id]
         assert projected["threadId"] == attempt["thread_id"]
-        assert projected["turnId"] == attempt["turn_id"]
+        assert projected["initialTurnId"] == attempt["initial_turn_id"]
+        assert projected["terminalTurnId"] == attempt["terminal_turn_id"]
         assert projected["observedTurnIds"] == attempt["observed_turn_ids"]
 
     for session in state["review_sessions"]:
         for role, result in session["results"].items():
             attempt = attempts[result["attempt_id"]]
             assert result["thread_id"] == attempt["thread_id"]
-            assert result["turn_id"] == attempt["turn_id"]
+            assert result["initial_turn_id"] == attempt["initial_turn_id"]
+            assert result["terminal_turn_id"] == attempt["terminal_turn_id"]
             assert result["observed_turn_ids"] == attempt["observed_turn_ids"]
             projected = next(
                 item
@@ -1072,7 +1180,8 @@ def test_reports_and_manifest_preserve_all_agent_identity_associations(
                 if item["reviewSessionId"] == session["id"]
             )["results"][role]
             assert projected["threadId"] == result["thread_id"]
-            assert projected["turnId"] == result["turn_id"]
+            assert projected["initialTurnId"] == result["initial_turn_id"]
+            assert projected["terminalTurnId"] == result["terminal_turn_id"]
 
     manifest = [
         artifact
@@ -1085,7 +1194,8 @@ def test_reports_and_manifest_preserve_all_agent_identity_associations(
         assert artifact["review_session_id"] == attempt["review_session"]
         assert artifact["role"] == attempt["role"]
         assert artifact["thread_id"] == attempt["thread_id"]
-        assert artifact["turn_id"] == attempt["turn_id"]
+        assert artifact["initial_turn_id"] == attempt["initial_turn_id"]
+        assert artifact["terminal_turn_id"] == attempt["terminal_turn_id"]
         assert artifact["observed_turn_ids"] == attempt["observed_turn_ids"]
 
 
@@ -1925,7 +2035,7 @@ def test_reviewer_follow_exception_waits_and_retries_only_the_failed_role(
     assert results["one"]["status"] == "completed"
     assert results["two"]["status"] == "unknown"
     failed_receipt = next(
-        (item["threadId"], item["turnId"])
+        (item["threadId"], item["initialTurnId"])
         for item in waiting["attempts"]
         if item["reviewerRole"] == "two"
     )
@@ -2000,8 +2110,10 @@ def test_completed_reviewer_is_durable_while_another_follow_is_blocked(
         )
         assert completed_attempt["status"] == "completed"
         assert completed_result["status"] == "completed"
-        assert completed_result["turnId"] == completed_attempt["turnId"]
-        assert completed_result["observedTurnIds"] == [completed_attempt["turnId"]]
+        assert completed_result["terminalTurnId"] == completed_attempt["terminalTurnId"]
+        assert completed_result["observedTurnIds"] == [
+            completed_attempt["initialTurnId"]
+        ]
         assert completed_result["messageArtifact"]
         assert completed_attempt["outputArtifacts"]
         assert state["cohorts"][0]["threads"]["one"] == completed_attempt["threadId"]
@@ -2061,12 +2173,12 @@ def test_reviewer_completion_reconciles_after_per_result_write(
     detached = [
         item
         for item in crashed["attempts"]
-        if item["role"] == "reviewer" and item["status"] == "DETACHED"
+        if item["role"] == "reviewer" and item["status"] == "RUNNING"
     ]
     assert len(completed) == 1
     assert len(detached) == 1
     assert intent["attempt_id"] == completed[0]["id"]
-    assert intent["turn_id"] == completed[0]["turn_id"]
+    assert intent["terminal_turn_id"] == completed[0]["terminal_turn_id"]
     assert crashed["review_sessions"][-1]["results"] == {}
 
     workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
@@ -2075,7 +2187,10 @@ def test_reviewer_completion_reconciles_after_per_result_write(
     assert report["status"] == "READY_CERTIFIED"
     assert report["reviewSessions"][-1]["results"]["one"]["status"] == "completed"
     assert report["reviewSessions"][-1]["results"]["two"]["status"] == "completed"
-    completed_receipt = (completed[0]["thread_id"], completed[0]["turn_id"])
+    completed_receipt = (
+        completed[0]["thread_id"],
+        completed[0]["initial_turn_id"],
+    )
     assert codex.follow_calls.count(completed_receipt) == 1
 
     artifact_paths = [item["path"] for item in report["artifactManifest"]]
@@ -2155,8 +2270,9 @@ def test_stale_follow_intent_with_persisted_reviewer_result_reconciles(
     state_path = Path(waiting["statePath"])
     state = json.loads(state_path.read_text())
     attempt = next(item for item in state["attempts"] if item["reviewer_role"] == "one")
-    attempt["status"] = "DETACHED"
+    attempt["status"] = "RUNNING"
     attempt["completed_at"] = None
+    attempt["terminal_turn_id"] = None
     state["status"] = "RUNNING"
     state["waiting_reason"] = None
     state["allowed_actions"] = []
@@ -2164,7 +2280,6 @@ def test_stale_follow_intent_with_persisted_reviewer_result_reconciles(
         "kind": "agent_follow",
         "attempt_id": attempt["id"],
         "thread_id": attempt["thread_id"],
-        "turn_id": attempt["turn_id"],
     }
     state_path.write_text(json.dumps(state))
     follow_calls = list(codex.follow_calls)
@@ -2403,9 +2518,14 @@ def test_start_initialization_and_advancement_hold_run_lock(
             assert_run_lock_held()
             return super().start(**kwargs)
 
-        def follow(self, *, thread_id, turn_id):
+        def follow(self, *, thread_id, initial_turn_id, completion_token, role):
             assert_run_lock_held()
-            return super().follow(thread_id=thread_id, turn_id=turn_id)
+            return super().follow(
+                thread_id=thread_id,
+                initial_turn_id=initial_turn_id,
+                completion_token=completion_token,
+                role=role,
+            )
 
     monkeypatch.setattr(impl_review, "ArtifactStore", LockCheckingStore)
     codex = LockCheckingCodex(repo, [lambda: None], [])
@@ -2496,7 +2616,47 @@ def test_crash_after_detach_recovers_exact_worker_turn_from_history(
     assert report["status"] == "READY_CERTIFIED"
     assert codex.history_calls == [("thread-1", "turn-1")]
     assert report["attempts"][0]["threadId"] == "thread-1"
-    assert report["attempts"][0]["turnId"] == "turn-1"
+    assert report["attempts"][0]["initialTurnId"] == "turn-1"
+
+
+def test_crash_recovery_rejects_invalid_history_terminal_status(
+    repo: Path, tmp_path: Path
+):
+    class InvalidHistoryCodex(CrashDuringFollowCodex):
+        def history(self, *, thread_id, initial_turn_id, completion_token, role):
+            self.history_calls.append((thread_id, initial_turn_id))
+            raw = (
+                agent_event(
+                    initial_turn_id,
+                    f"Done.\n{worker_marker(completion_token)}",
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "turn/completed",
+                        "threadId": thread_id,
+                        "turnId": initial_turn_id,
+                    }
+                )
+                + "\n"
+            ).encode()
+            return impl_review.parse_agent_jsonl(
+                raw, initial_turn_id, completion_token, role
+            )
+
+    codex = InvalidHistoryCodex(repo, [lambda: None], [])
+    workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
+    with pytest.raises(SimulatedCrash):
+        workflow.start(config(repo, tmp_path))
+
+    report = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).resume(
+        "test-run"
+    )
+
+    assert report["status"] == "WAITING"
+    assert report["waitingReason"] == "AGENT_OUTCOME_UNKNOWN"
+    assert report["attempts"][0]["status"] == "protocol_error"
+    assert codex.history_calls == [("thread-1", "turn-1")]
 
 
 def test_completed_worker_transition_reconciles_without_following_again(
@@ -2527,10 +2687,10 @@ def test_completed_worker_transition_reconciles_without_following_again(
     )
     worker_receipt = (
         crashed["attempts"][-1]["thread_id"],
-        crashed["attempts"][-1]["turn_id"],
+        crashed["attempts"][-1]["initial_turn_id"],
     )
     assert crashed["operation_intent"]["thread_id"] == worker_receipt[0]
-    assert crashed["operation_intent"]["turn_id"] == worker_receipt[1]
+    assert crashed["operation_intent"]["initial_turn_id"] == worker_receipt[1]
 
     workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
     report = workflow.resume("test-run")
@@ -2575,10 +2735,10 @@ def test_completed_reviewer_transition_reconciles_idempotently(
     assert intent["role"] == "reviewer"
     assert crashed["attempts"][-1]["status"] == "completed"
     assert crashed["review_sessions"][-1]["results"] == {}
-    reviewer_receipt = (intent["thread_id"], intent["turn_id"])
+    reviewer_receipt = (intent["thread_id"], intent["initial_turn_id"])
     assert reviewer_receipt == (
         crashed["attempts"][-1]["thread_id"],
-        crashed["attempts"][-1]["turn_id"],
+        crashed["attempts"][-1]["initial_turn_id"],
     )
 
     workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
@@ -2743,33 +2903,195 @@ def test_completed_branch_creation_is_reconciled_at_expected_base(
     assert git(repo, "branch", "--show-current") == "review/completed-create"
 
 
-def test_codexctl_adapter_never_follows_a_different_active_turn(tmp_path: Path):
+def agent_event(turn_id: str, message: str) -> str:
+    return json.dumps(
+        {
+            "type": "item/completed",
+            "threadId": "thread-1",
+            "turnId": turn_id,
+            "item": {"type": "agentMessage", "text": message},
+        }
+    )
+
+
+def terminal_event(turn_id: str, status: str = "completed") -> str:
+    return json.dumps(
+        {
+            "type": "turn/completed",
+            "threadId": "thread-1",
+            "turnId": turn_id,
+            "status": status,
+        }
+    )
+
+
+def test_codexctl_adapter_uses_persistent_thread_follow(tmp_path: Path):
     calls: list[list[str]] = []
-    target_history = (
-        json.dumps(
-            {
-                "type": "turn/completed",
-                "threadId": "thread-1",
-                "turnId": "older-turn",
-                "status": "completed",
-            }
-        )
+    token = "1" * 32
+    completed = (
+        agent_event("target-turn", f"Finished.\n{worker_marker(token)}")
+        + "\n"
+        + terminal_event("target-turn")
+        + "\n"
+    ).encode()
+
+    def run(
+        argv: list[str], *, cwd: Path, **_: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        if argv[1] == "follow":
+            return subprocess.CompletedProcess(argv, 130, completed, b"")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    adapter = impl_review.CodexctlAdapter("codexctl", tmp_path, subprocess_runner=run)
+    result = adapter.follow(
+        thread_id="thread-1",
+        initial_turn_id="target-turn",
+        completion_token=token,
+        role="worker",
+    )
+
+    assert result.status == "completed"
+    assert result.terminal_turn_id == "target-turn"
+    assert calls == [
+        [
+            "codexctl",
+            "follow",
+            "thread-1",
+            "--persist",
+            "--replay-turns",
+            ":",
+            "-o",
+            "jsonl",
+        ]
+    ]
+
+
+def test_codexctl_adapter_stops_real_persistent_follower_after_terminal_marker(
+    tmp_path: Path,
+):
+    token = "b" * 32
+    executable = tmp_path / "fake-codexctl"
+    executable.write_text(
+        f"""#!{sys.executable}
+import json
+import time
+
+events = [
+    {{
+        "type": "item/completed",
+        "threadId": "thread-1",
+        "turnId": "turn-a",
+        "item": {{"type": "agentMessage", "text": "Done.\\nWORKER_DONE: {token}"}},
+    }},
+    {{
+        "type": "turn/completed",
+        "threadId": "thread-1",
+        "turnId": "turn-a",
+        "status": "completed",
+    }},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+while True:
+    time.sleep(1)
+"""
+    )
+    executable.chmod(0o755)
+    adapter = impl_review.CodexctlAdapter(str(executable), tmp_path)
+
+    result = adapter.follow(
+        thread_id="thread-1",
+        initial_turn_id="turn-a",
+        completion_token=token,
+        role="worker",
+    )
+
+    assert result.status == "completed"
+    assert result.terminal_turn_id == "turn-a"
+
+
+def test_worker_attempt_spans_completed_turns_until_current_marker_turn_completes():
+    token = "2" * 32
+    raw = (
+        agent_event("turn-a", "Long command handed off.")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+        + agent_event("turn-b", f"All done.\n{worker_marker(token)}")
+        + "\n"
+        + terminal_event("turn-b")
+        + "\n"
+    ).encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "worker")
+
+    assert result.status == "completed"
+    assert result.observed_turn_ids == ["turn-a", "turn-b"]
+    assert result.terminal_turn_id == "turn-b"
+
+
+def test_marker_does_not_complete_before_its_turn_terminal_event():
+    token = "3" * 32
+    raw = agent_event("turn-a", f"Done.\n{worker_marker(token)}").encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "worker")
+
+    assert result.status == "running"
+    assert result.terminal_turn_id is None
+
+
+@pytest.mark.parametrize(
+    "status_fields",
+    [
+        {},
+        {"status": None},
+        {"status": ""},
+        {"status": "unknown"},
+        {"status": 1},
+        {"status": True},
+        {"status": {}},
+    ],
+)
+def test_invalid_turn_completion_status_is_a_protocol_error(
+    status_fields: dict[str, object],
+):
+    token = "c" * 32
+    event = {
+        "type": "turn/completed",
+        "threadId": "thread-1",
+        "turnId": "turn-a",
+    }
+    event.update(status_fields)
+    raw = (
+        agent_event("turn-a", f"Done.\n{worker_marker(token)}")
+        + "\n"
+        + json.dumps(event)
+        + "\n"
+    ).encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "worker")
+
+    assert result.status == "protocol_error"
+    assert result.error == "JSONL line 2 has invalid turn completion status"
+    assert result.messages == [f"Done.\n{worker_marker(token)}"]
+    assert result.observed_turn_ids == ["turn-a"]
+    assert result.terminal_turn_id == "turn-a"
+
+
+@pytest.mark.parametrize("operation", ["follow", "history"])
+def test_adapter_preserves_invalid_terminal_status_as_protocol_error(
+    tmp_path: Path, operation: str
+):
+    token = "d" * 32
+    malformed = (
+        agent_event("turn-a", f"Done.\n{worker_marker(token)}")
         + "\n"
         + json.dumps(
             {
-                "type": "item/completed",
-                "threadId": "thread-1",
-                "turnId": "target-turn",
-                "item": {"type": "agentMessage", "text": "Target finished."},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
                 "type": "turn/completed",
                 "threadId": "thread-1",
-                "turnId": "target-turn",
-                "status": "completed",
+                "turnId": "turn-a",
             }
         )
         + "\n"
@@ -2778,184 +3100,186 @@ def test_codexctl_adapter_never_follows_a_different_active_turn(tmp_path: Path):
     def run(
         argv: list[str], *, cwd: Path, **_: object
     ) -> subprocess.CompletedProcess[bytes]:
-        calls.append(argv)
-        if argv[1] == "status":
-            return subprocess.CompletedProcess(
-                argv, 0, b'{"activeTurnId":"extra-turn"}', b""
-            )
-        if argv[1] == "history":
-            return subprocess.CompletedProcess(argv, 0, target_history, b"")
-        raise AssertionError(f"unexpected command: {argv}")
+        assert argv[1] == operation
+        return subprocess.CompletedProcess(argv, 0, malformed, b"")
 
     adapter = impl_review.CodexctlAdapter("codexctl", tmp_path, subprocess_runner=run)
-    result = adapter.follow(thread_id="thread-1", turn_id="target-turn")
 
-    assert result.status == "unexpected_continuation"
-    assert result.final_message == "Target finished."
-    assert result.observed_turn_ids == ["target-turn", "extra-turn"]
-    assert [argv[1] for argv in calls] == ["status", "history"]
-
-
-def test_codexctl_adapter_follow_does_not_pass_isolation_flags(tmp_path: Path):
-    calls: list[list[str]] = []
-    completed = (
-        b'{"type":"turn/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","status":"completed"}\n'
+    result = getattr(adapter, operation)(
+        thread_id="thread-1",
+        initial_turn_id="turn-a",
+        completion_token=token,
+        role="worker",
     )
 
-    def run(
-        argv: list[str], *, cwd: Path, **_: object
-    ) -> subprocess.CompletedProcess[bytes]:
-        calls.append(argv)
-        if argv[1] == "status":
-            return subprocess.CompletedProcess(
-                argv, 0, b'{"activeTurnId":"target-turn"}', b""
-            )
-        if argv[1] == "follow":
-            return subprocess.CompletedProcess(argv, 0, completed, b"")
-        raise AssertionError(f"unexpected command: {argv}")
-
-    adapter = impl_review.CodexctlAdapter("codexctl", tmp_path, subprocess_runner=run)
-    result = adapter.follow(thread_id="thread-1", turn_id="target-turn")
-
-    assert result.status == "completed"
-    assert calls[-1] == ["codexctl", "follow", "thread-1", "-o", "jsonl"]
+    assert result.status == "protocol_error"
+    assert result.terminal_turn_id == "turn-a"
 
 
-def test_codexctl_adapter_nonzero_follow_does_not_certify_stdout(
+@pytest.mark.parametrize(
+    ("operation", "returncode", "stderr", "expected_error"),
+    [
+        ("follow", 0, b"follow transport detail\n", "follow transport detail"),
+        ("history", 0, b"", "attempt has not completed"),
+        ("history", 1, b"history transport detail\n", "attempt history unavailable"),
+    ],
+)
+def test_adapter_incomplete_result_preserves_stream_evidence_and_error_text(
     tmp_path: Path,
+    operation: str,
+    returncode: int,
+    stderr: bytes,
+    expected_error: str,
 ):
-    calls: list[list[str]] = []
-    completed = (
-        b'{"type":"item/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","item":{"type":"agentMessage",'
-        b'"text":"Looks completed."}}\n'
-        b'{"type":"turn/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","status":"completed"}\n'
-    )
+    token = "f" * 32
+    raw = (
+        agent_event("turn-a", "Long command handed off.")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+        + agent_event("turn-b", "Still working.")
+        + "\n"
+    ).encode()
 
     def run(
         argv: list[str], *, cwd: Path, **_: object
     ) -> subprocess.CompletedProcess[bytes]:
-        calls.append(argv)
-        if argv[1] == "status":
-            return subprocess.CompletedProcess(
-                argv, 0, b'{"activeTurnId":"target-turn"}', b""
-            )
-        if argv[1] == "follow":
-            return subprocess.CompletedProcess(argv, 17, completed, b"follow crashed")
-        if argv[1] == "history":
-            return subprocess.CompletedProcess(argv, 0, b"", b"")
-        raise AssertionError(f"unexpected command: {argv}")
+        assert argv[1] == operation
+        return subprocess.CompletedProcess(argv, returncode, raw, stderr)
 
     adapter = impl_review.CodexctlAdapter("codexctl", tmp_path, subprocess_runner=run)
-    result = adapter.follow(thread_id="thread-1", turn_id="target-turn")
+
+    result = getattr(adapter, operation)(
+        thread_id="thread-1",
+        initial_turn_id="turn-a",
+        completion_token=token,
+        role="worker",
+    )
 
     assert result.status == "unknown"
-    assert result.final_message is None
-    assert result.raw_jsonl == completed
-    assert result.observed_turn_ids == []
-    assert result.error == ("follow crashed; target turn history unavailable")
-    assert [argv[1] for argv in calls] == ["status", "follow", "history"]
+    assert result.raw_jsonl == raw
+    assert result.messages == ["Long command handed off.", "Still working."]
+    assert result.observed_turn_ids == ["turn-a", "turn-b"]
+    assert result.error == expected_error
+    assert result.terminal_turn_id is None
+    assert result.verdict is None
 
 
-def test_codexctl_adapter_nonzero_follow_recovers_exact_target_from_history(
-    tmp_path: Path,
-):
-    calls: list[list[str]] = []
-    follow_stdout = (
-        b'{"type":"turn/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","status":"completed"}\n'
-    )
-    history = (
-        b'{"type":"item/completed","threadId":"thread-1",'
-        b'"turnId":"other-turn","item":{"type":"agentMessage",'
-        b'"text":"Other turn."}}\n'
-        b'{"type":"turn/completed","threadId":"thread-1",'
-        b'"turnId":"other-turn","status":"completed"}\n'
-        b'{"type":"item/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","item":{"type":"agentMessage",'
-        b'"text":"Recovered target."}}\n'
-        b'{"type":"turn/completed","threadId":"thread-1",'
-        b'"turnId":"target-turn","status":"completed"}\n'
-    )
+def test_old_worker_marker_cannot_complete_a_new_attempt():
+    current = "4" * 32
+    old = "5" * 32
+    raw = (
+        agent_event("turn-a", f"Done.\n{worker_marker(old)}")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+    ).encode()
 
-    def run(
-        argv: list[str], *, cwd: Path, **_: object
-    ) -> subprocess.CompletedProcess[bytes]:
-        calls.append(argv)
-        if argv[1] == "status":
-            return subprocess.CompletedProcess(
-                argv, 0, b'{"activeTurnId":"target-turn"}', b""
-            )
-        if argv[1] == "follow":
-            return subprocess.CompletedProcess(argv, 23, follow_stdout, b"late failure")
-        if argv[1] == "history":
-            return subprocess.CompletedProcess(argv, 0, history, b"")
-        raise AssertionError(f"unexpected command: {argv}")
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", current, "worker")
 
-    adapter = impl_review.CodexctlAdapter("codexctl", tmp_path, subprocess_runner=run)
-    result = adapter.follow(thread_id="thread-1", turn_id="target-turn")
+    assert result.status == "running"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "VERDICT: PASS",
+        "REVIEW_RESULT: {token} PASS\nextra",
+        "REVIEW_RESULT: {token} PASS\nREVIEW_RESULT: {token} PASS",
+        "REVIEW_RESULT: {other} PASS",
+    ],
+)
+def test_invalid_reviewer_markers_do_not_complete(message: str):
+    token = "6" * 32
+    other = "7" * 32
+    raw = (
+        agent_event("turn-a", message.format(token=token, other=other))
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+    ).encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "reviewer")
+
+    assert result.status == "running"
+    assert result.verdict is None
+
+
+def test_reviewer_marker_duplicated_across_messages_does_not_complete():
+    token = "a" * 32
+    marker = review_marker(token, "PASS")
+    raw = (
+        agent_event("turn-a", marker)
+        + "\n"
+        + agent_event("turn-a", f"Final review.\n{marker}")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+    ).encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "reviewer")
+
+    assert result.status == "running"
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "FAIL"])
+def test_reviewer_result_marker_completes_with_verdict(verdict: str):
+    token = "8" * 32
+    raw = (
+        agent_event("turn-a", f"Review complete.\n{review_marker(token, verdict)}")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+    ).encode()
+
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, "reviewer")
 
     assert result.status == "completed"
-    assert result.final_message == "Recovered target."
-    assert result.raw_jsonl == history
-    assert result.observed_turn_ids == ["target-turn"]
-    assert result.error is None
-    assert [argv[1] for argv in calls] == ["status", "follow", "history"]
+    assert result.verdict == verdict
+    assert result.terminal_turn_id == "turn-a"
 
 
-def test_unexpected_reviewer_continuation_is_typed_and_full_audit_supersedes_it(
-    repo: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("role", "marker", "expected_verdict"),
+    [
+        ("worker", worker_marker("e" * 32), None),
+        ("reviewer", review_marker("e" * 32, "PASS"), "PASS"),
+    ],
+)
+def test_completion_marker_accepts_line_edge_whitespace(
+    role: str, marker: str, expected_verdict: str | None
 ):
-    codex = ScriptedCodex(
-        repo,
-        [lambda: commit(repo, "work.txt", "work\n")],
-        [
-            impl_review.AgentResult(
-                "unexpected_continuation",
-                messages=["Target result."],
-                observed_turn_ids=["target-turn", "extra-turn"],
-                error="observed another turn",
-            ),
-            "Fresh audit passes.\nVERDICT: PASS",
-        ],
-    )
-    workflow = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex)
-    waiting = workflow.start(config(repo, tmp_path, max_auto_worker_rounds=1))
+    token = "e" * 32
+    raw = (
+        agent_event("turn-a", f"Complete.\n  {marker}\t  ")
+        + "\n"
+        + terminal_event("turn-a")
+        + "\n"
+    ).encode()
 
-    assert waiting["waitingReason"] == "UNEXPECTED_CONTINUATION"
-    assert waiting["attempts"][-1]["status"] == "unexpected_continuation"
-    report = workflow.resume("test-run", "REQUIRE_FRESH_AUDIT")
-    assert report["status"] == "READY_CERTIFIED"
-    state = json.loads(Path(report["statePath"]).read_text())
-    assert [session["status"] for session in state["review_sessions"]] == [
-        "SUPERSEDED_BY_FULL_AUDIT",
-        "PASSED",
-    ]
+    result = impl_review.parse_agent_jsonl(raw, "turn-a", token, role)
+
+    assert result.status == "completed"
+    assert result.verdict == expected_verdict
 
 
-def test_unexpected_worker_continuation_is_not_a_generic_agent_failure(
-    repo: Path, tmp_path: Path
-):
-    class UnexpectedWorkerCodex(ScriptedCodex):
-        def start(self, **kwargs):
-            receipt = super().start(**kwargs)
-            self._results[receipt.turn_id] = impl_review.AgentResult(
-                "unexpected_continuation",
-                observed_turn_ids=[receipt.turn_id, "extra-turn"],
-                error="observed another turn",
-            )
-            return receipt
+def test_reused_thread_ignores_result_before_attempt_initial_turn():
+    token = "9" * 32
+    raw = (
+        agent_event("old-turn", f"Old.\n{review_marker(token, 'PASS')}")
+        + "\n"
+        + terminal_event("old-turn")
+        + "\n"
+        + agent_event("new-turn", "Review still running.")
+        + "\n"
+        + terminal_event("new-turn")
+        + "\n"
+    ).encode()
 
-    codex = UnexpectedWorkerCodex(repo, [lambda: None], [])
-    report = impl_review.Workflow(state_dir=tmp_path / "state", codex=codex).start(
-        config(repo, tmp_path)
-    )
+    result = impl_review.parse_agent_jsonl(raw, "new-turn", token, "reviewer")
 
-    assert report["waitingReason"] == "UNEXPECTED_CONTINUATION"
-    assert report["allowedActions"] == []
-    assert report["attempts"][-1]["status"] == "unexpected_continuation"
+    assert result.status == "running"
+    assert result.observed_turn_ids == ["new-turn"]
 
 
 def test_cli_usage_failure_exits_one(tmp_path: Path):
