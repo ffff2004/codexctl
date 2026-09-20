@@ -2565,7 +2565,7 @@ def test_concurrent_starts_for_one_run_id_cannot_both_advance(
     second_result_path = tmp_path / "second-result.json"
     first_config = config(repo, tmp_path, state_dir=state_dir)
     second_config = config(repo, tmp_path, state_dir=state_dir)
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     first = context.Process(
         target=run_start_process,
         args=(first_config, events_path, first_result_path, ready_path, release_path),
