@@ -36,6 +36,7 @@ python314Packages.buildPythonApplication {
     [
       pytestCheckHook
       pytest-asyncio
+      pytest-xdist
     ]
     ++ [ git ];
 
