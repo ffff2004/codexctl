@@ -43,11 +43,11 @@ It stores nothing locally; threads live in the shared runtime.
 Dependencies are managed with `uv`:
 
 ```sh
-uv sync          # create .venv, install project + dev dependencies
-uv run pre-commit install --hook-type pre-commit --hook-type pre-push --install-hooks  # install commit and push hooks
-uv run pytest    # run the test suite (no sockets needed)
-uv run codexctl  # run the CLI
-uv build         # build dist/ artifacts
+uv sync --locked    # create .venv, install project + dev dependencies
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push --install-hooks   # install commit and push hooks
+uv run pytest   # run the test suite (no sockets needed)
+uv run codexctl # run the CLI
+uv build    # build dist/ artifacts
 ```
 
 ## Code layout
