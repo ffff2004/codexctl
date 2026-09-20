@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -54,14 +55,21 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    path = tmp_path / "repo"
+@pytest.fixture(scope="session")
+def repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("repo-template") / "repo"
     path.mkdir()
     git(path, "init", "-q")
     (path / "base.txt").write_text("base\n")
     git(path, "add", "base.txt")
     git(path, "commit", "-qm", "chore: base")
+    return path
+
+
+@pytest.fixture
+def repo(tmp_path: Path, repo_template: Path) -> Path:
+    path = tmp_path / "repo"
+    shutil.copytree(repo_template, path)
     return path
 
 
