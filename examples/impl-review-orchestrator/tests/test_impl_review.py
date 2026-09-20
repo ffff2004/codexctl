@@ -34,7 +34,18 @@ def review_marker(token: str, verdict: str) -> str:
 
 def git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [
+            "git",
+            "-c",
+            "user.name=Test Worker",
+            "-c",
+            "user.email=worker@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "-C",
+            str(repo),
+            *args,
+        ],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -48,9 +59,6 @@ def repo(tmp_path: Path) -> Path:
     path = tmp_path / "repo"
     path.mkdir()
     git(path, "init", "-q")
-    git(path, "config", "user.name", "Test Worker")
-    git(path, "config", "user.email", "worker@example.test")
-    git(path, "config", "commit.gpgsign", "false")
     (path / "base.txt").write_text("base\n")
     git(path, "add", "base.txt")
     git(path, "commit", "-qm", "chore: base")
