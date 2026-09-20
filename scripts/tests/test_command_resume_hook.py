@@ -1,6 +1,7 @@
 """Exercise the wrapper through its CLI, replacing only the external CLI."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,9 +15,11 @@ WRAPPER = (
 
 @pytest.fixture
 def hook(tmp_path):
+    bash = shutil.which("bash")
+    assert bash is not None
     cli = tmp_path / "codexctl"
     cli.write_text(
-        "#!/usr/bin/env bash\n"
+        f"#!{bash}\n"
         'case "$1" in\n'
         'doctor) exit "${DOCTOR_EXIT:-0}" ;;\n'
         "steer)\n"
