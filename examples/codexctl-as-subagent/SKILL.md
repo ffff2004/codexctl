@@ -15,8 +15,7 @@ thread. A worker shares the checkout and runtime, but has its own context.
 
 1. Give each worker a non-overlapping responsibility. Its prompt states the
    objective, files or area it owns, constraints, required verification, and
-   the handoff expected. Tell it that other agents may change the checkout, so
-   it must preserve unrelated changes and report any friction or assumptions.
+   the handoff expected.
 
    Start the worker and save the returned `threadId`:
    (For Codex: if skill `command-resume-hook` exists, use it to run `codexctl start`)
