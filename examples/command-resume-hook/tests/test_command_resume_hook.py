@@ -7,10 +7,7 @@ from pathlib import Path
 
 import pytest
 
-WRAPPER = (
-    Path(__file__).resolve().parents[2]
-    / "examples/command-resume-hook/command-resume-hook.sh"
-)
+WRAPPER = Path(__file__).resolve().parents[1] / "command-resume-hook.sh"
 
 
 @pytest.fixture

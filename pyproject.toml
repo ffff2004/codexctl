@@ -36,7 +36,12 @@ exclude = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "scripts/tests", "examples/impl-review-orchestrator/tests"]
+testpaths = [
+    "tests",
+    "scripts/tests",
+    "examples/command-resume-hook/tests",
+    "examples/impl-review-orchestrator/tests",
+]
 
 [tool.ruff]
 target-version = "py314"
