@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Run a command in the background, persist its output, and wake the current
+# Run a command synchronously, persist its output, and notify the current
 # Codex thread when it finishes.
 #
 # The wrapper first steers the current turn. If the structured steer error is
@@ -14,10 +14,16 @@ usage() {
 Usage:
   command-resume-hook.sh [--thread-id ID] [--output-dir DIR]
                          [--codexctl PATH] -- COMMAND [ARG ...]
+  command-resume-hook.sh [--thread-id ID] [--output-dir DIR] --list
+  command-resume-hook.sh [--thread-id ID] [--output-dir DIR] --job JOB_ID
 
 The thread ID defaults to CODEX_THREAD_ID. Command stdout and stderr are
 stored separately in a unique job directory below DIR. DIR defaults to
-${TMPDIR:-/tmp}/codexctl-jobs.
+${TMPDIR:-/tmp}/codexctl-jobs. Jobs are grouped by thread ID.
+Queries need no running codexctl service. Missing results mean unknown status,
+not proof that a command is still running. Query exit codes describe the query;
+command_exit_code in result.txt describes the command. Values printed with
+shell escaping are for display; never source job files.
 EOF
 }
 
@@ -29,6 +35,8 @@ die() {
 thread_id=${CODEX_THREAD_ID-}
 output_root=${CODEXCTL_JOB_DIR:-${TMPDIR:-/tmp}/codexctl-jobs}
 codexctl_bin=${CODEXCTL_BIN:-codexctl}
+query_mode=
+job_id=
 
 while (($# > 0)); do
   case $1 in
@@ -47,6 +55,18 @@ while (($# > 0)); do
       codexctl_bin=$2
       shift 2
       ;;
+    --list)
+      [[ -z $query_mode ]] || die "choose only one query"
+      query_mode=list
+      shift
+      ;;
+    --job)
+      (($# >= 2)) || die "--job requires a value"
+      [[ -z $query_mode ]] || die "choose only one query"
+      query_mode=job
+      job_id=$2
+      shift 2
+      ;;
     -h|--help)
       usage >&1
       exit 0
@@ -62,7 +82,41 @@ while (($# > 0)); do
 done
 
 [[ -n $thread_id ]] || die "--thread-id or CODEX_THREAD_ID is required"
+[[ $thread_id =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid thread ID"
+thread_dir=$output_root/$thread_id
+
+show_job() {
+  local directory=$1
+  printf 'job_id=%s\njob_dir=%q\n' "${directory##*/}" "$directory"
+  if [[ -f $directory/result.txt ]]; then
+    cat -- "$directory/result.txt" || return
+  else
+    printf 'status=unknown\n'
+  fi
+  if [[ -f $directory/job.txt ]]; then
+    cat -- "$directory/job.txt" || return
+  fi
+  printf 'stdout=%q\nstderr=%q\n\n' "$directory/stdout.log" "$directory/stderr.log"
+}
+
+if [[ -n $query_mode ]]; then
+  (($# == 0)) || die "queries do not accept a command"
+  if [[ $query_mode == job ]]; then
+    [[ $job_id =~ ^job\.[a-zA-Z0-9]+$ ]] || die "invalid job ID"
+    [[ -d $thread_dir/$job_id ]] || die "job not found: $job_id"
+    show_job "$thread_dir/$job_id"
+    exit $?
+  fi
+  shopt -s nullglob
+  for directory in "$thread_dir"/job.*; do
+    [[ -d $directory ]] || continue
+    show_job "$directory" || exit 2
+  done
+  exit 0
+fi
+
 (($# > 0)) || die "a command is required after --"
+umask 077
 
 doctor_output_file=$(mktemp "${TMPDIR:-/tmp}/codexctl-doctor.XXXXXX") \
   || die "cannot create doctor output file"
@@ -81,11 +135,12 @@ else
   exit "$doctor_exit_code"
 fi
 
-if ! mkdir -p -- "$output_root"; then
-  die "cannot create output directory: $output_root"
+if ! mkdir -p -- "$thread_dir"; then
+  die "cannot create output directory: $thread_dir"
 fi
 
-job_dir=$(mktemp -d "$output_root/job.XXXXXX") || die "cannot create job directory"
+thread_dir=$(cd -- "$thread_dir" && pwd -P) || die "cannot resolve output directory"
+job_dir=$(mktemp -d "$thread_dir/job.XXXXXX") || die "cannot create job directory"
 stdout_file=$job_dir/stdout.log
 stderr_file=$job_dir/stderr.log
 resume_stdout_file=$job_dir/resume.stdout.log
@@ -104,6 +159,16 @@ wake_result_file=$job_dir/wake.result.txt
 printf -v command_text '%q ' "$@"
 command_text=${command_text% }
 
+{
+  printf 'thread_id=%s\n' "$thread_id"
+  printf 'command=%s\n' "$command_text"
+  printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$job_dir/job.txt.tmp" && mv -- "$job_dir/job.txt.tmp" "$job_dir/job.txt" \
+  || die "cannot register job"
+: >"$stdout_file" && : >"$stderr_file" || die "cannot create command logs"
+printf 'job_id=%s\njob_dir=%q\n' "${job_dir##*/}" "$job_dir"
+printf 'stdout=%q\nstderr=%q\n' "$stdout_file" "$stderr_file"
+
 # Capture bash's `time` output separately so it does not pollute the command's
 # stderr artifact.
 TIMEFORMAT='%R'
@@ -113,16 +178,27 @@ else
   command_exit_code=$?
 fi
 
+# Publish the command outcome before attempting any notification. A missing
+# result is deliberately unknown: the wrapper may have been killed.
+{
+  printf 'status=completed\n'
+  printf 'command_exit_code=%d\n' "$command_exit_code"
+  printf 'wall_clock_seconds=%s\n' "$command_wall_clock_time"
+  printf 'finished_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'stdout=%q\nstderr=%q\n' "$stdout_file" "$stderr_file"
+} >"$job_dir/result.txt.tmp" && mv -- "$job_dir/result.txt.tmp" "$job_dir/result.txt" \
+  || die "cannot persist command result in $job_dir"
+
 resume_prompt=$(cat <<EOF
 An asynchronous command has finished
 
+Job ID: ${job_dir##*/}
+Result file: $job_dir/result.txt
 Command: $command_text
 Exit code: $command_exit_code
 Wall clock time: ${command_wall_clock_time}s
 stdout file: $stdout_file
 stderr file: $stderr_file
-
-Read the stdout and stderr files as needed
 EOF
 )
 
