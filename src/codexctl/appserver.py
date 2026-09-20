@@ -45,6 +45,7 @@ CLIENT_NAME = "codexctl"
 CLIENT_VERSION = "0.1.0"
 THREAD_LIST_PAGE_SIZE = 100
 _STDIO_STREAM_LIMIT = 64 * 1024
+STDIO_GRACEFUL_WAIT_SECONDS = 1.0
 
 # Synthetic notification method used to surface server-initiated interaction
 # requests that v1 cannot broker. Internal to codexctl; never on the wire.
@@ -377,7 +378,6 @@ class _OwnedStdioProcess:
     callers get bounded cleanup rather than an unbounded reap guarantee.
     """
 
-    _GRACEFUL_WAIT_SECONDS = 1.0
     _TERMINATE_WAIT_SECONDS = 1.0
 
     def __init__(self, process: asyncio.subprocess.Process) -> None:
@@ -463,7 +463,7 @@ class _OwnedStdioProcess:
             with contextlib.suppress(Exception):
                 stdin.close()
 
-        await self._wait(self._GRACEFUL_WAIT_SECONDS)
+        await self._wait(STDIO_GRACEFUL_WAIT_SECONDS)
         # The parent may already have exited while a descendant still holds
         # the protocol pipes open. Always clean the dedicated process group,
         # then use SIGKILL only when the group remains alive.

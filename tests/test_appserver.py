@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from websockets.asyncio.server import serve, unix_serve
 
+import codexctl.appserver as appserver
 from codexctl.appserver import (
     REQUIRED_LIFECYCLE_OPERATIONS,
     UNSUPPORTED_INTERACTION_METHOD,
@@ -48,6 +49,12 @@ from codexctl.model import (
     SandboxPolicy,
     StartConfig,
 )
+
+
+@pytest.fixture(autouse=True)
+def fast_stdio_graceful_wait(monkeypatch):
+    """Keep process-cleanup integration tests from paying the production grace."""
+    monkeypatch.setattr(appserver, "STDIO_GRACEFUL_WAIT_SECONDS", 0.05)
 
 
 def _stdio_websocket_proxy_source(
